@@ -194,12 +194,10 @@ func (bw *byteWriter) encodeArray(in interface{}) error {
 }
 
 func (bw *byteWriter) encodeEd25519PublicKey(in ed25519.PublicKey) error {
-	_, err := bw.Write(in)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	buf := make([]byte, ed25519.PublicKeySize)
+	copy(buf, in)
+	_, err := bw.Write(buf)
+	return err
 }
 
 // encodeMap encodes a map, sorting the keys based on their type

@@ -1,146 +1,160 @@
-# 🍓 Strawberry: A JAM Client Implementation in Go
+# Strawberry JAM — Dev Node (Fork con Debug & Tooling)
 
-Welcome to Strawberry, our implementation of the JAM client for Polkadot, written in Go. This project is part of Eiger's effort to contribute to the Polkadot ecosystem by providing a robust and efficient client implementation.
+Fork de [eigerco/strawberry](https://github.com/eigerco/strawberry) con modificaciones para ejecutar un nodo JAM en modo desarrollo con producción de bloques, RPC WebSocket/HTTP, telemetry, y más.
 
-Eiger account `131MpMXeuKG6L27Ye23uzWr739KFbbrCBdiv39XZtnTCPwQB`
+## Cambios realizados
 
-## Table of Contents
+### 1. Corrección de JSON tags en `test_validators.json`
 
-- [Introduction](#introduction)
-- [Features](#features)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Contributing](#contributing)
-- [License](#license)
-- [Acknowledgements](#acknowledgements)
+Los tags `json` de `FullValidatorInfo` en `cmd/strawberry/main.go` se corrigieron para coincidir con el archivo `test_validators.json`:
+- `"address"` → `"ip"`
+- `"ed25519_pub"`, `"ed25519_private"` para las claves ed25519
 
-## Introduction
+### 2. Manejo de prefijo `0x` en claves
 
-Strawberry is an implementation of the JAM (JOIN-ACCUMULATE MACHINE) client for Polkadot, developed in Go. This implementation aims to provide a lightweight, performant, and secure JAM client.
+Se agregó `decodeHex()` en `cmd/strawberry/main.go` que remueve el prefijo `"0x"` con `strings.TrimPrefix` antes de decodificar hex. Las claves en `test_validators.json` usan prefijo `0x`.
 
-For more information about JAM, read the [graypaper](https://graypaper.com).
-Strawberry follows the latest specification outlined in the graypaper which itself is still maturing. 
+### 3. Seed de 32 bytes → PrivateKey de 64 bytes
 
-## Features
+Las claves `ed25519_private` en el JSON son seeds de 32 bytes. Se usa `ed25519.NewKeyFromSeed(seed)` para derivar la private key completa de 64 bytes requerida por Go.
 
-- Written in Go for performance and reliability
-- Milestones one "IMPORTER: State-transitioning conformance tests pass and can import blocks." has been implemented and [sent for review on Nov 20th 2024](https://github.com/w3f/jam-milestone-delivery/pull/6)
-- Working on Milestone 2 and beyond.
-- Easy to configure and extend.
+### 4. Flags de línea de comandos
 
-## Getting started
+Se agregaron flags CLI en `cmd/strawberry/main.go`:
+- `--name` — nombre del nodo (default: `Strawberry-Node`)
+- `--port` — puerto P2P (default: del validador)
+- `--rpc-port` — puerto RPC WebSocket/HTTP (default: `9944`)
+- `--telemetry-url` — URL de telemetry WebSocket
+- `--chain` — especificación de chain (default: `dev`)
+- `--validator` — modo validador (flag aceptado pero no-op)
+- `--help` — muestra ayuda
 
-### Prerequisites
-- Make
-- Go 1.25.5 or higher
-- Rust 1.81.1 or higher
+### 5. Archivo de constantes dev (`chain_dev.go`)
 
-### Installation
-Follow the steps below to get started:
+Se creó `internal/constants/chain_dev.go` con build tag `dev`:
+- `NumberOfValidators = 2`
+- `TimeslotsPerEpoch = 12`
+- `EpochDuration = TimeslotDuration * TimeslotsPerEpoch`
 
-1. Clone the repository:
-    ```bash
-    git clone https://github.com/eigerco/strawberry.git
-    cd strawberry
-    ```
+Los build constraints de `chain.go` y `chain_tiny.go` se actualizaron para excluir el tag `dev`.
 
-2. Build the project:
-    ```bash
-   make build 
-    ```
+### 6. Block Producer (`cmd/strawberry/producer.go`)
 
-3. Run the demo executable:
-    ```bash
-    ./strawberry
-    ```
-## Usage
-This demo app starts up a simple http server with one endpoint.
-The import block endpoint can be accessed at `POST /block/import`
+Archivo nuevo que implementa producción autónoma de bloques:
+- Genera headers JAM con `ParentHash`, `PriorStateRoot`, `ExtrinsicHash`, `TimeSlotIndex`, `BlockAuthorIndex`
+- Agrega `EpochMarker` al primer timeslot de cada epoch
+- Catch-up desde genesis hasta el slot actual (~10ms delay entre bloques)
+- Luego produce un bloque cada `jamtime.TimeslotDuration` (6s)
+- Almacena header + block via `store.PutBlock`, luego notifica via `HandleNewHeader`
+- Callback a RPC server para broadcast de suscripciones
 
-Usage example:
+### 7. RPC Server WebSocket/HTTP (`cmd/strawberry/rpc.go`)
+
+Archivo nuevo que implementa un servidor JSON-RPC compatible con Substrate:
+- **WebSocket** (con `golang.org/x/net/websocket`) para Polkadot.js
+- **HTTP POST** para curl/scripts
+- Origen WebSocket permitido (handshake custom que acepta todos los orígenes)
+- Suscripciones `chain_subscribeNewHeads`, `chain_subscribeFinalizedHeads`
+- **Métodos implementados:**
+  - `system_chain`, `system_name`, `system_version`, `system_health`, `system_peers`, `system_properties`, `system_chainType`, `system_localListenAddresses`, `system_syncState`, `system_accountNextIndex`
+  - `chain_getHeader`, `chain_getBlock`, `chain_getBlockHash`, `chain_getFinalizedHead`
+  - `chain_subscribeNewHeads`, `chain_subscribeFinalizedHeads`, `chain_unsubscribeNewHeads`, `chain_unsubscribeFinalizedHeads`
+  - `state_getRuntimeVersion`, `chain_getRuntimeVersion`, `state_getMetadata`
+  - `state_subscribeRuntimeVersion`, `state_subscribeMetadata`, `state_unsubscribeRuntimeVersion`, `state_unsubscribeMetadata`
+  - `rpc_methods`
+- Headers JAM convertidos a formato Substrate (hex `parentHash`, `number`, `stateRoot`, `extrinsicsRoot`, `digest`) para que exploradores puedan renderizarlos
+
+### 8. Telemetry Client (`cmd/strawberry/telemetry.go`)
+
+Archivo nuevo que conecta a telemetry de Polkadot vía WebSocket:
+- Envía handshake con `system_chain`, `system_name`, `system_version`
+- Si se pasa `--telemetry-url`, conecta y reporta estadísticas del nodo (bloques, peers, etc.)
+
+### 9. Getter `GetLatestFinalized()` en BlockService
+
+Agregado en `internal/chain/service.go` para que el RPC pueda consultar el último bloque finalizado.
+
+### 10. Corrección de bug JAM codec: Ed25519 nil → 32 bytes padding
+
+**Archivo:** `pkg/serialization/codec/jam/encode.go`
+
+**Problema:** `encodeEd25519PublicKey` llamaba `bw.Write(in)` que escribe **0 bytes** cuando `in` es `nil`. En `ValidatorKeys.Ed25519` (campo `[]byte`), el zero value es `nil`. Esto ocurría en los `EpochMarker.Keys` en bloques de límite de epoch.
+
+El custom `UnmarshalJAM` de `ValidatorKeys` siempre lee **32 bytes**, causando un desajuste de 64 bytes (2 validadores × 32 bytes) en el stream JAM. Esto desplazaba todos los campos siguientes del header, haciendo que `BlockSealSignature` (campo `[96]byte` al final) fallara con `unexpected EOF`.
+
+**Solución:** padding a 32 bytes antes de escribir:
+```go
+buf := make([]byte, ed25519.PublicKeySize)
+copy(buf, in)
+_, err := bw.Write(buf)
+```
+
+### 11. Debug logging mejorado
+
+- Log del slot y epoch en cada bloque producido
+- Mensaje de warning de `HandleNewHeader` incluye hash y slot del bloque problemático
+- Mensaje de `IsDescendantOfFinalized` incluye slot y hash del bloque padre fallido
+
+## Cómo usar
+
+### Requisitos
+- Go 1.25.5+
+
+### Construir y ejecutar (modo dev)
 ```bash
-curl -i -X POST localhost:8080/block/import -H "Content-Type: application/json" --data-binary "@demo-block-sample.json"
+go build -tags dev ./cmd/strawberry/
+./strawberry --name "MiNodo" --rpc-port 9944 --telemetry-url "wss://telemetry.polkadot.io/submit/ 0"
 ```
 
-This returns:
+Esto inicia un nodo que:
+1. Escucha en puerto UDP (P2P, default del validador)
+2. Sirve RPC en `ws://[::1]:9944` y `http://[::1]:9944`
+3. Produce bloques JAM desde genesis hasta el slot actual (~100ms de catch-up)
+4. Reporta a telemetry de Polkadot
+
+### Flags disponibles
 ```
-{"message":"extrinsic guarantees validation failed, err: anchor block not present within recent blocks","status":"error"}
+--config          archivo de configuración (default: appconfig.json)
+--chain           chain spec (default: dev)
+--validator       modo validador
+--name            nombre del nodo (default: Strawberry-Node)
+--telemetry-url   URL de telemetry WebSocket
+--port            puerto P2P (default: del validador)
+--rpc-port        puerto RPC (default: 9944)
+--help            muestra ayuda
 ```
-Meaning that the block is being validated.
 
-## Docker
-
-A single `linux/amd64` image runs in two modes, selected by the `JAM_FUZZ`
-environment variable. The image follows the [JAM standard target packaging
-spec](https://github.com/davxy/jam-conformance/tree/main/fuzz-proto#standard-target-packaging).
-
-Build:
-
+### Probar RPC
 ```bash
-docker build -t strawberry .
+# Información del chain
+curl -X POST http://localhost:9944 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"system_chain","params":[]}'
+
+# Último header
+curl -X POST http://localhost:9944 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"chain_getHeader","params":[]}'
+
+# Métodos disponibles
+curl -X POST http://localhost:9944 -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"rpc_methods","params":[]}'
 ```
 
-**Normal mode** — validator node listening on UDP 30000 with baked-in dev configs:
+## Archivos relevantes
 
-```bash
-docker run --rm -p 30000:30000/udp strawberry
-```
+| Archivo | Descripción |
+|---------|-------------|
+| `cmd/strawberry/main.go` | Entry point con flags, carga de validadores, inicialización |
+| `cmd/strawberry/producer.go` | Block producer (nuevo) |
+| `cmd/strawberry/rpc.go` | Servidor RPC WS/HTTP (nuevo) |
+| `cmd/strawberry/telemetry.go` | Cliente telemetry (nuevo) |
+| `internal/constants/chain_dev.go` | Constantes dev (nuevo) |
+| `internal/constants/chain.go` | Build constraint actualizado |
+| `internal/constants/chain_tiny.go` | Build constraint actualizado |
+| `internal/chain/service.go` | GetLatestFinalized + debug logging |
+| `pkg/serialization/codec/jam/encode.go` | Fix nil Ed25519 padding |
+| `test_validators.json` | Validadores Alice y Bob (nuevo) |
+| `appconfig.json` | Config con validatorIndex |
 
-To use your own keys/config, mount over the baked-in files:
+## Créditos
 
-```bash
-docker run --rm -p 30000:30000/udp \
-    -v "$PWD/appconfig.json:/app/appconfig.json:ro" \
-    -v "$PWD/test_validators.json:/app/test_validators.json:ro" \
-    strawberry
-```
-
-**Fuzz mode** — JAM conformance target speaking the fuzz protocol over a Unix socket:
-
-```bash
-docker run --rm \
-    -e JAM_FUZZ=1 \
-    -e JAM_FUZZ_SPEC=tiny \
-    -e JAM_FUZZ_DATA_PATH=/tmp/jam/data \
-    -e JAM_FUZZ_SOCK_PATH=/tmp/jam/fuzz.sock \
-    -e JAM_FUZZ_LOG_LEVEL=info \
-    -v /tmp/jam:/tmp/jam \
-    strawberry
-```
-
-`JAM_FUZZ_SPEC` accepts `tiny` or `full`.
-
-> The image bakes a freshly-generated ed25519 keypair for local dev. **Do not use it in production** — generate your own `test_validators.json`.
-
-## Run tests
-
-### Unit tests
-
-```shell
-make test
-```
-
-### Integration tests
-Integration tests validate our code using the test vectors provided by [this](https://github.com/w3f/jamtestvectors) repository.
-All integration tests are grouped within the `tests/integrations` folder, and the test cases/vectors (JSON and BIN files) are located in the `tests/integration/vectors` directory.
-To execute these tests, use the following command:
-```shell
-make integration
-```
-
-## Contributing
-
-We welcome contributions to Strawberry. Before contributing please read the [CONTRIBUTING](CONTRIBUTING.md) file for details.
-
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
-## Acknowledgements
-
-We would like to thank the Web3 Foundation for their support and the Polkadot community for their continuous contributions and feedback.
-
----
-
-If you have any questions contact us at hello@eiger.co
+Fork de [eigerco/strawberry](https://github.com/eigerco/strawberry), un cliente JAM en Go para Polkadot.

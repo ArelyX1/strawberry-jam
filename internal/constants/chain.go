@@ -1,4 +1,4 @@
-//go:build !tiny && !conformance
+//go:build !tiny && !conformance && !dev
 
 package constants
 

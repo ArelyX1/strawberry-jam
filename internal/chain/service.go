@@ -194,6 +194,13 @@ func (bs *BlockService) AddLeaf(hash crypto.Hash, slot jamtime.Timeslot) {
 	bs.KnownLeaves[hash] = slot
 }
 
+// GetLatestFinalized safely returns the latest finalized block info.
+func (bs *BlockService) GetLatestFinalized() LatestFinalized {
+	bs.mu.RLock()
+	defer bs.mu.RUnlock()
+	return bs.LatestFinalized
+}
+
 // RemoveLeaf removes a block from the set of known leaves.
 func (bs *BlockService) RemoveLeaf(hash crypto.Hash) {
 	bs.mu.Lock()
@@ -224,7 +231,7 @@ func (bs *BlockService) IsDescendantOfFinalized(header *block.Header) (bool, err
 	for current.TimeSlotIndex > finalizedSlot {
 		parent, err := bs.Store.GetHeader(current.ParentHash)
 		if err != nil {
-			return false, fmt.Errorf("get parent block: %w", err)
+			return false, fmt.Errorf("get parent block of slot %d (hash %x): %w", current.TimeSlotIndex, current.ParentHash, err)
 		}
 		current = &parent
 	}

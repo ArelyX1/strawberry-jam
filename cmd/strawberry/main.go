@@ -2,18 +2,19 @@ package main
 
 import (
 	"context"
-
-	"github.com/eigerco/strawberry/internal/crypto/ed25519"
-
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
+	"strings"
 
+	"github.com/eigerco/strawberry/internal/block"
 	"github.com/eigerco/strawberry/internal/crypto"
+	"github.com/eigerco/strawberry/internal/crypto/ed25519"
 	"github.com/eigerco/strawberry/internal/safrole"
 	chainState "github.com/eigerco/strawberry/internal/state"
 	"github.com/eigerco/strawberry/internal/validator"
@@ -21,17 +22,25 @@ import (
 	"github.com/eigerco/strawberry/pkg/network/node"
 )
 
+var version = "0.1.0-dev"
+
 type FullValidatorInfo struct {
 	Index      uint   `json:"index"`
-	IP         string `json:"address"`
+	Name       string `json:"name"`
+	Seed       string `json:"seed"`
+	IP         string `json:"ip"`
 	Port       int    `json:"port"`
-	Ed25519Pub string `json:"ed25519_public_key"`
-	Ed25519Prv string `json:"ed25519_private_key"`
+	Ed25519Pub string `json:"ed25519_pub"`
+	Ed25519Prv string `json:"ed25519_private"`
 }
 
 type AppConfig struct {
 	LogLevel       string `json:"loglevel"`
 	ValidatorIndex int    `json:"validatorIndex"`
+}
+
+func decodeHex(s string) ([]byte, error) {
+	return hex.DecodeString(strings.TrimPrefix(s, "0x"))
 }
 
 func (f FullValidatorInfo) ToJson() ([]byte, error) {
@@ -96,20 +105,42 @@ func (f FullValidatorInfo) ToMetadata() ([]byte, error) {
 		return nil, err
 	}
 
-	// Create a 128-byte array filled with zeros
 	result := make([]byte, 128)
-	// Copy the address bytes into the start of the array
 	copy(result, addrBytes)
 
 	return result, nil
 }
 
-// main starts a blockchain node.
-// go run main.go -index 0
 func main() {
+	var (
+		configFile   string
+		chainSpec    string
+		isValidator  bool
+		nodeName     string
+		telemetryURL string
+		portOverride int
+		rpcPort      int
+		help         bool
+	)
+
+	flag.StringVar(&configFile, "config", "appconfig.json", "path to config file")
+	flag.StringVar(&chainSpec, "chain", "dev", "chain specification")
+	flag.BoolVar(&isValidator, "validator", false, "run as validator")
+	flag.StringVar(&nodeName, "name", "Strawberry-Node", "node name")
+	flag.StringVar(&telemetryURL, "telemetry-url", "", "telemetry WebSocket URL")
+	flag.IntVar(&portOverride, "port", 0, "override p2p listen port")
+	flag.IntVar(&rpcPort, "rpc-port", 9944, "RPC WebSocket port")
+	flag.BoolVar(&help, "help", false, "show help")
+	flag.Parse()
+
+	if help {
+		flag.Usage()
+		return
+	}
+
 	ctx := context.Background()
 
-	appConfig, err := loadConfig("appconfig.json")
+	appConfig, err := loadConfig(configFile)
 	if err != nil {
 		panic("application config load failed:" + err.Error())
 	}
@@ -144,6 +175,9 @@ func main() {
 	}
 	address := vs[index].IP
 	port := vs[index].Port
+	if portOverride > 0 {
+		port = portOverride
+	}
 	udpAddress, err := net.ResolveUDPAddr("udp", net.JoinHostPort(address, strconv.Itoa(port)))
 	if err != nil {
 		log.Internal.Fatal().
@@ -156,20 +190,20 @@ func main() {
 	log.Internal.Info().
 		Msgf("listening on: %v", address)
 
-	prv, err := hex.DecodeString(vs[index].Ed25519Prv)
+	seed, err := decodeHex(vs[index].Ed25519Prv)
 	if err != nil {
 		log.Internal.Fatal().
 			Err(err).
 			Msg("own private key decode failed")
 	}
-	pub, err := hex.DecodeString(vs[index].Ed25519Pub)
+	pub, err := decodeHex(vs[index].Ed25519Pub)
 	if err != nil {
 		log.Internal.Fatal().
 			Err(err).
 			Msg("own public key decode failed")
 	}
 
-	privateKey := ed25519.PrivateKey(prv)
+	privateKey := ed25519.NewKeyFromSeed(seed)
 	publicKey := ed25519.PublicKey(pub)
 	vkeys := validator.ValidatorKeys{
 		EdPrv: privateKey,
@@ -178,7 +212,7 @@ func main() {
 	validatorsData := safrole.ValidatorsData{}
 
 	for i, k := range vs {
-		pub, err := hex.DecodeString(k.Ed25519Pub)
+		pub, err := decodeHex(k.Ed25519Pub)
 		if err != nil {
 			log.Internal.Fatal().
 				Int("index", i).
@@ -211,17 +245,34 @@ func main() {
 		ValidatorState: vstate,
 	}
 
-	node, err := node.NewNode(ctx, udpAddress, vkeys, state, index)
+	n, err := node.NewNode(ctx, udpAddress, vkeys, state, index)
 	if err != nil {
 		log.Internal.Fatal().
 			Err(err).
 			Msg("node creation failed")
 	}
-	err = node.Start()
+	err = n.Start()
 	if err != nil {
 		log.Internal.Fatal().
 			Err(err).
 			Msg("node start failed")
 	}
+
+	chainName := fmt.Sprintf("Strawberry %s", chainSpec)
+
+	// Start RPC server (before block producer so it's ready for subscriptions)
+	rpcAddr := fmt.Sprintf(":%d", rpcPort)
+	rpcSrv := startRPCServer(rpcAddr, nodeName, chainName, version,
+		n.BlockService.Store, n.BlockService)
+
+	// Start block producer
+	startBlockProducer(n.BlockService, index,
+		func(hash crypto.Hash, num uint, h block.Header) {
+			rpcSrv.updateBlock(hash, num, h)
+		})
+
+	// Connect telemetry
+	startTelemetry(telemetryURL, nodeName, version, chainName)
+
 	select {}
 }
