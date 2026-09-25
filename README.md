@@ -2,6 +2,47 @@
 
 Fork de [eigerco/strawberry](https://github.com/eigerco/strawberry) con modificaciones para ejecutar un nodo JAM en modo desarrollo con producción de bloques, RPC WebSocket/HTTP, telemetry, y más.
 
+## Estructura del proyecto
+
+El repositorio son **dos módulos Go** unidos por un `go.work`, para que cada uno
+se pueda versionar y consumir por separado sin arrastrar al otro:
+
+| Módulo | Ruta | Qué es |
+| --- | --- | --- |
+| `github.com/eigerco/strawberry` | `.` | El nodo JAM. Incluye `internal/` y `cmd/`, que son código de upstream y se dejan sin tocar para que los merges sigan siendo triviales. |
+| `github.com/eigerco/strawberry/sdk` | `sdk/` | El SDK para escribir services JAM de forma declarativa. Incluye `papucoin/`, el primer service real. |
+
+El SDK depende de los primitivos de protocolo del nodo (derivación de claves de
+storage, tipos de hash, `ServiceId`, `Timeslot`) en lugar de reimprimirlos: son
+críticos de consenso y solo debe existir una implementación de cada uno. Como
+los tipos son newtypes distintos, el compilador obliga a convertir en la frontera
+en lugar de dejar que ambas copias diverjan.
+
+```
+.
+├── go.work              # une el nodo y el SDK para desarrollo local
+├── go.mod               # módulo del nodo
+├── cmd/                 # binarios del nodo
+├── internal/            # internals del nodo (upstream)
+├── sdk/                 # módulo del SDK de services  -> sdk/README.md
+│   ├── service.go       # contrato del service: Init, Refine, Accumulate, OnTransfer
+│   ├── context.go       # superficie de host calls que ve un handler
+│   ├── registry.go      # asigna ids de service sin renumerar
+│   ├── executor.go      # corre los handlers contra un clon del estado
+│   ├── scheduler.go     # decide qué services ganan coretime (on-demand)
+│   └── papucoin/        # PAPU: supply, balances, fees, faucet, relay EVM
+└── tests/               # tests de integración
+```
+
+Comandos que cubren ambos módulos:
+
+```
+make test        # nodo + SDK
+make test-sdk    # solo el SDK
+make fmt         # formatea ambos módulos
+make lint        # lintea ambos módulos
+```
+
 ## Cambios realizados
 
 ### 1. Corrección de JSON tags en `test_validators.json`

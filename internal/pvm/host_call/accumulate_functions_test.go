@@ -21,6 +21,11 @@ import (
 	"github.com/eigerco/strawberry/pkg/serialization/codec/jam"
 )
 
+// assignCore is a core index that is in range for every chain profile. The dev
+// profile only has one core, so a hardcoded 1 would be an out-of-range index
+// into the fixed-size AssignedServiceIds / PendingAuthorizersQueues arrays.
+const assignCore = uint64(min(1, int(constants.TotalNumberOfCores)-1))
+
 func TestAccumulate(t *testing.T) {
 	pp := &ProgramBlob{
 		ProgramMemorySizes: ProgramMemorySizes{
@@ -129,17 +134,17 @@ func TestAccumulate(t *testing.T) {
 				R8: slices.Concat(transform(authHashes, hash2bytes)...),
 			},
 			initialRegs: deltaRegs{
-				R7: 1,   // core id
-				R9: 340, // new assigner
+				R7: assignCore, // core id
+				R9: 340,        // new assigner
 			},
 			X: AccumulateContext{
-				ServiceId: 0, // current service - must match AssignedServiceIds[1]
+				ServiceId: 0, // current service - must match AssignedServiceIds[assignCore]
 				AccumulationState: state.AccumulationState{
 					ServiceState: service.ServiceState{
 						340: service.ServiceAccount{}, // new assigner must exist
 					},
 					AssignedServiceIds: [constants.TotalNumberOfCores]block.ServiceId{
-						1: 0, // current assigner for core 1 must match ServiceId (0)
+						assignCore: 0, // current assigner for the core must match ServiceId (0)
 					},
 				},
 			},
@@ -155,10 +160,10 @@ func TestAccumulate(t *testing.T) {
 						340: service.ServiceAccount{},
 					},
 					PendingAuthorizersQueues: state.PendingAuthorizersQueues{
-						1: [constants.PendingAuthorizersQueueSize]crypto.Hash(authHashes),
+						assignCore: [constants.PendingAuthorizersQueueSize]crypto.Hash(authHashes),
 					},
 					AssignedServiceIds: [constants.TotalNumberOfCores]block.ServiceId{
-						1: 340,
+						assignCore: 340,
 					},
 				},
 			},

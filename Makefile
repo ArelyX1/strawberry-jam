@@ -34,14 +34,14 @@ help: Makefile
 	@echo
 
 .PHONY: fmt
-## fmt: Formats the Go code.
+## fmt: Formats the Go code in the node and the service SDK.
 fmt:
-	go fmt ./...
+	go fmt ./... ./sdk/...
 
 .PHONY: lint
-## lint: Runs golangci-lint run
+## lint: Runs golangci-lint over the node and the service SDK.
 lint:
-	golangci-lint run --timeout=5m
+	golangci-lint run --timeout=5m ./... ./sdk/...
 
 .PHONY: build-bandersnatch
 ## build-bandersnatch: Builds the bandersnatch library
@@ -58,9 +58,16 @@ build-erasurecoding:
 	cp erasurecoding/target/release/$(ERASURECODING_LIB) internal/erasurecoding/reedsolomon/lib/$(ERASURECODING_LIB)
 
 .PHONY: test
-## test: Runs unit tests.
+## test: Runs unit tests across every module in the workspace.
+# The SDK is a separate module, so ./... alone would skip it and its tests
+# would never run.
 test: build-bandersnatch build-erasurecoding
-	go test ./... -race -v $(DARWIN_TEST_GOFLAGS)
+	go test ./... ./sdk/... -race -v $(DARWIN_TEST_GOFLAGS)
+
+.PHONY: test-sdk
+## test-sdk: Runs only the service SDK tests.
+test-sdk:
+	go test ./sdk/... -race -v
 
 .PHONY: integration-tiny
 ## integration: Runs integration tests with tiny configuration.

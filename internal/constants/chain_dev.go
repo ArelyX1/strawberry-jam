@@ -7,7 +7,10 @@ const (
 
 	TimeslotsPerEpoch = 12
 
-	TotalNumberOfCores uint16 = 1
+	// Two cores, not one: several state-transition and host-call tests index
+	// core 1 into fixed-size [TotalNumberOfCores]T arrays, and JAM's dispute and
+	// authorization tests need a second core to observe re-assignment.
+	TotalNumberOfCores uint16 = 2
 
 	MaxTimeslotsForLookupAnchor = 14400
 

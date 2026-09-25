@@ -18,10 +18,14 @@ import (
 	"github.com/eigerco/strawberry/internal/validator"
 )
 
+// Dispute vote thresholds. For a production-sized validator set these are
+// exactly the GP values (0, V/3, 2V/3+1). The clamps keep the three buckets
+// distinct when V is too small to express them (V<3 makes V/3 collapse onto 0),
+// which the dev profile hits. Clamping is a no-op once V >= 3.
 const (
-	DisputeVoteBad   uint16 = 0                                          // 0 positive votes - report is bad
-	DisputeVoteWonky uint16 = constants.NumberOfValidators / 3           // 1/3 positive votes - report is wonky/unknowable
-	DisputeVoteGood  uint16 = (2 * constants.NumberOfValidators / 3) + 1 // 2/3+1 positive votes - report is good
+	DisputeVoteBad   uint16 = 0
+	DisputeVoteWonky uint16 = max(constants.NumberOfValidators/3, 1)
+	DisputeVoteGood  uint16 = max(2*constants.NumberOfValidators/3+1, DisputeVoteWonky+1)
 )
 
 // CalculateIntermediateCoreAssignmentsFromExtrinsics processes dispute verdicts to clear
