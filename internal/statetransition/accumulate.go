@@ -93,7 +93,26 @@ func (a *Accumulator) InvokePVM(accState state.AccumulationState, newTime jamtim
 	}
 
 	// F (equation B.10)
-	hostCallFunc := func(hostCall uint64, gasCounter pvm.Gas, regs pvm.Registers, mem pvm.Memory, ctx pvm.AccumulateContextPair) (pvm.Gas, pvm.Registers, pvm.Memory, pvm.AccumulateContextPair, error) {
+	//
+	// As in refine, the entry point and ecall indices come from the blob: the
+	// linker assigns both, so they are read rather than assumed.
+	guest, guestErr := pvm.PrepareGuest(c, "")
+	if guestErr != nil {
+		log.VM.Error().Err(guestErr).Msgf("error preparing service code")
+		return AccumulationOutput{AccumulationState: stateWithBalance}, nil
+	}
+	guestCode, guestErr := guest.Code()
+	if guestErr != nil {
+		log.VM.Error().Err(guestErr).Msgf("error framing service code")
+		return AccumulationOutput{AccumulationState: stateWithBalance}, nil
+	}
+
+	hostCallFunc := func(ecall uint64, gasCounter pvm.Gas, regs pvm.Registers, mem pvm.Memory, ctx pvm.AccumulateContextPair) (pvm.Gas, pvm.Registers, pvm.Memory, pvm.AccumulateContextPair, error) {
+		hostCall, ok := guest.HostCallID(ecall)
+		if !ok {
+			return gasCounter, regs, mem, ctx, pvm.ErrPanicf("unknown ecall %d", ecall)
+		}
+
 		log.VM.Debug().
 			Str("host_call", host_call.HostCallName(hostCall)).
 			Uint32("service_id", uint32(serviceIndex)).
@@ -166,7 +185,7 @@ func (a *Accumulator) InvokePVM(accState state.AccumulationState, newTime jamtim
 	}
 
 	errPanic := &pvm.ErrPanic{}
-	gasUsed, ret, newCtxPair, err := pvm.InvokeWholeProgram(c, 5, pvm.UGas(gas), args, hostCallFunc, newCtxPair)
+	gasUsed, ret, newCtxPair, err := pvm.InvokeWholeProgram(guestCode, guest.Entry, pvm.UGas(gas), args, hostCallFunc, newCtxPair)
 	if err != nil && (errors.Is(err, pvm.ErrOutOfGas) || errors.As(err, &errPanic)) {
 		log.VM.Error().Err(err).Msgf("Program invocation failed")
 		return AccumulationOutput{

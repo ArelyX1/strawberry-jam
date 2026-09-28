@@ -18,3 +18,4 @@ tests/simulation/output
 internal/crypto/bandersnatch/lib
 internal/erasurecoding/reedsolomon/lib
 benchmark_results.txt
+guests/target/

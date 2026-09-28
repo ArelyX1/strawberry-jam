@@ -16,11 +16,12 @@ type PolkavmBlob struct {
 
 // Section ids used by the linker for the pieces the PVM needs.
 const (
-	SectionROData  = 2
-	SectionRWData  = 3
-	SectionImports = 4
-	SectionExports = 5
-	SectionCode    = 6
+	SectionMemoryConfig = 1
+	SectionROData       = 2
+	SectionRWData       = 3
+	SectionImports      = 4
+	SectionExports      = 5
+	SectionCode         = 6
 )
 
 // readCompact decodes a JAM compact unsigned integer, returning the value and
@@ -144,6 +145,36 @@ func (b *PolkavmBlob) Exports() (map[string]uint64, error) {
 		p += int(nameLen)
 	}
 	return out, nil
+}
+
+// MemoryConfig carries the sizes the linker reserved: ro data, rw data and the
+// stack. The stack figure is the linker's own minimum, so the host does not
+// have to guess one.
+type MemoryConfig struct {
+	RODataSize uint32
+	RWDataSize uint32
+	StackSize  uint32
+}
+
+// MemoryConfig reads the reserved memory sizes, returning nil when the blob
+// carries no memory config section.
+func (b *PolkavmBlob) MemoryConfig() (*MemoryConfig, error) {
+	section, ok := b.Sections[SectionMemoryConfig]
+	if !ok {
+		return nil, nil
+	}
+	var cfg MemoryConfig
+	fields := []*uint32{&cfg.RODataSize, &cfg.RWDataSize, &cfg.StackSize}
+	p := 0
+	for _, field := range fields {
+		value, n, err := readVarint(section[p:])
+		if err != nil {
+			return nil, fmt.Errorf("memory config: %w", err)
+		}
+		*field = uint32(value)
+		p += n
+	}
+	return &cfg, nil
 }
 
 // EntryPoint returns the code offset of the named export. The chain's entry

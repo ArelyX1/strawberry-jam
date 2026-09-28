@@ -47,6 +47,10 @@ type ServiceCfg struct {
 	WelcomeAmount string `json:"welcomeAmount"`
 	FirstNonce    uint64 `json:"firstNonce"`
 	Endowment     string `json:"endowment"`
+	// Code names a polkavm guest blob to run the economy with, instead of the
+	// native Go handlers. The service account is the same either way, so the two
+	// can be swapped without migrating state.
+	Code string `json:"code,omitempty"`
 	// Issuer is the hex encoded Ed25519 public key of the only address that may
 	// mint. Genesis names keys rather than addresses because the address
 	// checksum is derived: the node renders each address itself, so the two

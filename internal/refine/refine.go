@@ -7,7 +7,7 @@ import (
 	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/pvm"
-	"github.com/eigerco/strawberry/internal/pvm/host_call"
+	host_call_pkg "github.com/eigerco/strawberry/internal/pvm/host_call"
 	"github.com/eigerco/strawberry/internal/service"
 	"github.com/eigerco/strawberry/internal/state"
 	"github.com/eigerco/strawberry/internal/work"
@@ -97,38 +97,55 @@ func (r *Refine) InvokePVM(
 	}
 
 	// F ∈ Ω⟨(D⟨N → M⟩, ⟦G⟧)⟩∶ (n, ϱ, φ, μ, (m, e))
-	hostCall := func(hostCall uint64, gasCounter pvm.Gas, regs pvm.Registers, mem pvm.Memory, ctxPair pvm.RefineContextPair) (pvm.Gas, pvm.Registers, pvm.Memory, pvm.RefineContextPair, error) {
+	//
+	// The guest's entry point and ecall indices are read out of the blob: the
+	// linker assigns both, so they cannot be assumed here.
+	guest, guestErr := pvm.PrepareGuest(pvmCode.Code, "")
+	if guestErr != nil {
+		return nil, nil, 0, ErrBad
+	}
+	guestCode, guestErr := guest.Code()
+	if guestErr != nil {
+		return nil, nil, 0, ErrBad
+	}
+
+	hostCall := func(ecall uint64, gasCounter pvm.Gas, regs pvm.Registers, mem pvm.Memory, ctxPair pvm.RefineContextPair) (pvm.Gas, pvm.Registers, pvm.Memory, pvm.RefineContextPair, error) {
+		hostCall, ok := guest.HostCallID(ecall)
+		if !ok {
+			return gasCounter, regs, mem, ctxPair, pvm.ErrPanicf("unknown ecall %d", ecall)
+		}
+
 		log.VM.Debug().
-			Str("host_call", host_call.HostCallName(hostCall)).
+			Str("host_call", host_call_pkg.HostCallName(hostCall)).
 			Uint32("service_id", uint32(w.ServiceId)).
 			Str("phase", "refine").
 			Msg("Host call invoked")
 
 		switch hostCall {
-		case host_call.GasID:
-			gasCounter, regs, err = host_call.GasRemaining(gasCounter, regs)
-		case host_call.FetchID:
+		case host_call_pkg.GasID:
+			gasCounter, regs, err = host_call_pkg.GasRemaining(gasCounter, regs)
+		case host_call_pkg.FetchID:
 			zeroHash := crypto.Hash{}
 			// TODO we need to pass the preimage data `x` instead of nil (where x = [[x ∣ (H(x), ∣x∣) <− wx] ∣ w <− pw])
-			gasCounter, regs, mem, err = host_call.Fetch(gasCounter, regs, mem, &workPackage, &zeroHash, authorizerHashOutput, &itemIndex, importedSegments, nil, nil)
-		case host_call.HistoricalLookupID:
-			gasCounter, regs, mem, ctxPair, err = host_call.HistoricalLookup(gasCounter, regs, mem, ctxPair, w.ServiceId, r.state.Services, workPackage.Context.LookupAnchor.Timeslot)
-		case host_call.ExportID:
-			gasCounter, regs, mem, ctxPair, err = host_call.Export(gasCounter, regs, mem, ctxPair, exportOffset)
-		case host_call.MachineID:
-			gasCounter, regs, mem, ctxPair, err = host_call.Machine(gasCounter, regs, mem, ctxPair)
-		case host_call.PeekID:
-			gasCounter, regs, mem, ctxPair, err = host_call.Peek(gasCounter, regs, mem, ctxPair)
-		case host_call.PokeID:
-			gasCounter, regs, mem, ctxPair, err = host_call.Poke(gasCounter, regs, mem, ctxPair)
-		case host_call.PagesID:
-			gasCounter, regs, mem, ctxPair, err = host_call.Pages(gasCounter, regs, mem, ctxPair)
-		case host_call.InvokeID:
-			gasCounter, regs, mem, ctxPair, err = host_call.Invoke(gasCounter, regs, mem, ctxPair)
-		case host_call.ExpungeID:
-			gasCounter, regs, mem, ctxPair, err = host_call.Expunge(gasCounter, regs, mem, ctxPair)
+			gasCounter, regs, mem, err = host_call_pkg.Fetch(gasCounter, regs, mem, &workPackage, &zeroHash, authorizerHashOutput, &itemIndex, importedSegments, nil, nil)
+		case host_call_pkg.HistoricalLookupID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.HistoricalLookup(gasCounter, regs, mem, ctxPair, w.ServiceId, r.state.Services, workPackage.Context.LookupAnchor.Timeslot)
+		case host_call_pkg.ExportID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.Export(gasCounter, regs, mem, ctxPair, exportOffset)
+		case host_call_pkg.MachineID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.Machine(gasCounter, regs, mem, ctxPair)
+		case host_call_pkg.PeekID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.Peek(gasCounter, regs, mem, ctxPair)
+		case host_call_pkg.PokeID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.Poke(gasCounter, regs, mem, ctxPair)
+		case host_call_pkg.PagesID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.Pages(gasCounter, regs, mem, ctxPair)
+		case host_call_pkg.InvokeID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.Invoke(gasCounter, regs, mem, ctxPair)
+		case host_call_pkg.ExpungeID:
+			gasCounter, regs, mem, ctxPair, err = host_call_pkg.Expunge(gasCounter, regs, mem, ctxPair)
 		default:
-			regs[pvm.R7] = uint64(host_call.WHAT)
+			regs[pvm.R7] = uint64(host_call_pkg.WHAT)
 			gasCounter -= RefineCost
 		}
 		// otherwise if ϱ′ < 0
@@ -139,7 +156,7 @@ func (r *Refine) InvokePVM(
 	}
 
 	// (g, r, (m, e)) = ΨM(Λ(δ[w_s], (p_x)t, w_c), 0, w_g, a, F, (∅, []))∶
-	remainingGas, result, ctxPair, err := pvm.InvokeWholeProgram(pvmCode.Code, 0, pvm.UGas(w.GasLimitRefine), args, hostCall, pvm.RefineContextPair{
+	remainingGas, result, ctxPair, err := pvm.InvokeWholeProgram(guestCode, guest.Entry, pvm.UGas(w.GasLimitRefine), args, hostCall, pvm.RefineContextPair{
 		IntegratedPVMMap: make(map[uint64]pvm.IntegratedPVM),
 		Segments:         []work.Segment{},
 	})

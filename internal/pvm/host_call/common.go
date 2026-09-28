@@ -2,7 +2,10 @@ package host_call
 
 import (
 	"math"
+	"sort"
+	"strings"
 
+	"github.com/eigerco/strawberry/internal/pvm"
 	. "github.com/eigerco/strawberry/internal/pvm" //nolint:staticcheck // TODO: remove dot import
 	"github.com/eigerco/strawberry/pkg/serialization/codec/jam"
 )
@@ -189,6 +192,40 @@ func HostCallName(id uint64) string {
 	}
 }
 
+// hostCallIDByCanonicalName inverts HostCallName. It exists because the ecall
+// index a guest emits is assigned by the linker in order of first call, so it
+// does not match the id the dispatcher switches on and has to be translated
+// back through the import symbol.
+var hostCallIDByCanonicalName = func() map[string]uint64 {
+	names := map[string]uint64{}
+	for id := uint64(GasID); id <= uint64(LogID); id++ {
+		if name := HostCallName(id); name != "unknown" {
+			names[name] = id
+		}
+	}
+	return names
+}()
+
+// HostCallIDForImport resolves a guest import symbol to a canonical host call
+// id. Guests name their imports freely, so the canonical name is matched as a
+// suffix: this keeps c3_read, read and service_read all resolving to ReadID.
+func HostCallIDForImport(symbol string) (uint64, bool) {
+	lower := strings.ToLower(symbol)
+	// Longest first so a longer name cannot be shadowed by a shorter suffix
+	// that also matches.
+	candidates := make([]string, 0, len(hostCallIDByCanonicalName))
+	for name := range hostCallIDByCanonicalName {
+		candidates = append(candidates, name)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return len(candidates[i]) > len(candidates[j]) })
+	for _, name := range candidates {
+		if strings.HasSuffix(lower, name) {
+			return hostCallIDByCanonicalName[name], true
+		}
+	}
+	return 0, false
+}
+
 func readNumber[U interface{ ~uint32 | ~uint64 | ~int64 }](mem Memory, addr uint64, length int) (u U, err error) {
 	b := make([]byte, length)
 	if addr > math.MaxUint32 {
@@ -234,4 +271,8 @@ func writeFromOffset(
 // Helper to check if a service id coming from a register is a uint32.
 func isServiceId(s uint64) bool {
 	return s <= math.MaxUint32
+}
+
+func init() {
+	pvm.ResolveHostCall = HostCallIDForImport
 }

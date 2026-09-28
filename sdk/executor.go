@@ -187,3 +187,17 @@ func (e *Executor) Accumulate(id block.ServiceId, items []RefinedItem, incoming 
 	result.Account = working
 	return result, nil
 }
+
+// Runtime is what the chain needs from a service implementation, whether the
+// logic is a Go handler or a polkavm guest. Both are driven the same way, so a
+// service can be swapped between them without touching the state transition.
+type Runtime interface {
+	Refine(id block.ServiceId, item []byte, timeslot jamtime.Timeslot, gasLimit uint64, all service.ServiceState) (Result, error)
+	Initialize(id block.ServiceId, timeslot jamtime.Timeslot, gasLimit uint64, all service.ServiceState) (Result, error)
+	Accumulate(id block.ServiceId, items []RefinedItem, incoming []service.DeferredTransfer, timeslot jamtime.Timeslot, gasLimit uint64, all service.ServiceState) (Result, error)
+}
+
+var (
+	_ Runtime = (*Executor)(nil)
+	_ Runtime = (*PVMExecutor)(nil)
+)

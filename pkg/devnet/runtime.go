@@ -9,6 +9,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/jamtime"
+	"github.com/eigerco/strawberry/internal/pvm"
 	"github.com/eigerco/strawberry/internal/service"
 	"github.com/eigerco/strawberry/internal/state"
 	"github.com/eigerco/strawberry/internal/state/merkle"
@@ -78,7 +80,7 @@ type Runtime struct {
 	root  crypto.Hash
 
 	registry   *svc.Registry
-	executor   *svc.Executor
+	executor   svc.Runtime
 	scheduler  *svc.Scheduler
 	papucoinID block.ServiceId
 	trie       *store.Trie
@@ -146,7 +148,20 @@ func New(opts Options) (*Runtime, error) {
 		return nil, fmt.Errorf("devnet: cannot register %s as service %d: %w", genesis.Service.Name, id, err)
 	}
 
-	executor := svc.NewExecutor(registry)
+	var executor svc.Runtime = svc.NewExecutor(registry)
+	if code := genesis.Service.Code; code != "" {
+		blob, err := loadGuestBlob(code)
+		if err != nil {
+			return nil, fmt.Errorf("devnet: cannot load guest %q: %w", code, err)
+		}
+		// The guest needs its entry point and ecall indices resolved before it
+		// runs, so fail here rather than at the first work item.
+		if _, err := pvm.PrepareGuest(blob, ""); err != nil {
+			return nil, fmt.Errorf("devnet: guest %q is not runnable: %w", code, err)
+		}
+		executor = svc.NewPVMExecutor(blob)
+		log.Printf("jam running the economy as a polkavm guest: %s", code)
+	}
 	scheduler := svc.NewScheduler(registry, int(constants.MaxNumberOfItems))
 
 	trieDB := opts.TrieDB
@@ -734,3 +749,21 @@ func encodeItem(item papucoin.Item) []byte {
 	}
 	return payload
 }
+
+// loadGuestBlob reads a guest blob named by the genesis. A path is taken as a
+// path; anything else is resolved against the guest directory, so a genesis can
+// ship a bare file name.
+func loadGuestBlob(name string) ([]byte, error) {
+	candidates := []string{name}
+	if !filepath.IsAbs(name) {
+		candidates = append(candidates, filepath.Join(guestDir, name))
+	}
+	for _, candidate := range candidates {
+		if blob, err := os.ReadFile(candidate); err == nil {
+			return blob, nil
+		}
+	}
+	return nil, fmt.Errorf("no blob at %v", candidates)
+}
+
+var guestDir = "guests"
