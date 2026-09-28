@@ -7,6 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/eigerco/strawberry/internal/constants"
 )
 
 func TestJamTime_FromTime(t *testing.T) {
@@ -228,7 +230,7 @@ func TestJamTime_IsInFutureTimeSlot(t *testing.T) {
 
 func TestJamTime_ToEpoch(t *testing.T) {
 	t.Run("jamtime to epoch", func(t *testing.T) {
-		jamTime := FromSeconds(3600) // 1 hour after JAM Epoch
+		jamTime := FromSeconds(epochSeconds(t)) // the first second of the second epoch
 		epoch := jamTime.ToEpoch()
 		expected := Epoch(1)
 		assert.Equal(t, expected, epoch)
@@ -241,13 +243,13 @@ func TestJamTech_FromEpoch(t *testing.T) {
 
 		convertedJamTime := FromEpoch(e)
 
-		assert.Equal(t, uint64(3600), convertedJamTime.Seconds)
+		assert.Equal(t, epochSeconds(t), convertedJamTime.Seconds)
 	})
 }
 
 func TestEpochAndTimeslotConversion(t *testing.T) {
 	t.Run("successfully converts jamtime to epoch and timeslot", func(t *testing.T) {
-		jamTime := FromSeconds(3600) // 1 hour after JAM Epoch
+		jamTime := FromSeconds(epochSeconds(t)) // the first second of the second epoch
 
 		epoch, timeslot := jamTime.ToEpochAndTimeslot()
 		expectedEpoch := Epoch(1)
@@ -264,13 +266,13 @@ func TestEpochAndTimeslotConversion(t *testing.T) {
 		jamTime, err := EpochAndTimeslotToJamTime(epoch, timeslot)
 		require.NoError(t, err)
 
-		expected := uint64(3606)
+		expected := epochSeconds(t) + uint64(TimeslotDuration.Seconds())
 
 		assert.Equal(t, expected, jamTime.Seconds)
 	})
 
 	t.Run("returns an error when timeslot is outside of accepted range", func(t *testing.T) {
-		timeslot := Timeslot(601)
+		timeslot := Timeslot(constants.TimeslotsPerEpoch + 1)
 		epoch := Epoch(1)
 
 		jamTime, err := EpochAndTimeslotToJamTime(epoch, timeslot)
@@ -314,20 +316,21 @@ func TestValidateJamTime(t *testing.T) {
 func TestJamTime_IsInSameEpoch(t *testing.T) {
 	t.Run("same epoch - beginning", func(t *testing.T) {
 		time1 := JamTime{Seconds: 0}
-		time2 := JamTime{Seconds: 3599}
+		time2 := JamTime{Seconds: epochSeconds(t) - 1}
 
 		assert.True(t, time1.IsInSameEpoch(time2))
 	})
 
 	t.Run("same epoch - middle", func(t *testing.T) {
-		time1 := JamTime{Seconds: 3600*100 + 1800}
-		time2 := JamTime{Seconds: 3600*100 + 3599}
+		epoch := epochSeconds(t) * 100
+		time1 := JamTime{Seconds: epoch + epochSeconds(t)/2}
+		time2 := JamTime{Seconds: epoch + epochSeconds(t) - 1}
 
 		assert.True(t, time1.IsInSameEpoch(time2))
 	})
 
 	t.Run("different epochs - consecutive", func(t *testing.T) {
-		time1 := JamTime{Seconds: 3599}
+		time1 := JamTime{Seconds: epochSeconds(t) - 1}
 		time2 := JamTime{Seconds: 3600}
 
 		assert.False(t, time1.IsInSameEpoch(time2))
@@ -369,7 +372,7 @@ func TestJamTime_IsInSameEpoch(t *testing.T) {
 
 	t.Run("zero and almost one epoch", func(t *testing.T) {
 		time1 := JamTime{Seconds: 0}
-		time2 := JamTime{Seconds: 3599}
+		time2 := JamTime{Seconds: epochSeconds(t) - 1}
 
 		assert.True(t, time1.IsInSameEpoch(time2))
 	})

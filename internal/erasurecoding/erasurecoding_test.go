@@ -51,13 +51,18 @@ func TestUnzipLace(t *testing.T) {
 }
 
 func TestEncodeDecodeRoundTripRandom(t *testing.T) {
+	// The sizes are multiples and near-multiples of the chunk size the chain spec
+	// defines, because that is what decides the shape of the encoding. A list of
+	// byte counts written down for mainnet would not be a list of interesting
+	// sizes for a spec with a different chunk size.
+	chunk := constants.ErasureCodingChunkSize
 	dataSizes := []int{
 		1,
-		684,
-		1368,
-		2052,
-		4096,
-		4104,
+		chunk,
+		2 * chunk,
+		3 * chunk,
+		6 * chunk,
+		6*chunk + 8,
 	}
 
 	seed := time.Now().UnixNano()
@@ -76,6 +81,18 @@ func TestEncodeDecodeRoundTripRandom(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, len(shards), OriginalShards+RecoveryShards)
 
+			// Losing shards is what erasure coding exists for, and it is only
+			// possible in a spec that carries recovery shards. The development spec
+			// has as many original shards as it has validators, so there is nothing
+			// to reconstruct from and saying so is better than passing a test that
+			// never lost anything.
+			if RecoveryShards == 0 {
+				shards[0] = nil
+				_, err := Decode(shards, size)
+				require.Error(t, err, "a spec with no recovery shards should refuse a decode it cannot do")
+				return
+			}
+
 			// Randomly remove RecoveryShards shards.
 			indices := rng.Perm(RecoveryShards)
 			for i := range indices {
@@ -91,6 +108,37 @@ func TestEncodeDecodeRoundTripRandom(t *testing.T) {
 			require.Equal(t, data, dataOut)
 		})
 	}
+}
+
+// TestEncodeWithoutRecoveryShards covers the chain specs that have no recovery
+// shards, the development spec among them.
+//
+// A code with no parity cannot reconstruct anything, so the honest answer is that
+// the shards decode while they are all there and are refused the moment one is
+// not. Shards that look like an encoding but cannot survive any loss are the one
+// answer that must not happen: a caller that stores them believes it can lose data
+// it cannot lose.
+func TestEncodeWithoutRecoveryShards(t *testing.T) {
+	if RecoveryShards != 0 {
+		t.Skipf("this chain spec has %d recovery shards, so it can lose data and recover it", RecoveryShards)
+	}
+
+	data := make([]byte, 2*constants.ErasureCodingChunkSize)
+	for i := range data {
+		data[i] = byte(i + 1)
+	}
+
+	shards, err := Encode(data)
+	require.NoError(t, err, "a spec with no recovery shards can still be encoded")
+	require.Len(t, shards, OriginalShards)
+
+	decoded, err := Decode(shards, len(data))
+	require.NoError(t, err)
+	require.Equal(t, data, decoded)
+
+	shards[0] = nil
+	_, err = Decode(shards, len(data))
+	require.Error(t, err, "a spec with no recovery shards cannot recover a missing shard, and has to say so")
 }
 
 func TestEncodeDecodeInitialTestVector(t *testing.T) {

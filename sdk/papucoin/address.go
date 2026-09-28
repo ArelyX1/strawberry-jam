@@ -106,6 +106,49 @@ func ValidChecksum(publicKey []byte) bool {
 	return bytes.Equal(AddressChecksum(publicKey), publicKey[ed25519.PublicKeySize:ed25519.PublicKeySize+4])
 }
 
+// AddressFromPublicKey renders a public key as a chain address. It is the
+// inverse of [ValidateChainAddress], and the only way to learn which address a
+// private key controls.
+func AddressFromPublicKey(publicKey ed25519.PublicKey) (string, error) {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("%w: public key is %d bytes, want %d", ErrInvalidAddress, len(publicKey), ed25519.PublicKeySize)
+	}
+	decoded := make([]byte, 0, decodedAddressLen)
+	decoded = append(decoded, publicKey...)
+	decoded = append(decoded, AddressChecksum(publicKey)...)
+	return SDLGPrefix + base58Encode(decoded), nil
+}
+
+// base58Encode renders bytes in base58 with the same alphabet [base58Decode]
+// reads, including one leading '1' per leading zero byte.
+func base58Encode(input []byte) string {
+	if len(input) == 0 {
+		return ""
+	}
+
+	leading := 0
+	for leading < len(input) && input[leading] == 0 {
+		leading++
+	}
+
+	number := new(big.Int).SetBytes(input)
+	radix := big.NewInt(58)
+	mod := new(big.Int)
+
+	var encoded []byte
+	for number.Sign() > 0 {
+		number.DivMod(number, radix, mod)
+		encoded = append(encoded, base58Alphabet[mod.Int64()])
+	}
+	for range leading {
+		encoded = append(encoded, base58Alphabet[0])
+	}
+	for i, j := 0, len(encoded)-1; i < j; i, j = i+1, j-1 {
+		encoded[i], encoded[j] = encoded[j], encoded[i]
+	}
+	return string(encoded)
+}
+
 // AddressChecksum returns the 4 byte checksum suffix for a public key.
 func AddressChecksum(publicKey []byte) []byte {
 	sum := blake2b.Sum256(publicKey)

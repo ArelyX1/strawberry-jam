@@ -14,15 +14,33 @@ type KVStore struct {
 }
 
 // NewKVStore initializes a new in-memory key-value store using Pebble.
+//
+// Nothing written to it survives the process, which is what the conformance
+// tests and the throwaway dev node want. A node that has to keep its blocks
+// and its state root across restarts has to use [NewKVStoreAt] instead.
 func NewKVStore() (*KVStore, error) {
+	return openStore("", vfs.NewMem())
+}
+
+// NewKVStoreAt initializes a key-value store backed by a directory on disk, so
+// blocks, headers and the state trie outlive the process. An empty path falls
+// back to the in-memory store, which keeps every existing caller working.
+func NewKVStoreAt(path string) (*KVStore, error) {
+	if path == "" {
+		return NewKVStore()
+	}
+	return openStore(path, vfs.Default)
+}
+
+func openStore(path string, fs vfs.FS) (*KVStore, error) {
 	opts := &pebble.Options{
-		FS:                          vfs.NewMem(), // Use in-memory filesystem
+		FS:                          fs,
 		Cache:                       pebble.NewCache(64 * 1024 * 1024),
 		MemTableSize:                32 * 1024 * 1024,
 		MemTableStopWritesThreshold: 4,
 	}
 
-	db, err := pebble.Open("", opts) // Empty string for path when using in-memory FS
+	db, err := pebble.Open(path, opts)
 	if err != nil {
 		return nil, err
 	}

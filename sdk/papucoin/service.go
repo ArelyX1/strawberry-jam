@@ -45,6 +45,15 @@ type Item struct {
 	// Raw is a relayed EVM transaction, hex encoded. It is only meaningful
 	// for a transfer, and only when a RelayVerifier is configured.
 	Raw string `json:"raw,omitempty"`
+	// MustBeSigned marks an item whose Sender has to prove it sent the item.
+	// System items, such as the ones the node mints from its own funds, leave
+	// it false; anything that arrives from outside sets it. The flag is a claim
+	// made by whoever builds the item, so the node has to set it on the way in
+	// rather than trust a payload to ask for its own proof.
+	MustBeSigned bool `json:"mustBeSigned"`
+	// Signature is the hex encoded Ed25519 signature of [SignablePayload] by
+	// the key behind Sender, and is only consulted when MustBeSigned is set.
+	Signature string `json:"signature,omitempty"`
 }
 
 // Op is the refined result of an item. Every core in the assigned set computes
@@ -187,6 +196,15 @@ func refineItem(ctx svc.RefineContext, payload []byte, params Params, issuer str
 	sender, err := NormalizeAddress(item.Sender)
 	if err != nil {
 		return nil, err
+	}
+
+	// An item that claims to come from outside has to be able to prove it. This
+	// runs before anything is read from the account, so an unproven sender costs
+	// nothing and can never be the actor of an operation.
+	if item.MustBeSigned {
+		if _, err := VerifyItemSignature(item); err != nil {
+			return nil, err
+		}
 	}
 
 	op := Op{Op: item.Method, Actor: sender, Sender: sender, Nonce: item.Nonce, Memo: item.Memo}

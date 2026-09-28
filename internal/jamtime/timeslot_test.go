@@ -136,25 +136,25 @@ func TestTimeSlot_TimeslotInEpoch(t *testing.T) {
 	})
 
 	t.Run("last timeslot of first epoch", func(t *testing.T) {
-		ts := Timeslot(599)
+		ts := Timeslot(constants.TimeslotsPerEpoch - 1)
 		result := ts.TimeslotInEpoch()
 
-		assert.Equal(t, uint32(599), result)
+		assert.Equal(t, uint32(constants.TimeslotsPerEpoch-1), result)
 		assert.False(t, ts.IsFirstTimeslotInEpoch())
 		assert.True(t, ts.IsLastTimeslotInEpoch())
 	})
 
 	t.Run("middle timeslot of first epoch", func(t *testing.T) {
-		ts := Timeslot(300)
+		ts := Timeslot(constants.TimeslotsPerEpoch / 2)
 		result := ts.TimeslotInEpoch()
 
-		assert.Equal(t, uint32(300), result)
+		assert.Equal(t, uint32(constants.TimeslotsPerEpoch/2), result)
 		assert.False(t, ts.IsFirstTimeslotInEpoch())
 		assert.False(t, ts.IsLastTimeslotInEpoch())
 	})
 
 	t.Run("first timeslot of second epoch", func(t *testing.T) {
-		ts := Timeslot(600)
+		ts := Timeslot(constants.TimeslotsPerEpoch)
 		result := ts.TimeslotInEpoch()
 
 		assert.Equal(t, uint32(0), result)
@@ -162,11 +162,13 @@ func TestTimeSlot_TimeslotInEpoch(t *testing.T) {
 		assert.False(t, ts.IsLastTimeslotInEpoch())
 	})
 
-	t.Run("random timeslot in a later epoch", func(t *testing.T) {
-		ts := Timeslot(123456)
+	t.Run("a timeslot in the middle of a later epoch", func(t *testing.T) {
+		// The sixth timeslot of the hundredth epoch, which is neither the first nor
+		// the last whatever the chain spec says an epoch is.
+		ts := Timeslot(constants.TimeslotsPerEpoch*100 + 5)
 		result := ts.TimeslotInEpoch()
 
-		assert.Equal(t, uint32(456), result)
+		assert.Equal(t, uint32(5), result)
 		assert.False(t, ts.IsFirstTimeslotInEpoch())
 		assert.False(t, ts.IsLastTimeslotInEpoch())
 	})
@@ -174,7 +176,7 @@ func TestTimeSlot_TimeslotInEpoch(t *testing.T) {
 	t.Run("Max timeslot", func(t *testing.T) {
 		ts := Timeslot(4294967295) // 2^32 - 1
 		result := ts.TimeslotInEpoch()
-		assert.Equal(t, uint32(495), result)
+		assert.Equal(t, uint32(4294967295%constants.TimeslotsPerEpoch), result)
 		assert.False(t, ts.IsFirstTimeslotInEpoch())
 		assert.False(t, ts.IsLastTimeslotInEpoch())
 	})
@@ -188,13 +190,13 @@ func TestTimeSlot_ToEpoch(t *testing.T) {
 	})
 
 	t.Run("last timeslot of first epoch", func(t *testing.T) {
-		ts := Timeslot(599)
+		ts := Timeslot(constants.TimeslotsPerEpoch - 1)
 		epoch := ts.ToEpoch()
 		assert.Equal(t, Epoch(0), epoch)
 	})
 
 	t.Run("first timeslot of second epoch", func(t *testing.T) {
-		ts := Timeslot(600)
+		ts := Timeslot(constants.TimeslotsPerEpoch)
 		epoch := ts.ToEpoch()
 		assert.Equal(t, Epoch(1), epoch)
 	})
@@ -202,37 +204,37 @@ func TestTimeSlot_ToEpoch(t *testing.T) {
 	t.Run("middle timeslot of arbitrary epoch", func(t *testing.T) {
 		ts := Timeslot(123456)
 		epoch := ts.ToEpoch()
-		assert.Equal(t, Epoch(205), epoch)
+		assert.Equal(t, Epoch(123456/constants.TimeslotsPerEpoch), epoch)
 	})
 
 	t.Run("last timeslot of arbitrary epoch", func(t *testing.T) {
-		ts := Timeslot(1199)
+		ts := Timeslot(2*constants.TimeslotsPerEpoch - 1)
 		epoch := ts.ToEpoch()
 		assert.Equal(t, Epoch(1), epoch)
 	})
 
 	t.Run("first timeslot of last possible epoch", func(t *testing.T) {
-		ts := Timeslot(4294966800) // 7158278 * 600
+		ts := Timeslot(uint32(MaxEpoch) * constants.TimeslotsPerEpoch)
 		epoch := ts.ToEpoch()
-		assert.Equal(t, Epoch(7158278), epoch)
+		assert.Equal(t, MaxEpoch, epoch)
 	})
 
 	t.Run("last timeslot of last possible epoch", func(t *testing.T) {
 		ts := Timeslot(4294967295) // uint32 max
 		epoch := ts.ToEpoch()
-		assert.Equal(t, Epoch(7158278), epoch)
+		assert.Equal(t, MaxEpoch, epoch)
 	})
 
 	t.Run("epoch boundary check", func(t *testing.T) {
-		ts1 := Timeslot(599)
-		ts2 := Timeslot(600)
+		ts1 := Timeslot(constants.TimeslotsPerEpoch - 1)
+		ts2 := Timeslot(constants.TimeslotsPerEpoch)
 		assert.NotEqual(t, ts1.ToEpoch(), ts2.ToEpoch())
 	})
 
 	t.Run("large timeslot value", func(t *testing.T) {
 		ts := Timeslot(1000000)
 		epoch := ts.ToEpoch()
-		assert.Equal(t, Epoch(1666), epoch)
+		assert.Equal(t, Epoch(1000000/constants.TimeslotsPerEpoch), epoch)
 	})
 
 	t.Run("consistency check with TimeslotInEpoch", func(t *testing.T) {
@@ -240,7 +242,7 @@ func TestTimeSlot_ToEpoch(t *testing.T) {
 		epoch := ts.ToEpoch()
 		inEpoch := ts.TimeslotInEpoch()
 
-		want := Timeslot(uint32(epoch)*600 + inEpoch)
+		want := Timeslot(uint32(epoch)*constants.TimeslotsPerEpoch + inEpoch)
 
 		assert.Equal(t, ts, want)
 	})

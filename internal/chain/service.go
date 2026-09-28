@@ -62,16 +62,37 @@ func NewBlockService(kvStore *pebble.KVStore) (*BlockService, error) {
 	return bs, nil
 }
 
+// GenesisParent is what the genesis block names as its parent. It is the marker
+// that tells one genesis block from any other, so a node can find the chain it was
+// already running, and so the blocks it produced can be told from the block that
+// chain began with.
+var GenesisParent = crypto.Hash{1}
+
 // initializeState sets up the initial blockchain state:
-// 1. Creates and stores the genesis block
-// 2. Sets genesis as the latest finalized block
+//  1. Creates and stores the genesis block, unless the chain already has one
+//  2. Sets the latest finalized block to the end of the chain it holds
 //
 // TODO: This is still a `mock` implementation.
 func (bs *BlockService) initializeState() error {
-	// For now use genesis block
+	// A chain that already has blocks keeps them. Writing a new genesis over them
+	// on every start would found a new chain each time a node was restarted, and
+	// would leave the blocks of the old one pointing at a parent nobody has.
+	if header, hash, found := bs.GenesisHeader(); found {
+		bs.mu.Lock()
+		defer bs.mu.Unlock()
+		bs.LatestFinalized = LatestFinalized{
+			Hash:          hash,
+			TimeSlotIndex: header.TimeSlotIndex,
+		}
+		return nil
+	}
+
+	// A dev chain is dated when it is started. JAM's genesis sits at the beginning
+	// of JAM time, which is millions of timeslots ago, and a node that started
+	// there would have to produce every timeslot since to reach the present.
 	genesisHeader := block.Header{
-		ParentHash:       crypto.Hash{1},
-		TimeSlotIndex:    jamtime.Timeslot(1),
+		ParentHash:       GenesisParent,
+		TimeSlotIndex:    jamtime.Now().ToTimeslot(),
 		BlockAuthorIndex: 0,
 	}
 	hash, err := genesisHeader.Hash()
@@ -94,6 +115,30 @@ func (bs *BlockService) initializeState() error {
 		TimeSlotIndex: genesisHeader.TimeSlotIndex,
 	}
 	return nil
+}
+
+// GenesisHeader returns the genesis block of the chain this store holds, if it has
+// one. It is what a node that was restarted recognises its own chain by.
+func (bs *BlockService) GenesisHeader() (block.Header, crypto.Hash, bool) {
+	var (
+		header block.Header
+		hash   crypto.Hash
+		found  bool
+	)
+	if _, _, err := bs.Store.FindHeader(func(h block.Header) bool {
+		if h.ParentHash != GenesisParent {
+			return false
+		}
+		candidate, err := h.Hash()
+		if err != nil {
+			return false
+		}
+		header, hash, found = h, candidate, true
+		return true
+	}); err != nil {
+		return block.Header{}, crypto.Hash{}, false
+	}
+	return header, hash, found
 }
 
 // checkFinalization determines if a block can be finalized by:

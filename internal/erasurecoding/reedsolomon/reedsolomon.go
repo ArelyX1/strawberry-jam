@@ -119,6 +119,14 @@ func (r *Encoder) Encode(
 		return errors.New("invalid shard size")
 	}
 
+	// A code with no recovery shards has no parity to compute: the shards that come
+	// out are the shards that went in. The reed-solomon library rejects this shape,
+	// but a chain spec that asks for no redundancy is a spec that can still be
+	// encoded, and the answer a caller needs is an encoding rather than an error.
+	if r.recoveryShardsCount == 0 {
+		return nil
+	}
+
 	flatOriginalShards := make([]byte, r.originalShardsCount*shardSize)
 	for i, s := range shards[:r.originalShardsCount] {
 		if len(s) != shardSize {
@@ -165,6 +173,16 @@ func (r *Encoder) Decode(shards [][]byte) error {
 	shardSize := ShardSize(shards)
 	if shardSize == 0 || shardSize > MaxShardSize {
 		return errors.New("invalid shard size")
+	}
+
+	// With no recovery shards there is nothing to recover from, so the only thing
+	// left to do is refuse when a shard is actually missing. The data of a spec
+	// without parity is only whole while every shard of it is.
+	if r.recoveryShardsCount == 0 {
+		if ShardCount(shards[:r.originalShardsCount]) != r.originalShardsCount {
+			return errors.New("no recovery shards to recover a missing shard from")
+		}
+		return nil
 	}
 
 	flatOriginalShards := []byte{}

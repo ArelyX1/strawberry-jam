@@ -35,7 +35,17 @@ func TestGetAllEpochsNeighborValidators(t *testing.T) {
 
 	neighbors, err := mapper.GetAllEpochsNeighborValidators(0)
 	assert.NoError(t, err)
-	assert.Len(t, neighbors, 64) //62 neighbors + 1 archived + 1 queued
+
+	// How many neighbors a validator has is a property of the grid, and the grid is
+	// the chain spec's validator count laid out as close to a square as it goes, so
+	// the count is not a number this test gets to write down. What is worth
+	// checking here is the shape: the neighbors across epochs are the ones in this
+	// epoch plus the validator that held this index before and the one that will
+	// hold it next.
+	sameEpoch, err := mapper.GetCurrentEpochNeighborValidators(0)
+	assert.NoError(t, err)
+	assert.Len(t, neighbors, len(sameEpoch)+2, "neighbors + one archived + one queued")
+	assert.ElementsMatch(t, sameEpoch, neighbors[2:], "the same epoch neighbors come last, and unchanged")
 }
 
 func TestFindValidatorIndex(t *testing.T) {
@@ -65,15 +75,21 @@ func TestIsNeighbor(t *testing.T) {
 	key5 := ed25519.PublicKey("key5")
 	keyNotValidator := ed25519.PublicKey("notvalidator")
 
-	// Calculate grid width based on total validator count
+	// The grid is the chain spec's validator count laid out as close to a square as
+	// it goes, and a scenario about rows and columns needs a grid that has more
+	// than one of them.
 	gridWidth := uint16(math.Floor(math.Sqrt(float64(constants.NumberOfValidators))))
+	if gridWidth < 2 || constants.NumberOfValidators < 4 {
+		t.Skipf("this chain spec has %d validators, a %d-wide grid, which has no second row or column to compare against",
+			constants.NumberOfValidators, gridWidth)
+	}
 
 	// Setup indices for different test scenarios
 	sameRowIdx1 := uint16(0)
 	sameRowIdx2 := uint16(1)
 	sameColIdx2 := gridWidth
 	differentIdx := gridWidth + 1
-	crossEpochIdx := uint16(42)
+	crossEpochIdx := uint16(constants.NumberOfValidators - 1)
 
 	// Setup validators in current epoch
 	currentValidators[sameRowIdx1] = crypto.ValidatorKey{Ed25519: key1}

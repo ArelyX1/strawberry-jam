@@ -15,6 +15,20 @@ import (
 	"github.com/eigerco/strawberry/internal/work"
 )
 
+// The number of shards a work bundle is cut into, and how big each one is, is
+// decided by the chain spec: one shard per validator, sized to the spec's chunk
+// size. A count written down here would only ever be right for one of them.
+func expectedShardCount() int {
+	return erasurecoding.OriginalShards + erasurecoding.RecoveryShards
+}
+
+// A shard is one strip of the data across the spec's original shards, so its
+// length follows from how many strips the data needs and how wide one is.
+func expectedShardLen(dataLen int) int {
+	chunks := (dataLen + constants.ErasureCodingChunkSize - 1) / constants.ErasureCodingChunkSize
+	return chunks * erasurecoding.ChunkShardSize
+}
+
 // Helper functions
 func createTestSegment(pattern byte) (seg work.Segment) {
 	for i := range seg {
@@ -37,9 +51,9 @@ func TestEraseBundleAndSegments(t *testing.T) {
 		sd, err := ShardBundleAndSegments(audBlob, []work.Segment{})
 		require.NoError(t, err)
 
-		assert.Len(t, sd.Bundle, 1023)
+		assert.Len(t, sd.Bundle, expectedShardCount())
 		assert.Len(t, sd.Segments, 0)
-		assert.Len(t, sd.BundleHashAndSegmentsRoot, 1023)
+		assert.Len(t, sd.BundleHashAndSegmentsRoot, expectedShardCount())
 		for _, pair := range sd.BundleHashAndSegmentsRoot {
 			assert.Len(t, pair, 32) // the pair should contain only one hash
 		}
@@ -58,10 +72,10 @@ func TestEraseBundleAndSegments(t *testing.T) {
 		segmentProofShards, err := erasurecoding.Encode(segmentProofs[0][:])
 		require.NoError(t, err)
 
-		expectedSegmentsForShards := make([][][]byte, 1023)
+		expectedSegmentsForShards := make([][][]byte, expectedShardCount())
 		for i := range expectedSegmentsForShards {
-			assert.Len(t, segmentShards[i], 12)
-			assert.Len(t, segmentProofShards[i], 12)
+			assert.Len(t, segmentShards[i], expectedShardLen(constants.SizeOfSegment))
+			assert.Len(t, segmentProofShards[i], expectedShardLen(constants.SizeOfSegment))
 
 			require.NoError(t, err)
 			expectedSegmentsForShards[i] = [][]byte{
@@ -73,9 +87,9 @@ func TestEraseBundleAndSegments(t *testing.T) {
 		sd, err := ShardBundleAndSegments(audBlob, []work.Segment{segment})
 		require.NoError(t, err)
 
-		assert.Len(t, sd.Bundle, 1023)
+		assert.Len(t, sd.Bundle, expectedShardCount())
 		assert.Equal(t, expectedSegmentsForShards, sd.Segments)
-		assert.Len(t, sd.BundleHashAndSegmentsRoot, 1023)
+		assert.Len(t, sd.BundleHashAndSegmentsRoot, expectedShardCount())
 		for i, pair := range sd.BundleHashAndSegmentsRoot {
 			require.Len(t, pair, 64) // the pair should contain two hashes
 			assert.Equal(t, crypto.Hash(pair[32:]), binary_tree.ComputeWellBalancedRoot([][]byte{segmentShards[i], segmentProofShards[i]}, crypto.HashData))
@@ -102,11 +116,11 @@ func TestEraseBundleAndSegments(t *testing.T) {
 		segmentProofShards, err := erasurecoding.Encode(segmentProofs[0][:])
 		require.NoError(t, err)
 
-		expectedSegmentsForShards := make([][][]byte, 1023)
+		expectedSegmentsForShards := make([][][]byte, expectedShardCount())
 		for i := range expectedSegmentsForShards {
-			assert.Len(t, segment1Shards[i], 12)
-			assert.Len(t, segment2Shards[i], 12)
-			assert.Len(t, segmentProofShards[i], 12)
+			assert.Len(t, segment1Shards[i], expectedShardLen(constants.SizeOfSegment))
+			assert.Len(t, segment2Shards[i], expectedShardLen(constants.SizeOfSegment))
+			assert.Len(t, segmentProofShards[i], expectedShardLen(constants.SizeOfSegment))
 
 			require.NoError(t, err)
 			expectedSegmentsForShards[i] = [][]byte{
@@ -118,9 +132,9 @@ func TestEraseBundleAndSegments(t *testing.T) {
 		sd, err := ShardBundleAndSegments(audBlob, []work.Segment{segment1, segment2})
 		require.NoError(t, err)
 
-		assert.Len(t, sd.Bundle, 1023)
+		assert.Len(t, sd.Bundle, expectedShardCount())
 		assert.Equal(t, expectedSegmentsForShards, sd.Segments)
-		assert.Len(t, sd.BundleHashAndSegmentsRoot, 1023)
+		assert.Len(t, sd.BundleHashAndSegmentsRoot, expectedShardCount())
 		for i, pair := range sd.BundleHashAndSegmentsRoot {
 			_ = i
 			require.Len(t, pair, 64) // the pair should contain two hashes

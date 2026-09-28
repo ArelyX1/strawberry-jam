@@ -1,0 +1,59 @@
+{
+  "network": "sdlg-jam",
+  "description": "Economia CRYPTOPAPU (PAPU) como service JAM sobre el nodo Go. Las claves de estado son las del SDK de Go, no las de node-ts, asi que la state root de esta red no coincide con la de la red TypeScript.",
+  "generatedFrom": "node-ts/genesis/genesis.json",
+  "timeslotSecs": 6,
+  "service": {
+    "id": 0,
+    "name": "CRYPTOPAPU",
+    "symbol": "PAPU",
+    "decimals": 12,
+    "maxSupply": "1000000000",
+    "transferFee": "0.000001",
+    "faucetAmount": "10000",
+    "welcomeAmount": "5",
+    "firstNonce": 1,
+    "endowment": "1000000000000",
+    "issuer": "485f178cef1a3b46476f31b1bb69b9e0dfd7ab354ea6d2291ba040fd4ed05b64",
+    "accounts": [
+      {
+        "publicKey": "0741d1215adc4ffaa76a0c92475e38bee1fcf68490ad3f72c5a5b7783e6f639c",
+        "amount": "100000"
+      },
+      {
+        "publicKey": "136eba951c75b267889b477d207021211cd183ca86d3edec3b95724a221a9c46",
+        "amount": "1000000"
+      },
+      {
+        "publicKey": "21bdbfcf78c3c048ef5fbfd0a3177afe738ecfd170e700af4710fcd0c923be45",
+        "amount": "1000000"
+      },
+      {
+        "publicKey": "2354d89218a3a805e9dec6758046280bedc277c46e5e490bd58405e3ed86e037",
+        "amount": "100000"
+      },
+      {
+        "publicKey": "26a8f8227f35674ecf5431723072f861e0251621d81d85afc4688407698ac9e8",
+        "amount": "100000"
+      },
+      {
+        "publicKey": "485f178cef1a3b46476f31b1bb69b9e0dfd7ab354ea6d2291ba040fd4ed05b64",
+        "amount": "700000000"
+      },
+      {
+        "publicKey": "600e56f81e2982c2fd1fbb3ddf1b9f4fe6c80057de99a3709f7f2d2357b504a3",
+        "amount": "100000"
+      },
+      {
+        "publicKey": "edeb266f32fe63109e168ad109dcf17a9378aa334cf2324580d5ca5b88a8622c",
+        "amount": "1000000"
+      }
+    ]
+  },
+  "evm": {
+    "chainId": 5120,
+    "name": "Mundo SDLG",
+    "symbol": "PAPU",
+    "decimals": 18
+  }
+}

@@ -26,6 +26,16 @@ type rpcServer struct {
 	subs        map[uint]chan<- subscribeEvent
 	subID       uint
 	subMu       sync.Mutex
+	// papucoin serves the economy, and is nil only on a node built without a
+	// runtime, which cannot happen on a node that produces blocks.
+	papucoin *papucoinHandlers
+	// rebuilt is closed once this node has rebuilt the state its blocks describe.
+	//
+	// Until then the state in memory is a state part way through a replay, and a
+	// node that answers a balance or a state root from it is answering about a
+	// chain that never existed. A caller waits here rather than being told a
+	// number that is about to change under it.
+	rebuilt chan struct{}
 }
 
 type subscribeEvent struct {
@@ -41,6 +51,7 @@ func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainS
 		chainStore:  chainStore,
 		bs:          bs,
 		subs:        make(map[uint]chan<- subscribeEvent),
+		rebuilt:     make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	wsServer := &websocket.Server{
@@ -56,6 +67,20 @@ func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainS
 		}
 		srv.handleHTTP(w, r)
 	})
+	// A node that was restarted still has the chain it was running, so the RPC
+	// starts from the tip that is on disk rather than waiting for the first block
+	// of this run to be produced before it can answer anything.
+	if tip, found := srv.loadTip(); found {
+		srv.mu.Lock()
+		srv.latestHash = tip.hash
+		srv.blockNum = tip.number
+		srv.mu.Unlock()
+		log.Internal.Info().
+			Str("hash", hashToHex(tip.hash)).
+			Uint("number", tip.number).
+			Msg("the RPC is answering for the chain on disk")
+	}
+
 	log.Internal.Info().Msgf("RPC server listening on ws://%s and http://%s", addr, addr)
 	go func() {
 		if err := http.ListenAndServe(addr, mux); err != nil {
@@ -63,6 +88,30 @@ func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainS
 		}
 	}()
 	return srv
+}
+
+// markRebuilt says the state this node rebuilt from its own blocks is the state it
+// is carrying, so the answers it gives are answers about a chain.
+func (s *rpcServer) markRebuilt() { close(s.rebuilt) }
+
+// waitRebuilt holds a caller until the state has been rebuilt. It is closed on a
+// node whose replay failed too, but that node does not survive to answer anything.
+func (s *rpcServer) waitRebuilt() { <-s.rebuilt }
+
+// readsTheChain is the set of methods whose answer depends on a state this node
+// has to rebuild from its blocks. A wallet asking for a balance during the replay
+// would be told a number that changes a second later, which is worse than a
+// second of waiting.
+func readsTheChain(method string) bool {
+	switch method {
+	case "papucoin_balance", "papucoin_supply", "papucoin_submit", "papucoin_faucet",
+		"jam_getHeader", "jam_stateRoot", "jam_serviceAccount", "jam_getStorage",
+		"eth_blockNumber", "eth_getBalance", "eth_getTransactionCount",
+		"eth_getBlockByNumber", "eth_sendRawTransaction", "eth_call", "eth_estimateGas":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *rpcServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +144,46 @@ func isSubscription(method string) bool {
 		method == "state_subscribeMetadata" ||
 		method == "state_unsubscribeRuntimeVersion" ||
 		method == "state_unsubscribeMetadata"
+}
+
+// tip is the last block a chain has, as far as this node is concerned.
+type tip struct {
+	hash   crypto.Hash
+	number uint
+}
+
+// loadTip finds the newest block the store holds. Headers are keyed by their own
+// hash, so they are not stored in any order this can lean on, and the newest one
+// is the one with the highest timeslot.
+func (s *rpcServer) loadTip() (tip, bool) {
+	var (
+		newest block.Header
+		found  bool
+		number uint
+	)
+	if _, _, err := s.chainStore.FindHeader(func(h block.Header) bool {
+		if h.ParentHash == chain.GenesisParent {
+			return false
+		}
+		if !found || h.TimeSlotIndex > newest.TimeSlotIndex {
+			newest, found = h, true
+		}
+		return false
+	}); err != nil || !found {
+		return tip{}, false
+	}
+	hash, err := newest.Hash()
+	if err != nil {
+		return tip{}, false
+	}
+	// The number of a block is how many blocks sit between the genesis and it, and
+	// the timeslots of a chain this node produces are one per block, so the count
+	// comes from the timeslots rather than from a walk that would have to read
+	// every header back.
+	if genesis, _, ok := s.bs.GenesisHeader(); ok {
+		number = uint(newest.TimeSlotIndex-genesis.TimeSlotIndex) + 1
+	}
+	return tip{hash: hash, number: number}, true
 }
 
 func (s *rpcServer) updateBlock(hash crypto.Hash, num uint, h block.Header) {
@@ -284,6 +373,14 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 				"chain_unsubscribeFinalizedHeads", "chain_getRuntimeVersion",
 				"state_getRuntimeVersion", "state_getMetadata",
 				"state_subscribeRuntimeVersion", "state_unsubscribeRuntimeVersion",
+				"jam_stateRoot", "jam_serviceAccount", "jam_getStorage", "jam_getHeader",
+				// Lo que una billetera que solo habla Ethereum pregunta. Cada uno
+				// responde con lo que la cadena tiene, y eth_call dice que no hay
+				// respuesta honesta todavia.
+				"eth_chainId", "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount",
+				"eth_gasPrice", "eth_estimateGas", "eth_getBlockByNumber", "eth_sendRawTransaction", "eth_call",
+				"papucoin_chainParams", "papucoin_balance", "papucoin_supply",
+				"papucoin_submit", "papucoin_faucet",
 			},
 		}}
 	case "system_chain":
@@ -386,6 +483,10 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: sid}
 	case "state_unsubscribeRuntimeVersion", "state_unsubscribeMetadata":
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: true}
+	case "papucoin_chainParams", "papucoin_balance", "papucoin_supply", "papucoin_submit", "papucoin_faucet", "jam_stateRoot", "jam_serviceAccount", "jam_getStorage", "jam_getHeader",
+		"eth_chainId", "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount",
+		"eth_gasPrice", "eth_estimateGas", "eth_getBlockByNumber", "eth_sendRawTransaction", "eth_call":
+		return s.papucoinCall(req)
 	case "system_syncState":
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: map[string]interface{}{
 			"currentBlock": fmt.Sprintf("0x%x", s.blockNum),
@@ -399,4 +500,72 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 			Error: &rpcErr{Code: -32601, Message: fmt.Sprintf("Method not found: %s", req.Method)},
 		}
 	}
+}
+
+// papucoinCall dispatches the economy methods. They are all answered from the
+// state the node committed, never from a cache the RPC keeps of its own.
+func (s *rpcServer) papucoinCall(req rpcReq) *rpcResp {
+	if s.papucoin == nil {
+		return &rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32601, Message: "this node has no PAPU service"}}
+	}
+
+	params, err := paramsOf(req.Params)
+	if err != nil {
+		return &rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32602, Message: err.Error()}}
+	}
+
+	// Everything below answers about the chain as it is, and the chain is not
+	// this node yet until it has rebuilt the state its own blocks describe. A node
+	// that answered during its own replay would be describing a state no block
+	// ever named, so the answer waits instead.
+	if readsTheChain(req.Method) {
+		s.waitRebuilt()
+	}
+
+	var result any
+	switch req.Method {
+	case "papucoin_chainParams":
+		result, err = s.papucoin.chainParams()
+	case "papucoin_balance":
+		result, err = s.papucoin.balance(params)
+	case "papucoin_supply":
+		result, err = s.papucoin.supply()
+	case "papucoin_submit":
+		result, err = s.papucoin.submit(params)
+	case "papucoin_faucet":
+		result, err = s.papucoin.faucet(params)
+	case "jam_getHeader":
+		result, err = s.papucoin.header()
+	case "eth_chainId":
+		result, err = s.papucoin.evmChainID()
+	case "eth_blockNumber":
+		result, err = s.papucoin.evmBlockNumber()
+	case "eth_getBalance":
+		result, err = s.papucoin.evmGetBalance(params)
+	case "eth_getTransactionCount":
+		result, err = s.papucoin.evmGetTransactionCount(params)
+	case "eth_gasPrice":
+		result, err = s.papucoin.evmGasPrice()
+	case "eth_getBlockByNumber":
+		result, err = s.papucoin.evmGetBlockByNumber(params)
+	case "eth_sendRawTransaction":
+		result, err = s.papucoin.sendRawTransaction(params)
+	case "eth_estimateGas":
+		result, err = s.papucoin.evmEstimateGas(params)
+	case "eth_call":
+		result, err = s.papucoin.evmCall()
+	case "jam_stateRoot":
+		result, err = s.papucoin.stateRoot()
+	case "jam_serviceAccount":
+		result, err = s.papucoin.serviceAccount()
+	case "jam_getStorage":
+		result, err = s.papucoin.storage(params)
+	default:
+		return &rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32601, Message: fmt.Sprintf("Method not found: %s", req.Method)}}
+	}
+
+	if err != nil {
+		return &rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32000, Message: err.Error()}}
+	}
+	return &rpcResp{JSONRPC: "2.0", ID: req.ID, Result: result}
 }

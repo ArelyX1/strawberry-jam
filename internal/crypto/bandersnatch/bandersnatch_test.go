@@ -55,11 +55,16 @@ func TestRingSignAndVerify(t *testing.T) {
 	}
 
 	// Including some zero'd out public keys that should be replaced with
-	// padding points.
-	ring[4] = crypto.BandersnatchPublicKey{}
-	ring[5] = crypto.BandersnatchPublicKey{}
+	// padding points. How many there are room for depends on the ring, and the
+	// ring is as big as the chain spec's validator count, so this is counted
+	// rather than written down.
+	for i := uint(0); i < min(2, GetRingSize()-1); i++ {
+		ring[i] = crypto.BandersnatchPublicKey{}
+	}
 
-	var proverIdx uint = 3
+	// The prover sits past the padding points, so the ring it proves over is not
+	// made of zeros it happens to be in the middle of.
+	proverIdx := GetRingSize() / 2
 	proverSk, err := NewPrivateKeyFromSeed(uintToSeed(proverIdx))
 	require.NoError(t, err)
 	proverPk := ring[proverIdx]

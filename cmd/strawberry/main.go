@@ -13,11 +13,14 @@ import (
 	"strings"
 
 	"github.com/eigerco/strawberry/internal/block"
+	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/crypto/ed25519"
 	"github.com/eigerco/strawberry/internal/safrole"
 	chainState "github.com/eigerco/strawberry/internal/state"
 	"github.com/eigerco/strawberry/internal/validator"
+	"github.com/eigerco/strawberry/pkg/db/pebble"
+	"github.com/eigerco/strawberry/pkg/devnet"
 	"github.com/eigerco/strawberry/pkg/log"
 	"github.com/eigerco/strawberry/pkg/network/node"
 )
@@ -121,6 +124,9 @@ func main() {
 		portOverride int
 		rpcPort      int
 		help         bool
+		genesisPath  string
+		dataDir      string
+		bridgeWallet string
 	)
 
 	flag.StringVar(&configFile, "config", "appconfig.json", "path to config file")
@@ -129,7 +135,10 @@ func main() {
 	flag.StringVar(&nodeName, "name", "Strawberry-Node", "node name")
 	flag.StringVar(&telemetryURL, "telemetry-url", "", "telemetry WebSocket URL")
 	flag.IntVar(&portOverride, "port", 0, "override p2p listen port")
-	flag.IntVar(&rpcPort, "rpc-port", 9944, "RPC WebSocket port")
+	flag.IntVar(&rpcPort, "rpc-port", 9944, "RPC WebSocket and HTTP port")
+	flag.StringVar(&genesisPath, "genesis", "genesis/chain-dev.json", "path to the genesis of the PAPU economy")
+	flag.StringVar(&dataDir, "data-dir", "", "directory to keep blocks and state in; empty keeps them in memory")
+	flag.StringVar(&bridgeWallet, "bridge-wallet", "", "hex Ed25519 seed of the account the node pays faucets from")
 	flag.BoolVar(&help, "help", false, "show help")
 	flag.Parse()
 
@@ -245,7 +254,38 @@ func main() {
 		ValidatorState: vstate,
 	}
 
-	n, err := node.NewNode(ctx, udpAddress, vkeys, state, index)
+	// The runtime owns the state of the chain: the services that exist, the PAPU
+	// balances and the state root. The node is handed a copy of the state it has
+	// at startup, and the runtime is what advances it from block to block.
+	genesis, err := devnet.LoadGenesis(genesisPath)
+	if err != nil {
+		log.Internal.Fatal().Str("genesis", genesisPath).Err(err).Msg("genesis load failed")
+	}
+
+	devValidators, err := devnet.DevValidatorKeys(constants.NumberOfValidators, validatorListenAddrs(vs))
+	if err != nil {
+		log.Internal.Fatal().Err(err).Msg("validator state build failed")
+	}
+
+	kvStore, err := openStore(dataDir)
+	if err != nil {
+		log.Internal.Fatal().Str("dataDir", dataDir).Err(err).Msg("database open failed")
+	}
+
+	runtime, err := devnet.New(devnet.Options{
+		Genesis:    genesis,
+		Validators: devValidators,
+		TrieDB:     kvStore,
+		BridgeKey:  bridgeKey(bridgeWallet),
+		Logf: func(format string, args ...any) {
+			log.Internal.Info().Msgf(format, args...)
+		},
+	})
+	if err != nil {
+		log.Internal.Fatal().Err(err).Msg("runtime build failed")
+	}
+
+	n, err := node.NewNodeWithStore(ctx, udpAddress, vkeys, state, index, kvStore)
 	if err != nil {
 		log.Internal.Fatal().
 			Err(err).
@@ -264,15 +304,53 @@ func main() {
 	rpcAddr := fmt.Sprintf(":%d", rpcPort)
 	rpcSrv := startRPCServer(rpcAddr, nodeName, chainName, version,
 		n.BlockService.Store, n.BlockService)
+	rpcSrv.papucoin = newPapucoinHandlers(runtime, rpcSrv)
 
 	// Start block producer
-	startBlockProducer(n.BlockService, index,
+	startBlockProducer(n.BlockService, runtime, index,
 		func(hash crypto.Hash, num uint, h block.Header) {
 			rpcSrv.updateBlock(hash, num, h)
-		})
+		}, rpcSrv.markRebuilt)
 
 	// Connect telemetry
 	startTelemetry(telemetryURL, nodeName, version, chainName)
 
 	select {}
+}
+
+// openStore opens the database the node keeps blocks, headers and state trie
+// nodes in. An empty directory keeps them in memory, which is what a throwaway
+// run wants.
+func openStore(dataDir string) (*pebble.KVStore, error) {
+	if dataDir != "" {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	return pebble.NewKVStoreAt(dataDir)
+}
+
+// bridgeKey reads the seed of the account the node pays faucets from. An empty
+// path leaves the node without one, so it cannot mint, which is the safe default
+// for a node nobody gave a key to.
+func bridgeKey(hexSeed string) ed25519.PrivateKey {
+	if hexSeed == "" {
+		return nil
+	}
+	seed, err := hex.DecodeString(strings.TrimPrefix(hexSeed, "0x"))
+	if err != nil || len(seed) != ed25519.SeedSize {
+		log.Internal.Warn().Str("bridgeWallet", hexSeed).Msg("the bridge wallet is not a 32 byte hex seed, so the node cannot pay faucets")
+		return nil
+	}
+	return ed25519.NewKeyFromSeed(seed)
+}
+
+// validatorListenAddrs renders the validator configuration as addresses, so the
+// state names where each validator can be reached.
+func validatorListenAddrs(vs []FullValidatorInfo) []string {
+	addrs := make([]string, 0, len(vs))
+	for _, v := range vs {
+		addrs = append(addrs, net.JoinHostPort(v.IP, strconv.Itoa(v.Port)))
+	}
+	return addrs
 }

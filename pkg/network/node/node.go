@@ -73,12 +73,19 @@ func (n *Node) GetAllPeers() []*peer.Peer {
 
 // NewNode creates a new Node instance with the specified configuration.
 // It initializes the TLS certificate, protocol manager, and network transport.
+// See [NewNodeWithStore] to keep blocks and state across restarts.
 func NewNode(nodeCtx context.Context, listenAddr *net.UDPAddr, keys validator.ValidatorKeys, state state.State, validatorIdx uint16) (*Node, error) {
 	kvStore, err := pebble.NewKVStore()
 	if err != nil {
 		return nil, err
 	}
+	return NewNodeWithStore(nodeCtx, listenAddr, keys, state, validatorIdx, kvStore)
+}
 
+// NewNodeWithStore is [NewNode] over a caller supplied key-value store. A dev
+// node passes a store rooted in a directory so the chain and the state trie are
+// not lost on every restart.
+func NewNodeWithStore(nodeCtx context.Context, listenAddr *net.UDPAddr, keys validator.ValidatorKeys, state state.State, validatorIdx uint16, kvStore *pebble.KVStore) (*Node, error) {
 	availabilityStore := store.NewShards(kvStore)
 	nodeCtx, cancel := context.WithCancel(nodeCtx)
 	peerSet := peer.NewPeerSet()

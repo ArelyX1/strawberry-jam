@@ -18,37 +18,26 @@ import (
 
 const jamBalance = 1 << 40
 
-// base58Encode is the inverse of base58Decode, used to mint test addresses.
-func base58Encode(input []byte) string {
-	number := new(big.Int).SetBytes(input)
-	radix := big.NewInt(58)
-	zero := new(big.Int)
-
-	var out []byte
-	for number.Cmp(zero) > 0 {
-		mod := new(big.Int)
-		number.DivMod(number, radix, mod)
-		out = append([]byte{base58Alphabet[mod.Int64()]}, out...)
+// testAddress builds a well formed chain address from a deterministic seed, and
+// testKey returns the private key behind it so that items can be signed.
+func testAddress(seed byte) string {
+	address, err := AddressFromPublicKey(testPublicKey(seed))
+	if err != nil {
+		panic(err)
 	}
-	for _, b := range input {
-		if b != 0 {
-			break
-		}
-		out = append([]byte{base58Alphabet[0]}, out...)
-	}
-	return string(out)
+	return address
 }
 
-// testAddress builds a well formed chain address from a deterministic seed.
-func testAddress(seed byte) string {
-	// NewKeyFromSeed returns a 64 byte private key, so the public half has to
-	// be taken explicitly.
-	publicKey, ok := ed25519.NewKeyFromSeed(bytes32(seed)).Public().(ed25519.PublicKey)
+func testKey(seed byte) ed25519.PrivateKey {
+	return ed25519.NewKeyFromSeed(bytes32(seed))
+}
+
+func testPublicKey(seed byte) ed25519.PublicKey {
+	publicKey, ok := testKey(seed).Public().(ed25519.PublicKey)
 	if !ok {
 		panic("ed25519 public key has an unexpected type")
 	}
-	decoded := append(append([]byte{}, publicKey...), AddressChecksum(publicKey)...)
-	return SDLGPrefix + base58Encode(decoded)
+	return publicKey
 }
 
 func bytes32(b byte) []byte {
@@ -241,6 +230,16 @@ func mustSubmitOK(t *testing.T, r *rig, item Item) {
 	result, err := r.exec.Accumulate(r.id, []svc.RefinedItem{{Item: payload, Report: refined.Report}}, nil, 0, 0, r.state)
 	require.NoError(t, err)
 	r.state[r.id] = result.Account
+}
+
+// mustSkip asserts that an item is refused during refinement, which is where a
+// service proves an item before any account is read.
+func (r *rig) mustSkip(t *testing.T, item Item) {
+	t.Helper()
+	payload, err := json.Marshal(item)
+	require.NoError(t, err)
+	_, err = r.exec.Refine(r.id, payload, 0, ^uint64(0), r.state)
+	require.Error(t, err)
 }
 
 func funded(t *testing.T) map[string]string {
