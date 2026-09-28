@@ -59,11 +59,16 @@ func TestABIRoundTrip(t *testing.T) {
 	}
 
 	entry := uint64(0)
+	if v := os.Getenv("ENTRY"); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &entry); err != nil {
+			t.Fatalf("bad ENTRY %q: %v", v, err)
+		}
+	}
 	gas, result, _, err := pvm.InvokeWholeProgram(bdata, entry, pvm.UGas(2_000_000_000), args, hostCall, pvm.AccumulateContextPair{})
 	if err != nil {
-		t.Fatalf("invoke: gas=%d err=%v", gas, err)
+		t.Fatalf("invoke at entry %d: gas=%d err=%v", entry, gas, err)
 	}
-	t.Logf("results: gasRemaining=%d result(%d)=%x", gas, len(result), result)
+	t.Logf("entry=%d results: gasRemaining=%d result(%d)=%x", entry, gas, len(result), result)
 	k, _ := statekey.NewStorage(serviceId, []byte{0x02})
 	if v, ok := account.GetStorage(k); ok {
 		t.Logf("storage[02] = %x", v)
