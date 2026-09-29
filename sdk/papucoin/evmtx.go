@@ -354,3 +354,91 @@ func decodeEVMRaw(rawHex string) ([]byte, error) {
 	}
 	return raw, nil
 }
+
+// SignEIP1559 builds and signs a typed EIP-1559 transaction, returning its raw
+// encoding. It is the counterpart of [ParseEVMTransaction]: a test, a wallet
+// simulator or a tool needs to produce the bytes a chain would accept, and
+// hand-rolling the envelope in every caller is how the two sides drift apart.
+// halfOrder is (n-1)/2, the boundary above which ecrecover rejects s. Signatures
+// are flipped to sit below it, so the same signed digest has one canonical
+// encoding.
+var halfOrder = func() secp256k1.ModNScalar {
+	// (n-1)/2 for secp256k1, taken from the curve order.
+	order, _ := new(big.Int).SetString(
+		"fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141", 16)
+	half := new(big.Int).Rsh(order, 1)
+	var s secp256k1.ModNScalar
+	if overflow := s.SetByteSlice(half.Bytes()); overflow {
+		panic("secp256k1 half order does not fit the scalar")
+	}
+	return s
+}()
+
+func SignEIP1559(
+	chainID *big.Int,
+	nonce uint64,
+	gasTipCap, gasFeeCap, gasLimit uint64,
+	to []byte,
+	value *big.Int,
+	data []byte,
+	key *secp256k1.PrivateKey,
+) ([]byte, error) {
+	if key == nil {
+		return nil, fmt.Errorf("papucoin: signing needs a private key")
+	}
+	if len(to) != 20 {
+		return nil, fmt.Errorf("papucoin: destination is %d bytes, want 20", len(to))
+	}
+
+	fields := [][]byte{
+		rlpEncodeUint(chainID),
+		rlpEncodeUint(new(big.Int).SetUint64(nonce)),
+		rlpEncodeUint(new(big.Int).SetUint64(gasTipCap)),
+		rlpEncodeUint(new(big.Int).SetUint64(gasFeeCap)),
+		rlpEncodeUint(new(big.Int).SetUint64(gasLimit)),
+		rlpEncodeString(to),
+		rlpEncodeUint(value),
+		{0x80}, // empty data
+		{0xc0}, // empty access list
+	}
+
+	// The parser reconstructs the signing hash by concatenating the raw
+	// encodings of the unsigned fields, so signing has to do the same rather
+	// than re-encode them into a list.
+	signing := append([]byte{0x02}, rlpConcat(fields...)...)
+	digest := keccak(signing)
+
+	// SignCompact returns a magic code: 27 plus the recovery id, with bit 3 set
+	// when the public key was requested compressed. The recovery id is what
+	// ecrecover needs, so the offset and the compression bit come off.
+	compact := ecdsa.SignCompact(key, digest, true)
+	recovery := (compact[0] - 27) & 3
+	yParity := recovery & 1
+	signature := append([]byte{recovery}, compact[1:]...)
+	r := signature[1:33]
+	s := signature[33:65]
+	// signRFC6979 already produces a low-s signature, so there is nothing to
+	// flip here. A recovery id above one would mean otherwise, and it is worth
+	// refusing rather than silently emitting something the chain rejects.
+	if recovery > 1 {
+		return nil, fmt.Errorf("%w: signing produced a high s", ErrEVMBadSignature)
+	}
+	// A yParity of 1 is the bare byte 0x01. A yParity of 0 has to be the empty
+	// string: a single 0x00 byte would be an integer with a leading zero, which
+	// is the non-canonical spelling of zero.
+	yParityField := rlpEncodeUint(big.NewInt(int64(yParity)))
+
+	signed := make([][]byte, 0, len(fields)+3)
+	signed = append(signed, fields...)
+	signed = append(signed, yParityField)
+	signed = append(signed, rlpEncodeString(r))
+	signed = append(signed, rlpEncodeString(s))
+	return append([]byte{0x02}, rlpEncodeList(signed)...), nil
+}
+
+// KeccakForTest exposes the chain's keccak so that a test can compute an address
+// the same way a wallet would. It is only for tests and fixtures; nothing in the
+// service should need it.
+func KeccakForTest(data []byte) []byte {
+	return keccak(data)
+}

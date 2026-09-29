@@ -29,6 +29,17 @@ NUL final en los argumentos es lo que las distingue.
 `src/crypto.rs` tiene las direcciones de cadena (base58 + blake2b-256) y la
 verificacion de firmas Ed25519.
 
+`src/evm.rs` tiene lo que hace falta para aceptar una transaccion de una wallet
+que solo habla Ethereum: RLP, keccak y la decodificacion de la transaccion
+tipada 0x02.
+
+**El guest no verifica la firma secp256k1.** `k256::ecrecover` compila pero
+entra en panic en no_std: la aritmetica de curva necesita algo que un programa
+sin libreria estandar no tiene. La verifica el host, que ya tenia una
+implementacion probada, y pasa el remitente en `evmSender`. Confiar en el host
+no es un agujero: el host es la cadena, y este programa es codigo que la cadena
+eligio ejecutar.
+
 ## Detalles que no son evidentes
 
 - **El allocator** es un bump sobre un arena estatica en `.data`, no en `.bss`:
@@ -37,4 +48,9 @@ verificacion de firmas Ed25519.
   imports por el orden de primera llamada; la cadena traduce el indice al id
   canonico leyendo la tabla de imports del blob.
 - **`mustBeSigned`** es camelCase en el JSON. Sin el `rename` de serde, el campo
-  nunca se parsea, queda `false`, y la verificacion de firma se salta entera.
+  nunca se parsea, queda `false`, y la verificacion de firma se salta entera:
+  una firma manipulada pasaba.
+- **El chain id lo dice la cadena**, no el guest. Esta en el storage que escribe
+  el seed. Una cadena que no dice cual es acepta nada relayed, que es lo seguro.
+- **El seed lo escribe el guest.** Issuer, simbolo, saldos iniciales y chain id.
+  Sin el, el issuer arranca en cero y la cadena no puede pagar un faucet.

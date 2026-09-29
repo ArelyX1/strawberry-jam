@@ -148,6 +148,8 @@ func New(opts Options) (*Runtime, error) {
 		return nil, fmt.Errorf("devnet: cannot register %s as service %d: %w", genesis.Service.Name, id, err)
 	}
 
+	pvmGuest := false
+	seedBalances := map[string]string{}
 	var executor svc.Runtime = svc.NewExecutor(registry)
 	if code := genesis.Service.Code; code != "" {
 		blob, err := loadGuestBlob(code)
@@ -159,7 +161,21 @@ func New(opts Options) (*Runtime, error) {
 		if _, err := pvm.PrepareGuest(blob, ""); err != nil {
 			return nil, fmt.Errorf("devnet: guest %q is not runnable: %w", code, err)
 		}
-		executor = svc.NewPVMExecutor(blob)
+		// The relay lets a wallet that only speaks Ethereum move balance: the
+		// host verifies the signature and the guest applies the transfer.
+		// The guest writes the genesis state itself, the way the native seed
+		// does, so the two start from identical bytes. Without this the issuer
+		// would hold nothing and the chain could not pay a single payout.
+		seedBalances = balances
+		pvmGuest = true
+		executor = svc.NewPVMExecutor(blob).
+			WithRelay(guestRelayAdapter{relay: relay}).
+			WithSeed(svc.Seed{
+				Issuer:   issuer,
+				Symbol:   params.Symbol,
+				Balances: seedBalances,
+				ChainID:  relay.ChainID.Int64(),
+			})
 		log.Printf("jam running the economy as a polkavm guest: %s", code)
 	}
 	scheduler := svc.NewScheduler(registry, int(constants.MaxNumberOfItems))
@@ -183,6 +199,9 @@ func New(opts Options) (*Runtime, error) {
 	seeded, err := executor.Initialize(id, 0, maxGas, services)
 	if err != nil {
 		return nil, fmt.Errorf("devnet: cannot initialise %s: %w", genesis.Service.Name, err)
+	}
+	if pvmGuest {
+		log.Printf("jam the guest wrote its genesis state: %d accounts in the seed, %d items in storage", len(seedBalances), seeded.Account.GetTotalNumberOfItems())
 	}
 	services[id] = seeded.Account
 
@@ -476,6 +495,14 @@ func (r *Runtime) runServiceLocked(assignment svc.Assignment, timeslot jamtime.T
 			r.logf("service %d refused an item from %q: %v", assignment.ServiceID, item.Origin, err)
 			continue
 		}
+		// A guest that emits nothing, or emits a refusal of its own, is saying
+		// why in the report; without this the operator only sees a balance that
+		// did not move.
+		if len(result.Report) == 0 {
+			r.logf("service %d declined an item from %q without giving a reason", assignment.ServiceID, item.Origin)
+		} else {
+			r.logf("service %d refined an item from %q into %s", assignment.ServiceID, item.Origin, result.Report)
+		}
 		refined = append(refined, svc.RefinedItem{Item: item.Payload, Report: result.Report})
 	}
 
@@ -489,6 +516,13 @@ func (r *Runtime) runServiceLocked(assignment svc.Assignment, timeslot jamtime.T
 
 	account = result.Account
 	r.state.Services[assignment.ServiceID] = account
+
+	// The bridge signs payouts with a nonce of its own choosing, and the service
+	// only accepts the one it expects next. Anything the chain did to that
+	// account in the meantime, such as the reserve transfer, moves the number
+	// the node has to use, so it is read back after every accumulate rather than
+	// only after a replay.
+	r.syncBridgeNonceLocked()
 	return nil
 }
 
@@ -561,7 +595,12 @@ func (r *Runtime) Submit(item papucoin.Item) error {
 			return fmt.Errorf("item amount: %w", err)
 		}
 	}
-	if item.Method != papucoin.MethodTransfer && item.Method != papucoin.MethodFaucet && item.Method != papucoin.MethodMint {
+	// Welcome and burn are claims a holder can make about itself, so they belong
+	// here as much as a transfer does. Mint stays out: only the issuer may mint,
+	// and the issuer is the chain itself, not whoever submits an item.
+	switch item.Method {
+	case papucoin.MethodTransfer, papucoin.MethodFaucet, papucoin.MethodWelcome, papucoin.MethodBurn:
+	default:
 		return fmt.Errorf("unknown method %q", item.Method)
 	}
 
@@ -767,3 +806,20 @@ func loadGuestBlob(name string) ([]byte, error) {
 }
 
 var guestDir = "guests"
+
+// guestRelayAdapter narrows the service's relay to what a guest needs: just the
+// address. The guest reads the rest out of the transaction itself, so passing a
+// whole struct across would be redundant. It lives here rather than in the SDK
+// because papucoin already imports the SDK, and importing it back would be a
+// cycle.
+type guestRelayAdapter struct {
+	relay *papucoin.EVMRelay
+}
+
+func (a guestRelayAdapter) Recover(rawHex string) (string, error) {
+	fields, err := a.relay.Recover(rawHex)
+	if err != nil {
+		return "", err
+	}
+	return fields.From, nil
+}

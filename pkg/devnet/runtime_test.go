@@ -306,8 +306,11 @@ func TestOnlyTheIssuerCanMint(t *testing.T) {
 	require.NoError(t, err)
 
 	// A mint is signed by the claimant, and the service only honours a mint that
-	// comes from the issuer, so this settles nothing at all.
-	submit(t, rt, mint(t, 1, claimant, "7", 1))
+	// comes from the issuer, so this settles nothing at all. The node refuses it
+	// at the door rather than queueing something the service will drop: an item
+	// nobody may send should not take up a slot in a block.
+	item := mint(t, 1, claimant, "7", 1)
+	require.Error(t, rt.Submit(item), "a mint from anybody but the issuer must be refused")
 	rt.Step(1)
 
 	balance, err := rt.View().Balance(claimant)

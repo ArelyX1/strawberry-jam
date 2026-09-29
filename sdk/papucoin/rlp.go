@@ -190,6 +190,11 @@ func rlpEncodeUint(v *big.Int) []byte {
 		return []byte{0x80}
 	}
 	be := v.Bytes()
+	// A single byte below 0x80 is its own encoding; wrapping it in a length
+	// prefix would be a second spelling of the same value.
+	if len(be) == 1 && be[0] < 0x80 {
+		return be
+	}
 	return append([]byte{0x80 + byte(len(be))}, be...)
 }
 
@@ -211,4 +216,37 @@ func rlpListHeader(payload int) []byte {
 		header = append(header, byte(payload>>shift))
 	}
 	return header
+}
+
+// rlpEncodeList encodes items as an RLP list. It is the counterpart of the
+// decoder above, and is what a wallet signing a transaction needs.
+// rlpEncodeList wraps already-encoded items in a list header. The items are
+// used verbatim: encoding them again would give each one a second header, and
+// the result would not be the transaction that was signed.
+func rlpEncodeList(items [][]byte) []byte {
+	return rlpConcat(items...)
+}
+
+func rlpEncodeString(b []byte) []byte {
+	if len(b) == 0 {
+		return []byte{0x80}
+	}
+	if len(b) == 1 && b[0] < 0x80 {
+		return []byte{b[0]}
+	}
+	header := rlpEncodeHeader(0x80, len(b), false)
+	return append(header[:len(header):len(header)], b...)
+}
+
+func rlpEncodeHeader(base byte, length int, isList bool) []byte {
+	short := base
+	long := base + 55
+	if length <= 55 {
+		return []byte{short + byte(length)}
+	}
+	var be []byte
+	for v := length; v > 0; v >>= 8 {
+		be = append([]byte{byte(v)}, be...)
+	}
+	return append([]byte{long + byte(len(be))}, be...)
 }

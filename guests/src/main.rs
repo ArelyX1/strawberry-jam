@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod crypto;
+mod evm;
 
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -41,6 +42,7 @@ const KEY_EVMNONCE: u8 = 0x04;
 const KEY_FAUCET: u8 = 0x05;
 const KEY_WELCOME: u8 = 0x06;
 const KEY_ISSUER: u8 = 0x07;
+const KEY_ASSET: u8 = 0x08;
 
 const DECIMALS: u8 = 12;
 const MAX_SUPPLY: u128 = 1_000_000_000_000_000_000_000_000;
@@ -53,7 +55,7 @@ const SELF: u64 = u64::MAX;
 
 // Bump allocator over a static arena. The guest runs once per invocation and
 // never returns, so free is a no-op and OOM is panic.
-const HEAP_SIZE: usize = 64 * 1024;
+const HEAP_SIZE: usize = 256 * 1024;
 #[repr(C, align(16))]
 struct Arena([u8; HEAP_SIZE]);
 #[used]
@@ -65,15 +67,18 @@ static mut OFFSET: usize = 0;
 struct Bump;
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let start = unsafe { OFFSET };
-        let aligned = (start + layout.align().next_power_of_two()) & !(layout.align().next_power_of_two() - 1);
+        let arena = core::ptr::addr_of_mut!(ARENA.0) as *mut u8;
+        let offset = core::ptr::addr_of_mut!(OFFSET);
+        let start = unsafe { *offset };
+        let align = layout.align();
+        let aligned = (start + align - 1) & !(align - 1);
         let end = aligned + layout.size();
         if end > HEAP_SIZE {
             return core::ptr::null_mut();
         }
         unsafe {
-            OFFSET = end;
-            (ARENA.0.as_mut_ptr()).add(aligned)
+            *offset = end;
+            arena.add(aligned)
         }
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
@@ -248,6 +253,10 @@ struct Item {
     memo: Option<String>,
     #[serde(default)]
     raw: Option<String>,
+    // EVMNonce and EVMSender are filled in by the chain, not by the wallet: the
+    // host verifies the signature and states who it recovered.
+    #[serde(default, rename = "evmSender")]
+    evm_sender: Option<String>,
     #[serde(default, rename = "mustBeSigned")]
     must_be_signed: bool,
     #[serde(default)]
@@ -278,15 +287,140 @@ fn push_field(name: &str, value: &str, first: &mut bool, out: &mut Vec<u8>) {
     }
 }
 
+// KEY_CHAIN_ID is where the chain states which EVM chain it presents, so a
+// transaction signed for another one cannot be replayed here. It is written by
+// the seed, because the chain id is a property of the chain rather than of this
+// program.
+const KEY_CHAIN_ID: u8 = 0x09;
+const WEI_GRANULARITY: u128 = 1_000_000;
+
+fn chain_id() -> u64 {
+    match storage_read(&[KEY_CHAIN_ID]) {
+        Some(v) if v.len() == 8 => {
+            let mut id: u64 = 0;
+            for b in v.iter() {
+                id = (id << 8) | u64::from(*b);
+            }
+            id
+        }
+        // A chain that never said what it is accepts nothing relayed, which is
+        // the safe answer: guessing would let any signed transaction through.
+        _ => 0,
+    }
+}
+
+// refine_relayed turns a raw EVM transaction into a report. The sender is
+// recovered from the signature, so nothing the item claims about who sent it is
+// believed; the destination still has to agree with the signed bytes, otherwise
+// a valid transaction could be pointed at someone else's balance.
+fn recovered_sender(item: &Item) -> Option<[u8; 20]> {
+    // The chain verifies the signature before the item gets here and states the
+    // recovered address in evmSender. Nothing here re-derives it, and nothing
+    // here would believe the claimed sender if the host had not checked it.
+    let raw = evm::decode_hex_address(item.evm_sender.as_deref()?)?;
+    Some(raw)
+}
+
+fn refine_relayed(raw_hex: &str, item: &Item) -> Option<Vec<u8>> {
+    let raw = match crypto::decode_hex(raw_hex) {
+        Some(raw) => raw,
+        None => return Some(br#"{"relayError":"la transaccion no es hex"}"#.to_vec()),
+    };
+    let tx = match evm::decode_relayed(&raw, chain_id(), recovered_sender(item)) {
+        Ok(tx) => tx,
+        Err(reason) => {
+            let mut out = Vec::with_capacity(reason.len() + 24);
+            out.extend_from_slice(b"{\"relayError\":\"");
+            out.extend_from_slice(reason.as_bytes());
+            out.extend_from_slice(b"\"}");
+            return Some(out);
+        }
+    };
+
+    let from = evm_address(tx.from);
+    let to = evm_address(tx.to);
+
+    if let Some(destination) = &item.to {
+        if crypto::normalize_address(destination)? != to {
+            return Some(br#"{"relayError":"el destino no coincide con la firma"}"#.to_vec());
+        }
+    }
+
+    if tx.value % WEI_GRANULARITY != 0 {
+        return Some(br#"{"relayError":"el valor no es un numero entero de micro-PAPU"}"#.to_vec());
+    }
+    let amount = tx.value / WEI_GRANULARITY;
+    if amount == 0 {
+        return Some(br#"{"relayError":"el valor es cero"}"#.to_vec());
+    }
+
+    let mut report = Vec::with_capacity(200);
+    report.push(b'{');
+    crypto::json_field("op", "transfer", &mut report);
+    report.push(b',');
+    crypto::json_field("actor", &from, &mut report);
+    report.push(b',');
+    crypto::json_field("sender", &from, &mut report);
+    report.push(b',');
+    report.extend_from_slice(b"\"nonce\":");
+    report.extend_from_slice(raw_string(item.nonce as u128).as_bytes());
+    report.push(b',');
+    crypto::json_field("to", &to, &mut report);
+    report.push(b',');
+    crypto::json_field("amount", &raw_string(amount), &mut report);
+    report.push(b',');
+    crypto::json_field("fee", "1000000", &mut report);
+    report.push(b',');
+    report.extend_from_slice(b"\"evmNonce\":");
+    report.extend_from_slice(raw_string(tx.evm_nonce as u128).as_bytes());
+    report.push(b'}');
+    Some(report)
+}
+
+fn evm_address(bytes: [u8; 20]) -> String {
+    let mut s = String::with_capacity(42);
+    s.push_str("0x");
+    for b in bytes {
+        s.push(char::from(b"0123456789abcdef"[(b >> 4) as usize]));
+        s.push(char::from(b"0123456789abcdef"[(b & 0xf) as usize]));
+    }
+    s
+}
+
 fn refine_item(args: &[u8]) -> Option<Vec<u8>> {
-    let item: Item = serde_json::from_slice(args).ok()?;
+    let item: Item = match serde_json::from_slice(args) {
+        Ok(item) => item,
+        Err(_) => {
+            // A malformed item is reported so the reason is visible instead of
+            // arriving as a silent refusal.
+            return Some(br#"{"parseError":"el item no es json valido"}"#.to_vec());
+        }
+    };
 
     match item.method.as_str() {
         "transfer" | "mint" | "burn" | "faucet" | "welcome" => {}
         _ => return None,
     }
-    if item.raw.is_some() {
-        return None; // the EVM relay lands in a later phase
+    if let Some(raw) = &item.raw {
+        if !evm::selfcheck() {
+            return Some(br#"{"relayError":"keccak no coincide con los vectores"}"#.to_vec());
+        }
+
+        let raw_bytes = match crypto::decode_hex(raw) {
+            Some(b) => b,
+            None => return Some(br#"{"relayError":"la transaccion no es hex valido"}"#.to_vec()),
+        };
+        if let Err(reason) = evm::decode_relayed(&raw_bytes, chain_id(), recovered_sender(&item)) {
+            // The reason is reported rather than swallowed: a wallet that
+            // cannot get a transfer through needs to know whether the
+            // transaction was malformed or the signature did not recover.
+            let mut out = Vec::with_capacity(64);
+            out.push(b'{');
+            crypto::json_field("relayError", reason, &mut out);
+            out.push(b'}');
+            return Some(out);
+        }
+        return refine_relayed(raw, &item);
     }
 
     let sender = crypto::normalize_address(&item.sender)?;
@@ -453,6 +587,63 @@ fn apply_op(op: &Op) -> bool {
     }
 }
 
+// seed is what the chain hands over so the economy can write its genesis state.
+// The native service receives it by running its own seed handler; a guest has no
+// such handler, so the chain passes it in.
+#[derive(serde::Deserialize)]
+struct Seed {
+    #[serde(rename = "Issuer")]
+    issuer: String,
+    #[serde(rename = "Symbol")]
+    symbol: String,
+    // The host sends balances as a JSON object, address to amount, so that is
+    // what is read here; an array of pairs would be a second spelling of the
+    // same thing and the chain would not agree on which one it is.
+    #[serde(default, rename = "Balances")]
+    balances: alloc::collections::BTreeMap<String, String>,
+    // ChainID is optional so a seed written before the chain said what it is
+    // still seeds the rest; the relayed path stays closed until it does.
+    #[serde(default, rename = "ChainID")]
+    chain_id: u64,
+}
+
+fn write_seed(args: &[u8]) {
+    let seed: Seed = match serde_json::from_slice(args) {
+        Ok(seed) => seed,
+        Err(_) => return,
+    };
+    if seed.balances.is_empty() {
+        return;
+    }
+
+    storage_write(&[KEY_ISSUER], seed.issuer.as_bytes());
+    if seed.chain_id != 0 {
+        let mut be = [0u8; 8];
+        let mut v = seed.chain_id;
+        for i in (0..8).rev() {
+            be[i] = (v & 0xff) as u8;
+            v >>= 8;
+        }
+        storage_write(&[KEY_CHAIN_ID], &be);
+    }
+    storage_write(&[KEY_ASSET], seed.symbol.as_bytes());
+
+    let mut total: u128 = 0;
+    for (address, amount) in seed.balances.iter() {
+        let raw = match parse_amount(amount) {
+            Some(raw) => raw,
+            None => continue,
+        };
+        total += raw;
+        let key = key_with(KEY_BALANCE, address);
+        write_u128(&key, raw);
+    }
+    if total > MAX_SUPPLY {
+        total = MAX_SUPPLY;
+    }
+    write_u128(&[KEY_SUPPLY], total);
+}
+
 fn accumulate_reports(args: &[u8]) {
     let body = if args.last() == Some(&0) { &args[..args.len() - 1] } else { args };
     if body.is_empty() {
@@ -469,9 +660,17 @@ fn accumulate_reports(args: &[u8]) {
 #[no_mangle]
 pub extern "C" fn main(_args_addr: u64, _args_len: u64) -> u32 {
     let args = read_args(_args_addr, _args_len);
-
     if args.last() == Some(&0) {
-        accumulate_reports(args);
+        let body = &args[..args.len() - 1];
+        // A seed is an object rather than a stream of reports, and the chain
+        // only sends one, at the very start.
+        if body.first() == Some(&b'{') {
+            if serde_json::from_slice::<Seed>(body).is_ok() {
+                write_seed(body);
+                halt(0, 0);
+            }
+        }
+        accumulate_reports(body);
         halt(0, 0);
     }
     if let Some(r) = refine_item(args) {
