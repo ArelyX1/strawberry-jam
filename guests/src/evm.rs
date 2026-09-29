@@ -345,10 +345,18 @@ pub fn decode_relayed(
     chain_id: u64,
     recovered: Option<[u8; 20]>,
 ) -> Result<RelayedFields, &'static str> {
-    if raw.len() < 3 || raw[0] != 0x02 {
-        return Err("no es una transaccion tipada 0x02");
-    }
-    let body = &raw[1..];
+    // Which shape it is decides where the fields sit. A wallet's library picks
+    // the shape, not the chain, so all three the host accepts have to work here
+    // or a legitimate transfer becomes a refusal.
+    // A kind per envelope byte, because where the fields sit depends on it.
+    // 0x02 is EIP-1559, 0x01 is EIP-2930, and anything else is a legacy
+    // transaction, which has no type byte at all.
+    let (kind, body): (u8, &[u8]) = match raw.first() {
+        Some(&0x02) => (2, &raw[1..]),
+        Some(&0x01) => (1, &raw[1..]),
+        _ => (0, raw),
+    };
+    let typed = kind != 0;
 
     let (payload_start, payload_len) = rlp_item(body, 0).ok_or("rlp truncado")?;
     if !rlp_is_list(body, 0) {
@@ -367,18 +375,55 @@ pub fn decode_relayed(
         fields.push((payload_start + p, len));
         p = start + len;
     }
-    if fields.len() != 12 {
+    // A typed transaction is unsigned fields plus yParity, r and s. EIP-1559
+    // splits the fee into two, so it has nine unsigned; EIP-2930 has one, so
+    // eight. A legacy one is six unsigned plus v, r and s, with the chain id
+    // folded into v rather than carried as its own field.
+    let want = match kind {
+        2 => 12,
+        1 => 11,
+        _ => 9,
+    };
+    if fields.len() != want {
         return Err("numero de campos inesperado");
     }
     let read = |index: usize| -> Option<(usize, usize)> { fields.get(index).copied() };
 
-    let chain = rlp_uint(body, read(0).ok_or("faltan campos")?.0).ok_or("el id de cadena no cabe")?;
-    if chain != chain_id {
-        return Err("la cadena no coincide");
-    }
-    let nonce = rlp_uint(body, read(1).ok_or("faltan campos")?.0).ok_or("el nonce no cabe")?;
+    // Typed: chainId, nonce, tip, fee, gas, to, value, data, accessList.
+    // Legacy: nonce, gasPrice, gas, to, value, data.
+    // EIP-1559: chainId, nonce, tip, fee, gas, to, value, data, accessList.
+    // EIP-2930: chainId, nonce, gasPrice, gas, to, value, data, accessList.
+    // Legacy:    nonce, gasPrice, gas, to, value, data.
+    let nonce_index = if typed { 1 } else { 0 };
+    let to_index = match kind {
+        2 => 5,
+        1 => 4,
+        _ => 3,
+    };
+    let value_index = match kind {
+        2 => 6,
+        1 => 5,
+        _ => 4,
+    };
 
-    let to_field = read(5).ok_or("faltan campos")?;
+    if typed {
+        let chain = rlp_uint(body, read(0).ok_or("faltan campos")?.0).ok_or("el id de cadena no cabe")?;
+        if chain != chain_id {
+            return Err("la cadena no coincide");
+        }
+    } else {
+        // A legacy transaction folds the chain id into v, so the check happens
+        // against that instead: v is chainId*2 + 35 + parity.
+        let v = rlp_uint(body, read(6).ok_or("faltan campos")?.0).ok_or("la v no cabe")?;
+        if v < 35 || (v - 35) / 2 != chain_id {
+            return Err("la cadena no coincide");
+        }
+    }
+
+    let nonce = rlp_uint(body, read(nonce_index).ok_or("faltan campos")?.0)
+        .ok_or("el nonce no cabe")?;
+
+    let to_field = read(to_index).ok_or("faltan campos")?;
     let to_bytes = rlp_bytes(body, to_field.0).ok_or("el destino no se puede leer")?;
     if to_bytes.len() != 20 {
         return Err("el destino no mide 20 bytes");
@@ -386,7 +431,8 @@ pub fn decode_relayed(
     let mut to = [0u8; 20];
     to.copy_from_slice(to_bytes);
 
-    let value_bytes = rlp_bytes(body, read(6).ok_or("faltan campos")?.0).ok_or("el valor no se puede leer")?;
+    let value_bytes = rlp_bytes(body, read(value_index).ok_or("faltan campos")?.0)
+        .ok_or("el valor no se puede leer")?;
     if value_bytes.len() > 16 {
         return Err("el valor no cabe en 128 bits");
     }

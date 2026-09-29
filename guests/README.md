@@ -52,5 +52,10 @@ eligio ejecutar.
   una firma manipulada pasaba.
 - **El chain id lo dice la cadena**, no el guest. Esta en el storage que escribe
   el seed. Una cadena que no dice cual es acepta nada relayed, que es lo seguro.
+- **Las tres formas de transaccion.** Legacy, EIP-2930 y EIP-1559 tienen los
+  campos en sitios distintos, y el destino y el valor cambian de indice segun
+  cual sea. Que emita una u otra es decision de la libreria del wallet, no de la
+  cadena: un guest que solo entienda una convierte una transferencia legitima en
+  un rechazo.
 - **El seed lo escribe el guest.** Issuer, simbolo, saldos iniciales y chain id.
   Sin el, el issuer arranca en cero y la cadena no puede pagar un faucet.

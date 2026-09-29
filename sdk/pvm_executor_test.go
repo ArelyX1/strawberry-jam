@@ -86,6 +86,39 @@ func TestPVMExecutorAccumulate(t *testing.T) {
 	}
 }
 
+// seededExecutor returns an executor for a chain that has said which EVM chain
+// it presents. A guest reads that from the seed it was given, and a chain that
+// has not said relays nothing, which is what a guest without a seed would see.
+// seededExecutor returns an executor for a chain that has said which EVM chain
+// it presents, along with the account that seed was written into. The account
+// matters: the chain id lives in the guest's storage, so a refine over a
+// different account is a chain that never said what it is, and it relays nothing.
+func seededExecutor(t *testing.T, chainID int64, relay svc.Relay) (*svc.PVMExecutor, service.ServiceState) {
+	t.Helper()
+	exec := svc.NewPVMExecutor(guestBlob(t)).WithSeed(svc.Seed{
+		Issuer:  "sdlgYsddpudnTY8tup2DtKeP5yTj4vQ2irGDvBEX6PuSAWpYHGV55",
+		Symbol:  "PAPU",
+		ChainID: chainID,
+	})
+	if relay != nil {
+		exec = exec.WithRelay(relay)
+	}
+	account := seededAccount()
+	all := service.ServiceState{0: account}
+	seeded, err := exec.Initialize(0, 0, 50_000_000_000, all)
+	if err != nil {
+		t.Fatalf("seeding the guest: %v", err)
+	}
+	all[0] = seeded.Account
+	return exec, all
+}
+
+func seededAccount() service.ServiceAccount {
+	account := service.NewServiceAccount()
+	account.Balance = 1_000_000_000
+	return account
+}
+
 // guestBlob loads the economy guest that ships in the repo, so the tests do not
 // depend on a build having happened elsewhere.
 func guestBlob(t *testing.T) []byte {

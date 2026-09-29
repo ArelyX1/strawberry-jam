@@ -587,6 +587,16 @@ fn apply_op(op: &Op) -> bool {
     }
 }
 
+fn null_as_empty_map<'de, D>(
+    deserializer: D,
+) -> Result<alloc::collections::BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(Option::<alloc::collections::BTreeMap<String, String>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 // seed is what the chain hands over so the economy can write its genesis state.
 // The native service receives it by running its own seed handler; a guest has no
 // such handler, so the chain passes it in.
@@ -599,7 +609,9 @@ struct Seed {
     // The host sends balances as a JSON object, address to amount, so that is
     // what is read here; an array of pairs would be a second spelling of the
     // same thing and the chain would not agree on which one it is.
-    #[serde(default, rename = "Balances")]
+    // A nil map arrives as JSON null, which a BTreeMap will not take; a chain
+    // with nobody funded is a chain with an empty set, not a broken one.
+    #[serde(default, deserialize_with = "null_as_empty_map", rename = "Balances")]
     balances: alloc::collections::BTreeMap<String, String>,
     // ChainID is optional so a seed written before the chain said what it is
     // still seeds the rest; the relayed path stays closed until it does.
@@ -612,11 +624,15 @@ fn write_seed(args: &[u8]) {
         Ok(seed) => seed,
         Err(_) => return,
     };
-    if seed.balances.is_empty() {
-        return;
+    // The issuer, the asset name and the chain id are written whatever the seed
+    // carries in balances: an empty opening set is a chain that starts with
+    // nobody funded, not a reason to write nothing at all.
+    if !seed.issuer.is_empty() {
+        storage_write(&[KEY_ISSUER], seed.issuer.as_bytes());
     }
-
-    storage_write(&[KEY_ISSUER], seed.issuer.as_bytes());
+    if !seed.symbol.is_empty() {
+        storage_write(&[KEY_ASSET], seed.symbol.as_bytes());
+    }
     if seed.chain_id != 0 {
         let mut be = [0u8; 8];
         let mut v = seed.chain_id;

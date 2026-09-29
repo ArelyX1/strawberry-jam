@@ -15,21 +15,20 @@ import (
 	"github.com/eigerco/strawberry/internal/block"
 	"github.com/eigerco/strawberry/internal/jamtime"
 	"github.com/eigerco/strawberry/internal/service"
-	svc "github.com/eigerco/strawberry/sdk"
 	"github.com/eigerco/strawberry/sdk/papucoin"
 )
 
 // testRelay recovers senders with the same implementation the chain uses, which
 // is the point: the guest is not being handed an identity, it is being handed
 // the answer to a question the host answered.
-type testRelay struct{}
+type testRelay struct{ chainID int64 }
 
-func (testRelay) Recover(rawHex string) (string, error) {
+func (r testRelay) Recover(rawHex string) (string, error) {
 	raw, err := hex.DecodeString(strings.TrimPrefix(rawHex, "0x"))
 	if err != nil {
 		return "", err
 	}
-	tx, err := papucoin.ParseEVMTransaction(raw, big.NewInt(1))
+	tx, err := papucoin.ParseEVMTransaction(raw, big.NewInt(r.chainID))
 	if err != nil {
 		return "", err
 	}
@@ -130,7 +129,6 @@ func unmarshalJSON(blob []byte, v any) error {
 // the only way it can move balance is if the guest recovers the sender from the
 // signature rather than believing the item.
 func TestPVMExecutorRelayedEVM(t *testing.T) {
-	blob := guestBlob(t)
 	fixture := newRelayedFixture(t, 3, 250)
 
 	item := papucoin.Item{
@@ -142,12 +140,12 @@ func TestPVMExecutorRelayedEVM(t *testing.T) {
 		Raw:    fixture.raw,
 	}
 
-	exec := svc.NewPVMExecutor(blob).WithRelay(testRelay{})
+	exec, all := seededExecutor(t, 1, testRelay{chainID: 1})
 	id := block.ServiceId(0)
 	account := service.NewServiceAccount()
 	account.Balance = 1_000_000_000
 
-	result, err := exec.Refine(id, mustJSON(t, item), jamtime.Timeslot(0), 50_000_000_000, service.ServiceState{id: account})
+	result, err := exec.Refine(id, mustJSON(t, item), jamtime.Timeslot(0), 50_000_000_000, all)
 	require.NoError(t, err)
 	require.NotEmpty(t, result.Report, "the guest refused a valid relayed transaction")
 	t.Logf("report: %s", result.Report)
@@ -172,7 +170,6 @@ func TestPVMExecutorRelayedEVM(t *testing.T) {
 // destination was swapped after signing is refused. The signature covers the
 // destination, so comparing it against the claimed one has to catch it.
 func TestPVMExecutorRelayedRejectsTampered(t *testing.T) {
-	blob := guestBlob(t)
 	fixture := newRelayedFixture(t, 1, 250)
 
 	item := papucoin.Item{
@@ -184,12 +181,12 @@ func TestPVMExecutorRelayedRejectsTampered(t *testing.T) {
 		Raw:    fixture.raw,
 	}
 
-	exec := svc.NewPVMExecutor(blob).WithRelay(testRelay{})
+	exec, all := seededExecutor(t, 1, testRelay{chainID: 1})
 	id := block.ServiceId(0)
 	account := service.NewServiceAccount()
 	account.Balance = 1_000_000_000
 
-	result, err := exec.Refine(id, mustJSON(t, item), jamtime.Timeslot(0), 50_000_000_000, service.ServiceState{id: account})
+	result, err := exec.Refine(id, mustJSON(t, item), jamtime.Timeslot(0), 50_000_000_000, all)
 	require.NoError(t, err)
 	// The signature is valid, so the host recovers the real sender; the guest is
 	// the one that refuses, because the claimed destination is not the signed one.
@@ -201,8 +198,6 @@ func TestPVMExecutorRelayedRejectsTampered(t *testing.T) {
 // another chain is not replayed here, which is what folding the chain id into
 // the signing hash is for.
 func TestPVMExecutorRelayedRejectsForeignChain(t *testing.T) {
-	blob := guestBlob(t)
-
 	key, err := secp256k1.GeneratePrivateKeyFromRand(rand.Reader)
 	require.NoError(t, err)
 	raw, err := papucoin.SignEIP1559(
@@ -229,12 +224,12 @@ func TestPVMExecutorRelayedRejectsForeignChain(t *testing.T) {
 		Raw:    "0x" + hexOf(raw),
 	}
 
-	exec := svc.NewPVMExecutor(blob).WithRelay(testRelay{})
+	exec, all := seededExecutor(t, 1, testRelay{chainID: 1})
 	id := block.ServiceId(0)
 	account := service.NewServiceAccount()
 	account.Balance = 1_000_000_000
 
-	result, err := exec.Refine(id, mustJSON(t, item), jamtime.Timeslot(0), 50_000_000_000, service.ServiceState{id: account})
+	result, err := exec.Refine(id, mustJSON(t, item), jamtime.Timeslot(0), 50_000_000_000, all)
 	require.Error(t, err, "a transaction for another chain must not be replayed here")
 	require.Empty(t, result.Report)
 	_ = ecdsa.NewSignature

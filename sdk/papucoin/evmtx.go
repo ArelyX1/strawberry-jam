@@ -442,3 +442,128 @@ func SignEIP1559(
 func KeccakForTest(data []byte) []byte {
 	return keccak(data)
 }
+
+// SignEVMLegacy builds and signs a pre-EIP-2718 transaction, returning its raw
+// encoding. The chain id is folded into v the way EIP-155 prescribes, so a legacy
+// transaction is as chain-bound as a typed one.
+func SignEVMLegacy(
+	chainID *big.Int,
+	nonce uint64,
+	gasPrice uint64,
+	gasLimit uint64,
+	to []byte,
+	value *big.Int,
+	data []byte,
+	key *secp256k1.PrivateKey,
+) ([]byte, error) {
+	if key == nil {
+		return nil, fmt.Errorf("papucoin: signing needs a private key")
+	}
+	if len(to) != 20 {
+		return nil, fmt.Errorf("papucoin: destination is %d bytes, want 20", len(to))
+	}
+	if data == nil {
+		data = []byte{}
+	}
+
+	unsigned := [][]byte{
+		rlpEncodeUint(new(big.Int).SetUint64(nonce)),
+		rlpEncodeUint(new(big.Int).SetUint64(gasPrice)),
+		rlpEncodeUint(new(big.Int).SetUint64(gasLimit)),
+		rlpEncodeString(to),
+		rlpEncodeUint(value),
+		rlpEncodeString(data),
+	}
+
+	// EIP-155: sign over the six fields, then the chain id and two empty
+	// placeholders, and report it in v as chainId*2 + 35 + parity. The
+	// placeholders have to be encoded exactly as the parser decodes them, so
+	// rlpEncodeUint(nil) is used rather than a literal byte.
+	signingChain := rlpConcat(append(append([][]byte{}, unsigned...),
+		rlpEncodeUint(chainID), rlpEncodeUint(nil), rlpEncodeUint(nil))...)
+
+	digest := keccak(signingChain)
+	compact := ecdsa.SignCompact(key, digest, true)
+	recovery := (compact[0] - 27) & 3
+	r := compact[1:33]
+	s := compact[33:65]
+	if recovery > 1 {
+		return nil, fmt.Errorf("%w: signing produced a high s", ErrEVMBadSignature)
+	}
+
+	v := new(big.Int).Mul(chainID, big.NewInt(2))
+	v.Add(v, big.NewInt(int64(35+recovery)))
+
+	signed := make([][]byte, 0, 9)
+	signed = append(signed, unsigned...)
+	signed = append(signed, rlpEncodeUint(v), rlpEncodeString(r), rlpEncodeString(s))
+	return rlpEncodeList(signed), nil
+}
+
+// SignEIP2930 builds and signs an EIP-2930 transaction, the type that exists
+// only to carry an access list. The chain accepts it, so a wallet that emits it
+// has to be able to move balance.
+func SignEIP2930(
+	chainID *big.Int,
+	nonce uint64,
+	gasPrice uint64,
+	gasLimit uint64,
+	to []byte,
+	value *big.Int,
+	data []byte,
+	accessList [][][]byte,
+	key *secp256k1.PrivateKey,
+) ([]byte, error) {
+	if key == nil {
+		return nil, fmt.Errorf("papucoin: signing needs a private key")
+	}
+	if len(to) != 20 {
+		return nil, fmt.Errorf("papucoin: destination is %d bytes, want 20", len(to))
+	}
+	if data == nil {
+		data = []byte{}
+	}
+
+	fields := [][]byte{
+		rlpEncodeUint(chainID),
+		rlpEncodeUint(new(big.Int).SetUint64(nonce)),
+		rlpEncodeUint(new(big.Int).SetUint64(gasPrice)),
+		rlpEncodeUint(new(big.Int).SetUint64(gasLimit)),
+		rlpEncodeString(to),
+		rlpEncodeUint(value),
+		rlpEncodeString(data),
+		rlpEncodeListOfLists(accessList),
+	}
+
+	digest := keccak(append([]byte{0x01}, rlpEncodeList(fields)...))
+	compact := ecdsa.SignCompact(key, digest, true)
+	recovery := (compact[0] - 27) & 3
+	if recovery > 1 {
+		return nil, fmt.Errorf("%w: signing produced a high s", ErrEVMBadSignature)
+	}
+	r := compact[1:33]
+	s := compact[33:65]
+
+	signed := make([][]byte, 0, len(fields)+3)
+	signed = append(signed, fields...)
+	signed = append(signed, rlpEncodeUint(big.NewInt(int64(recovery))))
+	signed = append(signed, rlpEncodeString(r), rlpEncodeString(s))
+	return append([]byte{0x01}, rlpEncodeList(signed)...), nil
+}
+
+// rlpEncodeListOfLists encodes a list whose items are themselves lists, which is
+// the shape an EIP-2930 access list takes.
+func rlpEncodeListOfLists(items [][][]byte) []byte {
+	encoded := make([][]byte, 0, len(items))
+	for _, item := range items {
+		encoded = append(encoded, rlpEncodeList(item))
+	}
+	return rlpEncodeList(encoded)
+}
+
+// RlpStringForTest exposes the string encoding so a caller building a
+// transaction field, such as a test assembling an access list, encodes it the
+// same way the signers do rather than by hand.
+func RlpStringForTest(b []byte) []byte {
+	return rlpEncodeString(b)
+}

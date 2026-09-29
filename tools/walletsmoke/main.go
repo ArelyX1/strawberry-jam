@@ -94,26 +94,60 @@ func main() {
 		die("el welcome no movio saldo para una wallet de cadena")
 	}
 
-	// The path MetaMask actually takes: a raw signed EVM transaction, verified
+	// The path a wallet actually takes: a raw signed EVM transaction, verified
 	// by the chain and applied by the guest. The faucet above is the node paying
-	// out; this is a wallet moving its own money to another wallet.
+	// out; this is a wallet moving its own money to another wallet. Which of the
+	// three transaction shapes a wallet emits is its own choice, so all three are
+	// tried: a library that only speaks one of them is still a real wallet.
 	recipient := "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	transferTx, err := papucoin.SignEIP1559(
-		big.NewInt(*chainID),
-		1, // the EVM nonce of this wallet, its first
-		1_000_000_000, 2_000_000_000, 21_000,
-		mustAddr(recipient),
-		big.NewInt(750*1_000_000), // 750 micro-PAPU, a whole number of them
-		nil,
-		key,
-	)
-	if err != nil {
-		die("firmar la transferencia: " + err.Error())
+	shapes := []struct {
+		name  string
+		nonce uint64
+		make  func(uint64) ([]byte, error)
+	}{
+		{"eip1559", 0, func(nonce uint64) ([]byte, error) {
+			return papucoin.SignEIP1559(
+				big.NewInt(*chainID), nonce,
+				1_000_000_000, 2_000_000_000, 21_000,
+				mustAddr(recipient),
+				big.NewInt(250*1_000_000),
+				nil, key,
+			)
+		}},
+		{"eip2930", 1, func(nonce uint64) ([]byte, error) {
+			return papucoin.SignEIP2930(
+				big.NewInt(*chainID), nonce,
+				1_000_000_000, 60_000,
+				mustAddr(recipient),
+				big.NewInt(250*1_000_000),
+				nil,
+				[][][]byte{{
+					papucoin.RlpStringForTest(make([]byte, 20)),
+					papucoin.RlpStringForTest([]byte{0x01, 0x02, 0x03, 0x04}),
+				}},
+				key,
+			)
+		}},
+		{"legacy", 2, func(nonce uint64) ([]byte, error) {
+			return papucoin.SignEVMLegacy(
+				big.NewInt(*chainID), nonce,
+				1_000_000_000, 21_000,
+				mustAddr(recipient),
+				big.NewInt(250*1_000_000),
+				nil, key,
+			)
+		}},
 	}
-	if _, err := rpc(client, "eth_sendRawTransaction", "0x"+hex(transferTx)); err != nil {
-		die("eth_sendRawTransaction: " + err.Error())
+	for _, shape := range shapes {
+		tx, err := shape.make(shape.nonce)
+		if err != nil {
+			die("firmar la transferencia " + shape.name + ": " + err.Error())
+		}
+		if _, err := rpc(client, "eth_sendRawTransaction", "0x"+hex(tx)); err != nil {
+			die("eth_sendRawTransaction " + shape.name + ": " + err.Error())
+		}
+		fmt.Printf("  eth_sendRawTransaction (%s) aceptada\n", shape.name)
 	}
-	fmt.Printf("  eth_sendRawTransaction aceptada (750 micro-PAPU)\n")
 
 	time.Sleep(*wait)
 	recipientBalance := readBalance(client, recipient)
