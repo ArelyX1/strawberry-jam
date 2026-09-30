@@ -2,7 +2,6 @@ package pvm
 
 import (
 	"errors"
-	"math"
 )
 
 // AccumulateEntryPoint is the ι that accumulation starts the PVM at.
@@ -45,10 +44,17 @@ func InvokeWholeProgram[X any](p []byte, entryPoint uint64, initialGas UGas, arg
 
 	if errors.Is(err, ErrHalt) {
 		maybeAddr := regs[R7]
-		result := make([]byte, regs[R8])
-		if maybeAddr > math.MaxUint32 {
+		// Check the range before sizing the result buffer. R8 is a guest
+		// register and R7 was only checked after the allocation, so this used to
+		// be make([]byte, R8) with a size the guest picked. Past the address
+		// space that is a runtime throw rather than a panic, and nothing
+		// recovers from it: the node process goes down.
+		if !memory1.HasAccess(maybeAddr, regs[R8], ReadOnly) {
+			// Do not return anything if registers 7 and 8 are not pointing to a valid memory page
+			// (u, [], x′) if ε = ∎ ∧ Nφ′7...+φ′8 ⊄ Vμ′
 			return gasUsed, []byte{}, x1, nil
 		}
+		result := make([]byte, regs[R8])
 		if err := memory1.Read(uint32(maybeAddr), result); err != nil {
 			// Do not return anything if registers 7 and 8 are not pointing to a valid memory page
 			// (u, [], x′) if ε = ∎ ∧ Nφ′7...+φ′8 ⊄ Vμ′

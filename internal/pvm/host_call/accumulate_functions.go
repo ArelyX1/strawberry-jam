@@ -487,7 +487,10 @@ func Eject(gas Gas, regs Registers, mem Memory, ctxPair AccumulateContextPair, t
 	}
 
 	// if d_l[h, l] = [x, y], y < t − D => OK
-	if len(historicalTimeslots) == 2 && historicalTimeslots[1] < timeslot-constants.PreimageExpulsionPeriod {
+	// Widen the subtraction: t and y are uint32, so below the period t − D wraps
+	// to a huge value and the guard would pass, ejecting far too early. The two
+	// branches in Forget already cast; this one did not.
+	if len(historicalTimeslots) == 2 && int64(historicalTimeslots[1]) < int64(timeslot)-constants.PreimageExpulsionPeriod {
 		xs := ctxPair.RegularCtx.ServiceAccount()
 		// s'_b = ((x_u)d)[x_s]b + d_b
 		xs.Balance += serviceAccount.Balance
@@ -744,6 +747,9 @@ func Provide(gas Gas, regs Registers, mem Memory, ctxPair AccumulateContextPair,
 	}
 
 	// i = µ[o..o+z]
+	if !mem.HasAccess(o, z, ReadOnly) {
+		return gas, regs, mem, ctxPair, ErrPanicf("inaccessible memory, address out of range")
+	}
 	i := make([]byte, z)
 	if o > math.MaxUint32 {
 		return gas, regs, mem, ctxPair, ErrPanicf("inaccessible memory, address out of range")

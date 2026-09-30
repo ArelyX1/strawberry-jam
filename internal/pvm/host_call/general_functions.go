@@ -294,10 +294,12 @@ func Read(gas pvm.Gas, regs pvm.Registers, mem pvm.Memory, s service.ServiceAcco
 	ko, kz, o := regs[pvm.R8], regs[pvm.R9], regs[pvm.R10]
 
 	// read key data from memory at ko..ko+kz
-	keyData := make([]byte, kz)
-	if ko > math.MaxUint32 {
+	// Size the buffer only after the range checks out: kz comes straight from a
+	// guest register, so allocating first hands make a size the guest picked.
+	if !mem.HasAccess(ko, kz, pvm.ReadOnly) {
 		return gas, regs, mem, pvm.ErrPanicf("inaccessible memory, address out of range")
 	}
+	keyData := make([]byte, kz)
 	err := mem.Read(uint32(ko), keyData)
 	if err != nil {
 		return gas, regs, mem, pvm.ErrPanicf(err.Error())
@@ -333,10 +335,11 @@ func Write(gas pvm.Gas, regs pvm.Registers, mem pvm.Memory, s service.ServiceAcc
 	vz := regs[pvm.R10]
 
 	//µko⋅⋅⋅+kz
-	keyData := make([]byte, kz)
-	if ko > math.MaxUint32 {
+	// Check the range before sizing the buffer; kz and vz are guest registers.
+	if !mem.HasAccess(ko, kz, pvm.ReadOnly) {
 		return gas, regs, mem, s, pvm.ErrPanicf("inaccessible memory, address out of range")
 	}
+	keyData := make([]byte, kz)
 	err := mem.Read(uint32(ko), keyData)
 	if err != nil {
 		return gas, regs, mem, s, pvm.ErrPanicf(err.Error())
@@ -356,10 +359,10 @@ func Write(gas pvm.Gas, regs pvm.Registers, mem pvm.Memory, s service.ServiceAcc
 			}
 		}
 	} else {
-		valueData := make([]byte, vz)
-		if vo > math.MaxUint32 {
+		if !mem.HasAccess(vo, vz, pvm.ReadOnly) {
 			return gas, regs, mem, s, pvm.ErrPanicf("inaccessible memory, address out of range")
 		}
+		valueData := make([]byte, vz)
 		err = mem.Read(uint32(vo), valueData)
 		if err != nil {
 			return gas, regs, mem, s, pvm.ErrPanicf(err.Error())
@@ -479,22 +482,24 @@ func Log(gas pvm.Gas, regs pvm.Registers, mem pvm.Memory, core *uint16, serviceI
 
 	// Write target
 	if to != 0 && tz != 0 {
-		targetBytes := make([]byte, tz)
-		if to > math.MaxUint32 {
+		if !mem.HasAccess(to, tz, pvm.ReadOnly) {
 			return gas, regs, mem, pvm.ErrPanicf("inaccessible memory, address out of range")
 		}
-		err := mem.Read(uint32(to), targetBytes)
-		if err != nil {
-			log.VM.Error().Msgf("unable to access memory for target: address %d length %d", to, tz)
+		targetBytes := make([]byte, tz)
+		if err := mem.Read(uint32(to), targetBytes); err != nil {
+			// Other host calls turn an unreadable range into a panic; doing the
+			// same here is what keeps Log from answering success on memory the
+			// guest was not allowed to touch.
+			return gas, regs, mem, pvm.ErrPanicf(err.Error())
 		}
 
 		_, _ = fmt.Fprintf(fullMsg, " %s", targetBytes)
 	}
 
-	msgBytes := make([]byte, xz)
-	if xo > math.MaxUint32 {
+	if !mem.HasAccess(xo, xz, pvm.ReadOnly) {
 		return gas, regs, mem, pvm.ErrPanicf("inaccessible memory, address out of range")
 	}
+	msgBytes := make([]byte, xz)
 	err := mem.Read(uint32(xo), msgBytes)
 	if err != nil {
 		log.VM.Error().Msgf("unable to access memory for target: address %d length %d", to, tz)

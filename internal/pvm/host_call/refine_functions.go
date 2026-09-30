@@ -130,10 +130,12 @@ func Machine(
 	i := regs[R9]
 
 	// p = µ[po ... po+pz]
-	p := make([]byte, pz)
-	if po > math.MaxUint32 {
+	// Range first, buffer second: pz is a guest register, so allocating from it
+	// before checking lets the guest pick an allocation it cannot survive.
+	if !mem.HasAccess(po, pz, ReadOnly) {
 		return gas, regs, mem, ctxPair, ErrPanicf("inaccessible memory, address out of range")
 	}
+	p := make([]byte, pz)
 	err := mem.Read(uint32(po), p)
 	if err != nil {
 		// p = ∇
@@ -179,10 +181,10 @@ func Peek(
 	}
 
 	// (m[n]u)[s...s+z]
-	s := make([]byte, z)
-	if sReg > math.MaxUint32 {
+	if !u.Ram.HasAccess(sReg, z, ReadOnly) {
 		return gas, withCode(regs, OOB), mem, ctxPair, nil
 	}
+	s := make([]byte, z)
 	err := u.Ram.Read(uint32(sReg), s)
 	if err != nil {
 		return gas, withCode(regs, OOB), mem, ctxPair, nil
@@ -217,10 +219,10 @@ func Poke(
 		return gas, withCode(regs, WHO), mem, ctxPair, nil
 	}
 
-	s := make([]byte, z)
-	if sReg > math.MaxUint32 {
+	if !mem.HasAccess(sReg, z, ReadOnly) {
 		return gas, regs, mem, ctxPair, ErrPanicf("inaccessible memory, address out of range")
 	}
+	s := make([]byte, z)
 	err := mem.Read(uint32(sReg), s)
 	if err != nil {
 		return gas, regs, mem, ctxPair, ErrPanicf(err.Error())

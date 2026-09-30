@@ -332,7 +332,11 @@ func TestAccumulate(t *testing.T) {
 			name:       "eject",
 			fn:         fnWithExtra[jamtime.Timeslot](Eject),
 			initialGas: 100,
-			extraParam: jamtime.Timeslot(200),
+			// The request is aged 10, so the eject only lands once the timeslot
+			// clears D. This used to pass t=200 against the default D of 19_200,
+			// which is only reachable through the t-D underflow: 10 < 200-19_200
+			// is false, so a correct guard answers HUH here.
+			extraParam: jamtime.Timeslot(constants.PreimageExpulsionPeriod + 100),
 			initialRegs: deltaRegs{
 				R7: 999,
 			},

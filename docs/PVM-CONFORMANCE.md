@@ -205,3 +205,46 @@ Ahora convierte a relativo explícitamente y actualiza `rw.end`, que es la
 autoridad sobre dónde acaba el segmento escribible. Cubierto por
 `internal/pvm/memory_allocate_test.go`, cuyo primer test falla si se restaura la
 versión anterior.
+
+### Arreglado: `Eject` expulsaba antes de tiempo
+
+`Eject` comparaba `y < t − D` con ambos operandos en `uint32`. Para todo
+`t < D` la resta se envuelve a un valor enorme, así que la guarda se cumplía y
+el hijo era expulsado, con su saldo traspasado al padre, miles de timeslots antes
+de lo debido. Los dos hermanos en `Forget` ya casteaban; esta rama no.
+
+Con `D = 19_200` en producción y timeslots 0-100 en los vectores de conformidad
+(`D = 32`), los slots 0-31 quedan afectados.
+
+El test `eject` de `accumulate_functions_test.go` pasaba `t=200` esperando `OK`,
+lo cual solo era alcanzable por el underflow: `10 < 200 − 19_200` es falso, así
+que una guarda correcta responde `HUH`. Corregido el timeslot del vector y
+añadida cobertura en `internal/pvm/host_call/eject_expunge_test.go`, que verifica
+el caso negativo (`HUH`) y el positivo (`OK`) para que el primero no pueda pasar
+por otra causa.
+
+### Arreglado: longitudes de guestreserveadas sin cota
+
+Varias host calls dimensionaban su buffer directamente con un registro del
+guest: `make([]byte, regs[R9])` en `Read`, `Write`, `Log`, `Peek`, `Poke`,
+`Machine` y `Provide`, y `make([]byte, regs[R8])` en el retorno por `halt`.
+
+Esto no es un bug de corrección sino uno fatal. Comprobado en aislamiento:
+`make([]byte, 1<<40)` produce `fatal error: runtime: out of memory` vía
+`runtime.throw`, que **no** es un panic y por tanto no lo captura ningún
+`recover`; el proceso muere. Y las host calls se ejecutan desde
+`InvokeHostCall`, fuera del `recover` de `InvokeBasic`, que ya ha retornado cuando
+el cuerpo de la llamada empieza a correr. Un solo `ecalli` tumbaba el nodo.
+
+Se añadió `Memory.HasAccess`, que valida el rango sin reservar, y todos esos
+sitios comprueban el rango antes de dimensionar. El resultado observable no
+cambia — una rango inaccesible ya devolvía panic — pero la reserva solo ocurre
+para rangos que caben de verdad en memoria.
+
+Cubierto por `internal/pvm/host_call/guest_sized_alloc_test.go`. Verificado
+revirtiendo el guard de `Read`: el proceso muere con `fatal error: runtime: out
+of memory` y el test falla.
+
+De paso, `Log` ya no se traga el error de lectura: registraba el fallo con
+`log.VM.Error()` y continuaba, devolviendo éxito sobre memoria a la que el guest
+no tenía acceso, mientras el resto de host calls convierten eso en panic.

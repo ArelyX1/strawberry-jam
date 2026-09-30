@@ -2,6 +2,7 @@ package pvm
 
 import (
 	"bytes"
+	"math"
 
 	"github.com/eigerco/strawberry/internal/block"
 	"github.com/eigerco/strawberry/internal/crypto"
@@ -37,6 +38,53 @@ type memorySegment struct {
 	end     uint32
 	data    []byte
 	access  MemoryAccess
+}
+
+// HasAccess reports whether the range [address, address+length) sits inside one
+// segment with at least the requested access.
+//
+// It exists because Read and Write take an already-sized buffer: a caller that
+// wants to size a buffer from guest-supplied registers has no way to ask whether
+// the range is even reachable without first allocating it. Sizing such a buffer
+// straight from a register means make([]byte, r) with r chosen by the guest,
+// and r beyond what the address space allows is not a recoverable panic but a
+// fatal runtime throw that no recover can catch.
+func (m *Memory) HasAccess(address uint64, length uint64, access MemoryAccess) bool {
+	if length == 0 {
+		return true
+	}
+	if address > math.MaxUint32 || length > math.MaxUint32 {
+		return false
+	}
+	// ☇ if min(x) mod 2^32 < 2^16
+	if address < 1<<16 {
+		return false
+	}
+	end, ok := safemath.Add(uint32(address), uint32(length))
+	if !ok {
+		return false
+	}
+
+	a := uint32(address)
+	allocatedHeapEnd := m.rw.address + uint32(len(m.rw.data))
+	fits := func(seg memorySegment, segEnd uint32) bool {
+		return a >= seg.address && end <= segEnd
+	}
+
+	var segmentAccess MemoryAccess
+	switch {
+	case fits(m.stack, m.stack.end):
+		segmentAccess = m.stack.access
+	case fits(m.rw, allocatedHeapEnd):
+		segmentAccess = m.rw.access
+	case fits(m.ro, m.ro.end):
+		segmentAccess = m.ro.access
+	case fits(m.args, m.args.end):
+		segmentAccess = m.args.access
+	default:
+		return false
+	}
+	return segmentAccess != Inaccessible && segmentAccess >= access
 }
 
 // Read reads from the set of readable indices (Vμ) (implements eq. A.7 v0.7.2)
