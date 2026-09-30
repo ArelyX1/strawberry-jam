@@ -180,5 +180,28 @@ En total: tres arreglos —dos de framing (`E4(|c|)` y `z`) y uno de punto de
 entrada—, cero regresiones en los 36 paquetes de pruebas unitarias y los 88 del
 SDK, y la integración completa en verde tanto en `tiny` como en `full`.
 
-Lo único que queda sin comprobar es `TestTraceFuzzy`, que lanza el fuzzer y satura
-la máquina; no se ha tocado.
+### Pendiente: `TestTraceFuzzy`
+
+Los 205 casos del fuzzer se lanzan todos en paralelo (`t.Parallel()` en cada
+subtest), y eso es lo que satura la máquina: 205 subtests contendiendo a la vez,
+no el coste de los vectores. Limitando el paralelismo a 2 con `GOMAXPROCS=2`, los
+primeros lotes (casos `00000000`–`00000309`) pasan en unos segundos sin fallos.
+
+No se ha ejecutado el conjunto completo porque quedan casos de coste patológico
+que no terminan en un plazo razonable, y agotarlos aquí no aporta tanto como
+mantener la máquina usable. Queda como verificación pendiente de una máquina
+dedicada (`-parallel 2`, sin límite de tiempo).
+
+### Arreglado: `allocatePages`
+
+`allocatePages` (`internal/pvm/common.go`) comparaba un índice de página
+absoluto contra `len(rw.data)`, que es relativo a `rw.address`. Las dos
+magnitudes no son comparables: el resultado era sobreasignar `rw.address` bytes de
+más, y `rw.end` se quedaba describiendo la extensión anterior, así que
+`GetAccess` y `SetAccess` seguían marcando como inaccesibles las páginas que
+`sbrk` acababa de entregar al huésped.
+
+Ahora convierte a relativo explícitamente y actualiza `rw.end`, que es la
+autoridad sobre dónde acaba el segmento escribible. Cubierto por
+`internal/pvm/memory_allocate_test.go`, cuyo primer test falla si se restaura la
+versión anterior.

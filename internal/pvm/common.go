@@ -162,14 +162,29 @@ func (m *Memory) Sbrk(size uint32) (uint32, error) {
 	return result, nil
 }
 
+// allocatePages grows the writable segment so that it covers the pages from
+// startPage to startPage+count.
+//
+// startPage is an absolute page index, so the end it names is an absolute
+// address, while rw.data is indexed from rw.address. Comparing the two
+// directly is what made this over-allocate by a whole rw.address worth of
+// bytes, and it left rw.end describing the old extent, so GetAccess and
+// SetAccess went on calling the freshly grown pages inaccessible.
 func (m *Memory) allocatePages(startPage uint32, count uint32) {
-	required := (startPage + count) * PageSize
-	if uint32(len(m.rw.data)) < required {
-		// Grow rw_data to fit new allocation
-		newData := make([]byte, required)
-		copy(newData, m.rw.data)
-		m.rw.data = newData
+	end := (startPage + count) * PageSize
+	if end <= m.rw.address {
+		return
 	}
+	required := end - m.rw.address
+	if uint32(len(m.rw.data)) >= required {
+		return
+	}
+	newData := make([]byte, required)
+	copy(newData, m.rw.data)
+	m.rw.data = newData
+	// rw.end is the authority on where the writable segment stops; sbrk
+	// handing out addresses past it is what the guest reads as a fault.
+	m.rw.end = end
 }
 
 // SetAccess updates the access mode
