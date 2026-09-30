@@ -126,3 +126,29 @@ bench: build-bandersnatch build-erasurecoding
   endif
 	go test -bench=^$(NAME)$$ ./tests/integration --tags=traces,tiny | tee benchmark_results.txt
 	python3 bench-stats.py benchmark_results.txt
+
+.PHONY: test-guest
+## test-guest: Runs the tests of the part of the guest that needs no PVM.
+## This is the half of the economy that can be checked on the host: addresses,
+## signatures, Keccak and the decoding of a relayed Ethereum transaction. It
+## used to be unreachable, and two of its assumptions were wrong.
+test-guest:
+	cd guests/core && cargo +nightly-2025-05-10 test
+
+.PHONY: build-guest
+## build-guest: Rebuilds the guest blob and says whether it matches the one in
+## the repository. The target and build-std are on the command line rather than
+## in a .cargo/config.toml, because that file is inherited downwards and
+## cannot be overridden, which is what stopped the core crate from being
+## testable at all.
+build-guest:
+	cargo +nightly-2025-05-10 build --release \
+		--manifest-path guests/Cargo.toml \
+		--target riscv64emac-unknown-none-polkavm.json -Zbuild-std=core,alloc
+	references/polkavm/target/release/polkatool link -i revive_v1 \
+		-o guests/papucoin.pol \
+		guests/target/riscv64emac-unknown-none-polkavm/release/papucoin-guest
+	@git diff --quiet -- guests/papucoin.pol \
+		&& echo "el blob commiteado es el que construye la fuente" \
+		|| (echo "el blob commiteado ya no corresponde a su fuente:"; \
+		    git --no-pager diff --stat -- guests/papucoin.pol; false)

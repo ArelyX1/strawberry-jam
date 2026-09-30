@@ -22,6 +22,10 @@ const (
 	keyWelcome   byte = 0x06
 	keyIssuer    byte = 0x07
 	keyAssetName byte = 0x08
+	// keyFeeLevel is where the current transfer fee lives. The fee is not a
+	// tariff fixed at genesis: it moves with how much the service is being asked
+	// to do, so the level has to be state that the next block can read.
+	keyFeeLevel byte = 0x0a
 )
 
 // Methods accepted by the service.
@@ -207,6 +211,14 @@ func refineItem(ctx svc.RefineContext, payload []byte, params Params, issuer str
 		}
 	}
 
+	// The report carries the price the transfer is being done at, so whoever
+	// reads the report sees what this transfer is being charged rather than a
+	// figure fixed when the chain was configured.
+	fee, err := refineFee(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+
 	op := Op{Op: item.Method, Actor: sender, Sender: sender, Nonce: item.Nonce, Memo: item.Memo}
 
 	switch item.Method {
@@ -240,7 +252,7 @@ func refineItem(ctx svc.RefineContext, payload []byte, params Params, issuer str
 
 			amount := new(big.Int).Quo(fields.Value, weiGranularity)
 			evmNonce := fields.Nonce
-			op.Op, op.Sender, op.To, op.Fee = MethodTransfer, from, to, params.TransferFee.String()
+			op.Op, op.Sender, op.To, op.Fee = MethodTransfer, from, to, fee.String()
 			op.Amount, op.EVMNonce = amount.String(), &evmNonce
 			break
 		}
@@ -253,7 +265,7 @@ func refineItem(ctx svc.RefineContext, payload []byte, params Params, issuer str
 		if err != nil {
 			return nil, err
 		}
-		op.To, op.Amount, op.Fee = to, amount.String(), params.TransferFee.String()
+		op.To, op.Amount, op.Fee = to, amount.String(), fee.String()
 
 	case MethodMint:
 		to, err := NormalizeAddress(item.To)
@@ -296,6 +308,7 @@ func refineItem(ctx svc.RefineContext, payload []byte, params Params, issuer str
 
 func accumulateItems(ctx svc.AccumulateContext, items []svc.RefinedItem, params Params) ([]byte, error) {
 	applied := 0
+	transfers := 0
 	for _, refined := range items {
 		if len(refined.Report) == 0 {
 			continue
@@ -312,10 +325,23 @@ func accumulateItems(ctx svc.AccumulateContext, items []svc.RefinedItem, params 
 		}
 		if ok {
 			applied++
+			if op.Op == MethodTransfer {
+				transfers++
+			}
 		}
 	}
 
-	ctx.Log(svc.LogDebug, fmt.Sprintf("papucoin applied %d of %d ops", applied, len(items)))
+	// The block's load is what moves the price, so the move happens here, after
+	// the work, and is what the next block will charge.
+	if err := nextFee(ctx, params, transfers); err != nil {
+		return nil, err
+	}
+
+	level, err := currentFee(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	ctx.Log(svc.LogDebug, fmt.Sprintf("papucoin applied %d of %d ops, %d transfers, price now %s", applied, len(items), transfers, level.String()))
 	return nil, nil
 }
 
@@ -323,11 +349,24 @@ func accumulateItems(ctx svc.AccumulateContext, items []svc.RefinedItem, params 
 // effect; an operation that fails a check is skipped rather than aborting the
 // block, matching the original chain.
 func applyOp(ctx svc.AccumulateContext, op Op, params Params) (bool, error) {
+	// A number that has already gone by is a replay and is dropped. A number at
+	// or ahead of the one the account is on is taken, and the account moves to
+	// one past it, so the same signed item can never be taken twice.
+	//
+	// The rule used to demand the exact number, which is what the original chain
+	// does, and that is only workable when nothing else is queued for the account
+	// at the same moment. An account that sends three transfers before the next
+	// block has them all numbered from the same state, the chain keeps the first
+	// and silently drops the other two, and the money in them is gone with no
+	// error anywhere. Allowing a number ahead costs the ability to jump the queue
+	// by more than the number of items already waiting, and no third party can do
+	// it: a relayed item is numbered by this node and a chain item has to be
+	// signed by the account it moves money for.
 	expected, err := readNonce(ctx, op.Actor, params.FirstNonce)
 	if err != nil {
 		return false, err
 	}
-	if op.Nonce != expected {
+	if op.Nonce < expected {
 		return false, nil
 	}
 
@@ -345,10 +384,16 @@ func applyOp(ctx svc.AccumulateContext, op Op, params Params) (bool, error) {
 		if err != nil {
 			return false, err
 		}
+		// The fee comes from the report rather than from a fresh reading of the
+		// price. The report was refined when the price stood at a known figure,
+		// and a client was shown that figure; re-reading here would charge
+		// whatever the price had become by the time the block settled, which is
+		// not what anybody was told and not what was agreed.
 		fee, err := amountFromString(op.Fee)
 		if err != nil {
 			return false, err
 		}
+		fee = clampFee(fee)
 
 		if op.EVMNonce != nil {
 			current, err := readEVMNonce(ctx, op.Sender)
@@ -459,14 +504,14 @@ func applyOp(ctx svc.AccumulateContext, op Op, params Params) (bool, error) {
 		return true, advance()
 
 	case MethodFaucet, MethodWelcome:
-		claimKey := []byte{keyFaucet}
+		claimKind := keyFaucet
 		amount := params.FaucetAmount
 		if op.Op == MethodWelcome {
-			claimKey = []byte{keyWelcome}
+			claimKind = keyWelcome
 			amount = params.WelcomeAmount
 		}
 
-		claimed, _, err := ctx.Read(append(claimKey, op.To...))
+		claimed, _, err := ctx.Read(claimKey(claimKind, op.To))
 		if err != nil {
 			return false, err
 		}
@@ -488,7 +533,7 @@ func applyOp(ctx svc.AccumulateContext, op Op, params Params) (bool, error) {
 		if err := writeAmount(ctx, []byte{keySupply}, next); err != nil {
 			return false, err
 		}
-		if err := ctx.Write(append(claimKey, op.To...), []byte{1}); err != nil {
+		if err := ctx.Write(claimKey(claimKind, op.To), []byte{1}); err != nil {
 			return false, err
 		}
 		return true, advance()
@@ -562,6 +607,9 @@ func writeAmount(ctx svc.AccumulateContext, key []byte, amount *big.Int) error {
 
 func balanceKey(address string) []byte { return append([]byte{keyBalance}, address...) }
 func nonceKey(address string) []byte   { return append([]byte{keyNonce}, address...) }
+func claimKey(kind byte, address string) []byte {
+	return append([]byte{kind}, address...)
+}
 func evmNonceKey(address string) []byte {
 	return append([]byte{keyEVMNonce}, address...)
 }

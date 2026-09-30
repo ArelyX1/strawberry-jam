@@ -88,10 +88,20 @@ type Runtime struct {
 	// startup. It is nil when the node was built without a store, which is the
 	// case for tests that only care about a chain in memory.
 
-	issuer      string
-	bridgeKey   ed25519.PrivateKey
-	bridgeAddr  string
-	bridgeNonce uint64
+	issuer     string
+	bridgeKey  ed25519.PrivateKey
+	bridgeAddr string
+	// issued is the last number of the chain's own sequence that was handed to
+	// an actor, and undecided counts the items handed out that no block has
+	// ruled on yet. The chain accepts an item only when its number is the one it
+	// expects next, and the state a node can read does not move until a block
+	// carries it, so three transactions sent in quick succession would otherwise
+	// all be handed the same number and two of them would be dropped without ever
+	// being applied. Counting what this node has already handed out keeps the
+	// sequence moving, and undecided is what lets a number be handed out again
+	// when the item that carried it was refused.
+	issued    map[string]uint64
+	undecided map[string]int
 	// bridgeFunded records that the faucet reserve has already been moved out of
 	// the genesis issuer account, which may only happen once.
 	bridgeFunded bool
@@ -212,20 +222,21 @@ func New(opts Options) (*Runtime, error) {
 	validators := ValidatorState(opts.Validators)
 
 	rt := &Runtime{
-		genesis:     genesis,
-		params:      params,
-		state:       newStateWith(services, opts.Validators),
-		registry:    registry,
-		executor:    executor,
-		scheduler:   scheduler,
-		papucoinID:  id,
-		trie:        store.NewTrie(trieDB),
-		issuer:      issuer,
-		evmChainID:  relay.ChainID,
-		weiPerRaw:   weiPerRaw(genesis.EVM.Decimals, params.Decimals),
-		bridgeKey:   opts.BridgeKey,
-		bridgeNonce: genesis.Service.FirstNonce,
-		logf:        logf,
+		genesis:    genesis,
+		params:     params,
+		state:      newStateWith(services, opts.Validators),
+		registry:   registry,
+		executor:   executor,
+		scheduler:  scheduler,
+		papucoinID: id,
+		trie:       store.NewTrie(trieDB),
+		issuer:     issuer,
+		evmChainID: relay.ChainID,
+		weiPerRaw:  weiPerRaw(genesis.EVM.Decimals, params.Decimals),
+		bridgeKey:  opts.BridgeKey,
+		issued:     map[string]uint64{},
+		undecided:  map[string]int{},
+		logf:       logf,
 	}
 	rt.state.ValidatorState = validators
 	if rt.bridgeKey != nil {
@@ -427,28 +438,72 @@ func (r *Runtime) FinishRebuild() {
 	defer r.mu.Unlock()
 
 	r.replaying = false
-	r.syncBridgeNonceLocked()
+	// The state the rebuild came from is the floor every number starts from, so
+	// anything this node handed out before the restart is forgotten rather than
+	// carried into a chain that has moved on.
+	r.issued = map[string]uint64{}
+	r.undecided = map[string]int{}
+}
+
+// nextNonceLocked hands out the next number of the chain's own sequence for an
+// actor, and records that it did. The number the chain expects is the one it
+// stored, which only moves when a block carries an item, so an account that
+// sends twice before the next block would be given the same number twice and
+// the chain would keep one and drop the other. Anything this node handed out
+// that the state has not caught up with is counted on top, so the numbers go up
+// one at a time and no item is lost.
+func (r *Runtime) nextNonceLocked(actor string) (uint64, error) {
+	stored, err := r.viewLocked().Nonce(actor)
+	if err != nil {
+		return 0, err
+	}
+	if stored == 0 {
+		stored = r.params.FirstNonce
+	}
+
+	next := stored
+	if last, ok := r.issued[actor]; ok && last >= stored {
+		next = last + 1
+	}
+	r.issued[actor] = next
+	r.undecided[actor]++
+	return next, nil
+}
+
+// settleNoncesLocked runs once per timeslot, when everything queued before this
+// point has been through a block and the state says which of those items the
+// chain took. A number whose item was refused never got stored, so handing it
+// out again is what keeps one refused transfer from pushing every later one out
+// of step with the chain.
+func (r *Runtime) settleNoncesLocked() {
+	for actor, waiting := range r.undecided {
+		if waiting == 0 {
+			continue
+		}
+		stored, err := r.viewLocked().Nonce(actor)
+		if err != nil {
+			r.logf("cannot read the nonce of %s: %v", actor, err)
+			continue
+		}
+		if stored == 0 {
+			stored = r.params.FirstNonce
+		}
+		if last, ok := r.issued[actor]; ok && last >= stored {
+			// The chain is still behind the numbers this node handed out, so the
+			// items carrying them were refused. The number the chain expects is
+			// free again.
+			r.issued[actor] = stored - 1
+		}
+		r.undecided[actor] = 0
+	}
 }
 
 // syncBridgeNonceLocked takes the bridge account's next nonce from the state, so
-// that a payout after a restart carries a number the service will accept. The
-// first nonce of the parameters is the floor, because an account the service has
-// never seen has not used one yet and the number it expects is the first.
-func (r *Runtime) syncBridgeNonceLocked() {
-	if r.bridgeAddr == "" {
-		return
-	}
-	nonce, err := r.viewLocked().Nonce(r.bridgeAddr)
-	if err != nil {
-		r.logf("cannot read the nonce of the faucet account %s: %v", r.bridgeAddr, err)
-		return
-	}
-	if nonce > r.bridgeNonce {
-		r.bridgeNonce = nonce
-	}
-}
-
 func (r *Runtime) runLocked(timeslot jamtime.Timeslot) ([]BlockWork, error) {
+	// Everything queued before this point has been through a block by now, so
+	// this is where the numbers this node handed out get settled against what the
+	// chain actually kept.
+	r.settleNoncesLocked()
 	r.fundBridgeLocked()
 
 	// The timeslot is part of the state, so the root of a chain that is running
@@ -475,8 +530,38 @@ func (r *Runtime) runLocked(timeslot jamtime.Timeslot) ([]BlockWork, error) {
 		r.scheduler.Settle([]svc.Assignment{assignment})
 	}
 
+	// The economy's service is assigned only when it has work queued, because
+	// that is what a core is for. But its transfer price is a price and a price
+	// that only ever goes up is not one: after a single busy stretch the chain
+	// would stay expensive forever, with nothing about the chain having changed
+	// to justify it. So it is run once per timeslot regardless, with nothing to
+	// do, and that empty block is the quiet block the price needs to hear about.
+	if !assignedThisSlot(r.papucoinID, assignments) {
+		result, err := r.executor.Accumulate(
+			r.papucoinID, nil, r.scheduler.Transfers(r.papucoinID), timeslot, constants.MaxAllocatedGasAccumulation, r.state.Services,
+		)
+		if err != nil {
+			r.logf("the economy service did not settle its price in timeslot %d: %v", timeslot, err)
+		} else if err := checkThreshold(result.Account); err != nil {
+			r.logf("the economy service failed its threshold in timeslot %d: %v", timeslot, err)
+		} else {
+			r.state.Services[r.papucoinID] = result.Account
+		}
+	}
+
 	r.updateRoot()
 	return work, nil
+}
+
+// assignedThisSlot reports whether the scheduler gave a service a core this
+// timeslot, which is not the same question as whether it had anything to do.
+func assignedThisSlot(id block.ServiceId, assignments []svc.Assignment) bool {
+	for _, a := range assignments {
+		if a.ServiceID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // runServiceLocked refines and accumulates one service, leaving the state untouched
@@ -518,11 +603,10 @@ func (r *Runtime) runServiceLocked(assignment svc.Assignment, timeslot jamtime.T
 	r.state.Services[assignment.ServiceID] = account
 
 	// The bridge signs payouts with a nonce of its own choosing, and the service
-	// only accepts the one it expects next. Anything the chain did to that
-	// account in the meantime, such as the reserve transfer, moves the number
-	// the node has to use, so it is read back after every accumulate rather than
-	// only after a replay.
-	r.syncBridgeNonceLocked()
+	// only accepts the one it expects next. Numbers this node handed out are
+	// settled here too, because this is the point where what the chain kept is
+	// known: a number whose item was refused is free to be handed out again.
+	r.settleNoncesLocked()
 	return nil
 }
 
@@ -658,20 +742,23 @@ func (r *Runtime) SubmitRelayed(rawTx string) (papucoin.Item, error) {
 	if err != nil {
 		return papucoin.Item{}, fmt.Errorf("relayed destination: %w", err)
 	}
+	// The number this item carries comes out of a counter this node keeps, so the
+	// lock is taken before it is read and held until the item is queued.
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	// An account has two sequences of numbers and this node is the one that keeps
 	// the chain's: the wallet keeps the Ethereum nonce, and the chain keeps its own
 	// so that a replayed transaction cannot be a second transfer. The transaction's
 	// nonce is checked by the wallet and by the service's EVM nonce record, so what
 	// this item has to carry is the next number of the chain's sequence, which is
-	// the number the service stored the last time the account was used. An account
-	// the chain has never used has not stored one, and the number it expects then
-	// is the first nonce of the parameters.
-	nonce, err := r.View().Nonce(from)
+	// the number the service stored the last time the account was used, plus the
+	// numbers this node has already handed out and no block has ruled on yet. An
+	// account the chain has never used has not stored one, and the number it
+	// expects then is the first nonce of the parameters.
+	nonce, err := r.nextNonceLocked(from)
 	if err != nil {
 		return papucoin.Item{}, err
-	}
-	if nonce == 0 {
-		nonce = r.params.FirstNonce
 	}
 
 	item := papucoin.Item{
@@ -689,8 +776,6 @@ func (r *Runtime) SubmitRelayed(rawTx string) (papucoin.Item, error) {
 		MustBeSigned: false,
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if err := r.enqueue(item, from); err != nil {
 		return papucoin.Item{}, err
 	}
@@ -722,17 +807,38 @@ func (r *Runtime) Faucet(to string) (papucoin.Item, error) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// A payout is once per address, and the service refuses the second one. The
+	// service also only advances a sender's nonce for the items it accepts, so
+	// queueing an item it is going to refuse would burn a nonce here that it
+	// never claims: the next payout would be numbered one too high, the service
+	// would drop that too, and from then on no address could be funded at all.
+	// Asking first also turns a silent no-op into an answer the caller can use.
+	claimed, err := r.viewLocked().FaucetClaimed(normalized)
+	if err != nil {
+		return papucoin.Item{}, err
+	}
+	if claimed {
+		return papucoin.Item{}, fmt.Errorf("%s has already taken its payout from the faucet", normalized)
+	}
+
+	// The payout is an item like any other, so it takes its number from the same
+	// place every item does. That is what lets a payout that the chain refused
+	// give its number back instead of pushing every later one out of step.
+	nonce, err := r.nextNonceLocked(r.bridgeAddr)
+	if err != nil {
+		return papucoin.Item{}, err
+	}
+
 	item, err := papucoin.SignItem(papucoin.Item{
 		Method:       papucoin.MethodFaucet,
-		Nonce:        r.bridgeNonce,
+		Nonce:        nonce,
 		To:           normalized,
 		MustBeSigned: true,
 	}, r.bridgeKey)
 	if err != nil {
 		return papucoin.Item{}, err
 	}
-	r.bridgeNonce++
-
 	if _, err := r.scheduler.Submit(r.papucoinID, svc.WorkItem{Payload: encodeItem(item), Origin: "faucet"}); err != nil {
 		return papucoin.Item{}, fmt.Errorf("the queue is full: %w", err)
 	}

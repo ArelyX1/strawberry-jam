@@ -1,25 +1,13 @@
 [package]
-name = "papucoin-guest"
+name = "papucoin-core"
 version = "0.0.0"
 edition = "2021"
 publish = false
-
-[[bin]]
-name = "papucoin-guest"
-path = "src/main.rs"
 
 [dependencies]
 blake2 = "0.11.0"
 digest = { version = "0.11", default-features = false, features = ["alloc"] }
 ed25519-dalek = { version = "3.0.0", default-features = false }
 elliptic-curve = { version = "0.14.1", default-features = false, features = ["sec1", "arithmetic"] }
-papucoin-core = { path = "core" }
-polkavm-derive = { path = "../../references/polkavm/crates/polkavm-derive" }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0.151", default-features = false, features = ["alloc"] }
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"

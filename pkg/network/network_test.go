@@ -331,10 +331,14 @@ func TestTwoNodesAnnounceBlocks(t *testing.T) {
 	node1Peer := node1.PeersSet.GetByAddress(addr.String())
 	require.NotNil(t, node1Peer, "Node1 should have Node2 as a peer")
 
-	// Create a mock block for node1 to announce to node2
+	// Create a mock block for node1 to announce to node2. It has to sit right on
+	// top of the node's own finalized block: a block from before it is an
+	// ancestor, and a node is right to refuse to announce one of those, so a
+	// header pinned to an arbitrary slot never leaves the sender and the test
+	// fails for a reason that has nothing to do with the network.
 	mockHeader := &block.Header{
 		ParentHash:       node1.BlockService.LatestFinalized.Hash,
-		TimeSlotIndex:    jamtime.Timeslot(2),
+		TimeSlotIndex:    node1.BlockService.LatestFinalized.TimeSlotIndex + 1,
 		BlockAuthorIndex: 0,
 	}
 	mockBLock := &block.Block{
@@ -399,10 +403,14 @@ func TestTwoNodesRequestBlock(t *testing.T) {
 	node2Peer := node1.PeersSet.GetByAddress(node2Addr.String())
 	require.NotNil(t, node2Peer, "Node1 should have Node2 as a peer")
 
-	// Create a mock block for node1 to announce to node2
+	// Create a mock block for node1 to announce to node2. It has to sit right on
+	// top of the node's own finalized block: a block from before it is an
+	// ancestor, and a node is right to refuse to announce one of those, so a
+	// header pinned to an arbitrary slot never leaves the sender and the test
+	// fails for a reason that has nothing to do with the network.
 	mockHeader := &block.Header{
 		ParentHash:       node1.BlockService.LatestFinalized.Hash,
-		TimeSlotIndex:    jamtime.Timeslot(2),
+		TimeSlotIndex:    node1.BlockService.LatestFinalized.TimeSlotIndex + 1,
 		BlockAuthorIndex: 0,
 	}
 	mockBLock := &block.Block{
@@ -1249,9 +1257,12 @@ func TestAnnounceBlocksAndDistributeShards(t *testing.T) {
 	// Connect the assurer to at least one guarantor
 	connectPeer(t, nodes, assurer1Id, guarantor1Id)
 
+	// On top of the node's own finalized block, for the reason the header in
+	// TestTwoNodesAnnounceBlocks explains: anything older is an ancestor and is
+	// not announced.
 	mockHeader := &block.Header{
 		ParentHash:       nodes[node1Id].BlockService.LatestFinalized.Hash,
-		TimeSlotIndex:    jamtime.Timeslot(2),
+		TimeSlotIndex:    nodes[node1Id].BlockService.LatestFinalized.TimeSlotIndex + 1,
 		BlockAuthorIndex: 0,
 	}
 

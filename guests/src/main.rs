@@ -3,8 +3,7 @@
 
 extern crate alloc;
 
-mod crypto;
-mod evm;
+use papucoin_core::{crypto, evm};
 
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -43,6 +42,7 @@ const KEY_FAUCET: u8 = 0x05;
 const KEY_WELCOME: u8 = 0x06;
 const KEY_ISSUER: u8 = 0x07;
 const KEY_ASSET: u8 = 0x08;
+const KEY_FEE_LEVEL: u8 = 0x0a;
 
 const DECIMALS: u8 = 12;
 const MAX_SUPPLY: u128 = 1_000_000_000_000_000_000_000_000;
@@ -50,6 +50,19 @@ const TRANSFER_FEE: u128 = 1_000_000;
 const FAUCET_AMOUNT: u128 = 10_000_000_000_000_000;
 const WELCOME_AMOUNT: u128 = 5_000_000_000_000_000;
 const FIRST_NONCE: u64 = 1;
+
+// The fee is a price, not a tariff, and these are its limits. They are the same
+// numbers the native service uses, and they have to be: a chain that runs either
+// one has to charge the same figure, or a client that quoted the other is
+// quoted wrong. All of it is far below one PAPU, because twelve decimals make a
+// whole unit a million times too coarse to be a fee.
+const FEE_FLOOR: u128 = 1_000;
+const FEE_CEILING: u128 = 1_000_000_000;
+const FEE_BUSY_TARGET: u32 = 8;
+const FEE_UP_NUMERATOR: u128 = 3;
+const FEE_UP_DENOMINATOR: u128 = 2;
+const FEE_DOWN_NUMERATOR: u128 = 2;
+const FEE_DOWN_DENOMINATOR: u128 = 3;
 
 const SELF: u64 = u64::MAX;
 
@@ -138,17 +151,25 @@ fn write_u128(key: &[u8], value: u128) {
     storage_write(key, &be);
 }
 
-fn read_nonce(address: &str) -> u64 {
-    match storage_read(&key_with(KEY_NONCE, address)) {
-        Some(v) if !v.is_empty() && v.len() <= 8 => {
+// A count is stored the same way an amount is, in sixteen big endian octets, so
+// it is read back the same way. Refusing anything wider than eight would make
+// the value this module writes unreadable to itself, and the nonce would never
+// move past the first one an account used.
+fn read_count(key: &[u8], absent: u64) -> u64 {
+    match storage_read(key) {
+        Some(v) if !v.is_empty() && v.len() <= 16 => {
             let mut x: u64 = 0;
             for b in v.iter() {
                 x = (x << 8) | u64::from(*b);
             }
             x
         }
-        _ => FIRST_NONCE,
+        _ => absent,
     }
+}
+
+fn read_nonce(address: &str) -> u64 {
+    read_count(&key_with(KEY_NONCE, address), FIRST_NONCE)
 }
 
 fn balance_of(address: &str) -> u128 {
@@ -515,9 +536,71 @@ fn advance_nonce(actor: &str, nonce: u64) {
     write_u128(&key_with(KEY_NONCE, actor), nonce as u128);
 }
 
+fn read_evm_nonce(address: &str) -> u64 {
+    read_count(&key_with(KEY_EVMNONCE, address), 0)
+}
+
+fn advance_evm_nonce(address: &str, nonce: u64) {
+    write_u128(&key_with(KEY_EVMNONCE, address), nonce as u128);
+}
+
+// current_fee is the price a block charges. A chain that has never charged one
+// falls back to what its genesis named, so the first transfer costs what the
+// chain was configured with rather than nothing.
+fn current_fee() -> u128 {
+    match storage_read(&[KEY_FEE_LEVEL]) {
+        Some(v) if !v.is_empty() => {
+            let level = read_u128(&[KEY_FEE_LEVEL]);
+            if level < FEE_FLOOR {
+                FEE_FLOOR
+            } else if level > FEE_CEILING {
+                FEE_CEILING
+            } else {
+                level
+            }
+        }
+        _ => TRANSFER_FEE,
+    }
+}
+
+// next_fee moves the price in the direction the block's load asks for. It runs
+// once per block, after that block's transfers, so what a block is charged is
+// the price the one before it settled on and a block never charges a price that
+// has not been published.
+fn next_fee(transfers: u32) {
+    let current = current_fee();
+    let next = if transfers > FEE_BUSY_TARGET {
+        current * FEE_UP_NUMERATOR / FEE_UP_DENOMINATOR
+    } else if transfers == 0 {
+        current * FEE_DOWN_NUMERATOR / FEE_DOWN_DENOMINATOR
+    } else {
+        current
+    };
+    let clamped = if next < FEE_FLOOR {
+        FEE_FLOOR
+    } else if next > FEE_CEILING {
+        FEE_CEILING
+    } else {
+        next
+    };
+    write_u128(&[KEY_FEE_LEVEL], clamped);
+}
+
 fn apply_op(op: &Op) -> bool {
+    // A number that has already gone by is a replay and is dropped. A number at
+    // or ahead of the one the account is on is taken, and the account moves to
+    // one past it, so the same signed item can never be taken twice.
+    //
+    // Demanding the exact number only works while nothing else is queued for the
+    // account at the same moment. An account that sends three transfers before the
+    // next block has them all numbered from the same state, the chain keeps the
+    // first and silently drops the other two, and the money in them is gone with
+    // no error anywhere. Allowing a number ahead costs the ability to jump the
+    // queue by more than the number of items already waiting, and no third party
+    // can do it: a relayed item is numbered by the node and a chain item has to be
+    // signed by the account it moves money for.
     let expected = read_nonce(&op.actor);
-    if op.nonce != expected {
+    if op.nonce < expected {
         return false;
     }
 
@@ -525,16 +608,33 @@ fn apply_op(op: &Op) -> bool {
         "transfer" => {
             let amount = parse_raw(&op.amount).unwrap_or(0);
             let to = crypto::normalize_address(&op.to).unwrap_or_default();
+            // An EVM transaction carries its own nonce, and the chain checks it
+            // against the count of the ones it has already taken from this
+            // sender. Without this a signed transaction could be put back on
+            // the wire as many times as an observer liked and each copy would
+            // move the money again.
+            if let Some(n) = op.evm_nonce {
+                if n != read_evm_nonce(&op.sender) {
+                    return false;
+                }
+            }
             let from = balance_of(&op.sender);
-            let total = amount + TRANSFER_FEE;
+            // The fee is the one this report was refined at, which is the
+            // figure a client was shown. Charging the live price instead would
+            // be charging something nobody was told.
+            let fee = clamp_fee(parse_raw(&op.fee).unwrap_or(0));
+            let total = amount + fee;
             if from < total {
                 return false;
             }
             write_u128(&key_with(KEY_BALANCE, &op.sender), from - total);
             credit(&to, amount);
             let supply = read_u128(&[KEY_SUPPLY]);
-            let next = if supply >= TRANSFER_FEE { supply - TRANSFER_FEE } else { 0 };
+            let next = if supply >= fee { supply - fee } else { 0 };
             write_u128(&[KEY_SUPPLY], next);
+            if op.evm_nonce.is_some() {
+                advance_evm_nonce(&op.sender, op.evm_nonce.unwrap() + 1);
+            }
             advance_nonce(&op.actor, op.nonce + 1);
             true
         }
@@ -662,14 +762,25 @@ fn write_seed(args: &[u8]) {
 
 fn accumulate_reports(args: &[u8]) {
     let body = if args.last() == Some(&0) { &args[..args.len() - 1] } else { args };
-    if body.is_empty() {
-        return;
+
+    // An empty block is still a block, and it is still evidence of how busy the
+    // chain is. Returning early here would mean the price only ever came down
+    // on a block that happened to carry some other item, which is a different
+    // rule from the one the native service follows and would leave the two
+    // implementations standing at different prices after the same history.
+    let mut transfers = 0u32;
+    if !body.is_empty() {
+        let mut de = serde_json::Deserializer::from_slice(body);
+        use serde::Deserialize;
+        while let Ok(op) = Op::deserialize(&mut de) {
+            if apply_op(&op) && op.op == "transfer" {
+                transfers += 1;
+            }
+        }
     }
-    let mut de = serde_json::Deserializer::from_slice(body);
-    use serde::Deserialize;
-    while let Ok(op) = Op::deserialize(&mut de) {
-        apply_op(&op);
-    }
+    // The block's load is what moves the price, so the move happens here, after
+    // the work, and is what the next block will charge.
+    next_fee(transfers);
 }
 
 #[polkavm_derive::polkavm_export]
@@ -723,4 +834,16 @@ fn _touch() {
     let _ = unsafe { c1_fetch(0, 0, 0, 0, 0, 0) };
     let _ = unsafe { c2_lookup(0, 0, 0, 0, 0, 0) };
     let _ = unsafe { c5_info(0, 0, 0, 0, 0, 0) };
+}
+// clamp_fee keeps a quoted fee inside the band the chain allows, so a report
+// that arrives with a figure outside it is charged the nearest figure that is
+// inside rather than whatever it asked for.
+fn clamp_fee(fee: u128) -> u128 {
+    if fee < FEE_FLOOR {
+        FEE_FLOOR
+    } else if fee > FEE_CEILING {
+        FEE_CEILING
+    } else {
+        fee
+    }
 }

@@ -98,12 +98,20 @@ func (a *Accumulator) InvokePVM(accState state.AccumulationState, newTime jamtim
 	// linker assigns both, so they are read rather than assumed.
 	guest, guestErr := pvm.PrepareGuest(c, "")
 	if guestErr != nil {
-		log.VM.Error().Err(guestErr).Msgf("error preparing service code")
+		// The service never ran, and saying otherwise is how a chain ends up
+		// reporting accumulates that did not happen. The count is taken from the
+		// work digests rather than from here, so nothing downstream can tell the
+		// difference between a service that ran and used no gas and one whose
+		// code could not be loaded at all. The gas it reports is zero either way,
+		// and the only honest thing to add is the reason.
+		log.VM.Error().Err(guestErr).Uint32("service_id", uint32(serviceIndex)).
+			Msg("service code could not be prepared, so this accumulate did not run")
 		return AccumulationOutput{AccumulationState: stateWithBalance}, nil
 	}
 	guestCode, guestErr := guest.Code()
 	if guestErr != nil {
-		log.VM.Error().Err(guestErr).Msgf("error framing service code")
+		log.VM.Error().Err(guestErr).Uint32("service_id", uint32(serviceIndex)).
+			Msg("service code could not be framed, so this accumulate did not run")
 		return AccumulationOutput{AccumulationState: stateWithBalance}, nil
 	}
 

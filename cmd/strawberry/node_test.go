@@ -179,8 +179,24 @@ func TestEVMRPCAnswersLikeAnEthereumChain(t *testing.T) {
 	// The ids of these answers are the ones a wallet expects, and a wrong one is
 	// indistinguishable from a chain the wallet has never heard of.
 	assert.Equal(t, "0x1400", evm(t, node, "eth_chainId"), "this chain has to answer for chain 5120")
-	assert.Equal(t, "0x0", evm(t, node, "eth_gasPrice"),
-		"this chain charges a fixed fee, not a price per unit of gas")
+	// The price a wallet is shown has to be the price the chain charges. It used
+	// to be zero, on the grounds that the fee is part of the transfer rather than
+	// a price per unit of gas, which is true of the shape but not of the number:
+	// a wallet told the price is zero shows zero, and zero is not what a transfer
+	// on this chain costs.
+	gasPrice := new(big.Int)
+	_, ok := gasPrice.SetString(trim0x(evm(t, node, "eth_gasPrice")), 16)
+	require.True(t, ok, "a gas price has to be a number a client can read")
+	assert.Positive(t, gasPrice.Sign(), "a chain that charges a fee cannot quote a price of zero")
+
+	startFeeRaw, err := papucoin.ParseAmount(genesis.Service.TransferFee, genesis.Service.Decimals)
+	require.NoError(t, err)
+	// The price is quoted in wei, and a raw unit of PAPU is worth however many wei
+	// the two sets of decimals say, which is the same factor a balance is scaled
+	// by. Scaling by the decimals alone would be out by 10^6 here.
+	perGas := new(big.Int).Mul(startFeeRaw, weiPerRawOf(genesis))
+	assert.Equal(t, perGas.String(), gasPrice.String(),
+		"the quoted price is the fee the chain starts from, in the wei a client prices gas in")
 
 	// Whatever number the node answers with, it has to be a number a block
 	// answers for: a wallet told 0x3 asks for 0x3 and reads a real block back.
@@ -233,6 +249,15 @@ func TestEVMRPCAnswersLikeAnEthereumChain(t *testing.T) {
 
 	// Relaying a signed transfer answers with the hash a wallet would look up,
 	// and nothing this node made up.
+	// Quote first, then send. The price is a moving one, so a client that reads
+	// it after sending is reading a figure that is no longer the one it agreed
+	// to, and the order here is the order a wallet has to use for the same
+	// reason.
+	quotedWei := new(big.Int)
+	_, parsed := quotedWei.SetString(trim0x(evm(t, node, "eth_gasPrice")), 16)
+	require.True(t, parsed, "a price has to be a number a client can read")
+	quotedRaw := new(big.Int).Quo(quotedWei, weiPerRawOf(genesis))
+
 	sent, err := rpc(port, "eth_sendRawTransaction", []interface{}{relayed})
 	require.NoError(t, err, "a transfer signed for this chain was refused")
 	hash, _ := sent["result"].(string)
@@ -249,12 +274,14 @@ func TestEVMRPCAnswersLikeAnEthereumChain(t *testing.T) {
 
 	senderRaw, err := papucoin.ParseAmount(genesis.Service.FaucetAmount, genesis.Service.Decimals)
 	require.NoError(t, err)
-	feeRaw, err := papucoin.ParseAmount(genesis.Service.TransferFee, genesis.Service.Decimals)
-	require.NoError(t, err)
-	left := new(big.Int).Sub(new(big.Int).Sub(senderRaw, big.NewInt(5e12)), feeRaw)
+	// The fee is a price, so what a client is charged is what it was quoted, and
+	// a client that is quoted one figure and charged another has been told
+	// something false. The quote is read back here rather than taken from the
+	// genesis, because the price is not a figure fixed at genesis.
+	left := new(big.Int).Sub(new(big.Int).Sub(senderRaw, big.NewInt(5e12)), quotedRaw)
 	wei := new(big.Int).Mul(left, weiPerRawOf(genesis))
 	assert.Equal(t, "0x"+wei.Text(16), evm(t, node, "eth_getBalance", sender),
-		"the sender pays the signed amount plus the fee, counted in wei")
+		"the sender pays the signed amount plus the price it was quoted, counted in wei")
 
 	// A block the chain has not produced yet is null rather than a block, and a
 	// block it produced reads back with the number it was asked for.
@@ -301,6 +328,9 @@ func TestEVMBalancesAndNonceSurviveARestart(t *testing.T) {
 
 	// The first transfer settles before the node stops, so the restart has a
 	// state to rebuild rather than a queue to guess from.
+	// Quote, send, and keep the figure: the price moves, so the two transfers
+	// below are charged what each was quoted rather than one frozen number.
+	firstQuote := quoteFee(t, node, weiPerRawOf(genesis))
 	sent, err := rpc(port, "eth_sendRawTransaction", []interface{}{first})
 	require.NoError(t, err, "the first transfer was refused")
 	assert.Regexp(t, "^0x[0-9a-f]{64}$", sent["result"], "a relayed transfer answers with its hash")
@@ -327,6 +357,7 @@ func TestEVMBalancesAndNonceSurviveARestart(t *testing.T) {
 	assert.Equal(t, "0x1", evm(t, restarted, "eth_getTransactionCount", sender),
 		"the EVM nonce was not rebuilt along with the rest of the state")
 
+	secondQuote := quoteFee(t, node, weiPerRawOf(genesis))
 	sentTwo, err := rpc(port, "eth_sendRawTransaction", []interface{}{second})
 	require.NoError(t, err, "a transfer signed with the rebuilt nonce was refused")
 	assert.Regexp(t, "^0x[0-9a-f]{64}$", sentTwo["result"], "the second transfer answers with its hash")
@@ -338,13 +369,14 @@ func TestEVMBalancesAndNonceSurviveARestart(t *testing.T) {
 
 	senderRaw, err := papucoin.ParseAmount(genesis.Service.FaucetAmount, genesis.Service.Decimals)
 	require.NoError(t, err)
-	feeRaw, err := papucoin.ParseAmount(genesis.Service.TransferFee, genesis.Service.Decimals)
-	require.NoError(t, err)
-	step := new(big.Int).Add(big.NewInt(5e12), feeRaw)
-	left := new(big.Int).Sub(new(big.Int).Sub(senderRaw, step), step)
+	// Two signed amounts and the two prices they were quoted, which is the whole
+	// of what left the account.
+	feeTotal := new(big.Int).Add(firstQuote, secondQuote)
+	step := new(big.Int).Add(new(big.Int).Add(big.NewInt(5e12), feeTotal), big.NewInt(5e12))
+	left := new(big.Int).Sub(senderRaw, step)
 	wei := new(big.Int).Mul(left, weiPerRawOf(genesis))
 	assert.Equal(t, "0x"+wei.Text(16), evm(t, restarted, "eth_getBalance", sender),
-		"the sender paid two signed amounts plus two fees")
+		"the sender paid two signed amounts plus the price each was quoted")
 
 	t.Log("first run:\n" + node.output.String())
 	t.Log("second run:\n" + restarted.output.String())
@@ -739,4 +771,17 @@ func hexHashOf(value string) crypto.Hash {
 
 func trimHex(value string) string {
 	return strings.TrimPrefix(value, "0x")
+}
+
+func trim0x(s string) string { return strings.TrimPrefix(s, "0x") }
+
+// quoteFee reads the price a transfer would be charged right now, in raw units.
+// A client has to read this before it sends, because the price moves: a client
+// that reads it afterwards is reading a figure the chain is no longer charging.
+func quoteFee(t *testing.T, proc *nodeProcess, weiPerRaw *big.Int) *big.Int {
+	t.Helper()
+	quotedWei := new(big.Int)
+	_, parsed := quotedWei.SetString(trim0x(evm(t, proc, "eth_gasPrice")), 16)
+	require.True(t, parsed, "a price has to be a number a client can read")
+	return new(big.Int).Quo(quotedWei, weiPerRaw)
 }

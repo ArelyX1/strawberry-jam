@@ -476,3 +476,86 @@ func write(t *testing.T, path string, genesis *Genesis) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(path, raw, 0o600))
 }
+
+// A faucet is claimed by address, and every claim comes out of the one account
+// this node pays from. Three addresses asking in the same breath are three items
+// from that one account, and the chain only takes an item carrying the number it
+// expects next. Reading that number out of the state would hand all three the
+// same one, and the chain would keep the first and drop the other two without
+// telling anybody, so nobody would ever be paid. Nothing may be lost.
+func TestFaucetPaysEveryoneWhoAsksBeforeTheNextBlock(t *testing.T) {
+	rt, err := New(Options{Genesis: testGenesis(t), BridgeKey: keyOf(t, 7)})
+	require.NoError(t, err)
+
+	rt.Step(1)
+	rt.Step(2)
+
+	wallets := []string{addressOf(t, 41), addressOf(t, 42), addressOf(t, 43)}
+	for _, wallet := range wallets {
+		_, err := rt.Faucet(wallet)
+		require.NoError(t, err)
+	}
+
+	// One timeslot for all three, which is what a burst of requests looks like.
+	rt.Step(3)
+
+	want := papucoin.FormatRaw(rt.Params().FaucetAmount, 12)
+	for _, wallet := range wallets {
+		paid, err := rt.View().Balance(wallet)
+		require.NoError(t, err)
+		assert.Equal(t, want, papucoin.FormatRaw(paid, 12),
+			"%s asked before the block and was not paid", wallet)
+	}
+}
+
+// A transfer the chain turns down, most often for want of money, still took a
+// number out of the account's sequence. That number has to come back, or every
+// later transfer from the account is numbered one too high, is turned down in
+// turn, and the money in it is stranded for good.
+func TestARefusedTransferDoesNotStrandTheAccount(t *testing.T) {
+	rt, err := New(Options{Genesis: testGenesis(t), BridgeKey: keyOf(t, 7)})
+	require.NoError(t, err)
+
+	key := keyOf(t, 61)
+	sender, err := papucoin.AddressFromPublicKey(key.Public().(ed25519.PublicKey))
+	require.NoError(t, err)
+	rich := addressOf(t, 62)
+
+	_, err = rt.Faucet(sender)
+	require.NoError(t, err)
+	rt.Step(1)
+
+	send := func(amount string) error {
+		t.Helper()
+		nonce := rt.nextNonceForTest(t, sender)
+		item, err := papucoin.SignItem(papucoin.Item{
+			Method: papucoin.MethodTransfer, Sender: sender,
+			Nonce: nonce, To: rich, Amount: amount, MustBeSigned: true,
+		}, key)
+		require.NoError(t, err)
+		return rt.Submit(item)
+	}
+
+	// More than the account holds. The chain keeps the item and refuses it, and
+	// the number it carried is never stored.
+	require.NoError(t, send("1000000000"), "the item is well formed, the chain is what refuses it")
+
+	// What fits has to go through afterwards, or the account is stuck.
+	require.NoError(t, send("1"))
+
+	rt.Step(2)
+
+	paid, err := rt.View().Balance(rich)
+	require.NoError(t, err)
+	assert.Equal(t, "1", papucoin.FormatRaw(paid, 12),
+		"the transfer that fits went through after the one that did not")
+}
+
+func (r *Runtime) nextNonceForTest(t *testing.T, actor string) uint64 {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	nonce, err := r.nextNonceLocked(actor)
+	require.NoError(t, err)
+	return nonce
+}

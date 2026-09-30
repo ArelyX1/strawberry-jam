@@ -82,6 +82,23 @@ func (v *View) Nonce(address string) (uint64, error) {
 	return amount.Uint64(), nil
 }
 
+// FaucetClaimed reports whether an address has already taken its payout, which
+// is a one-off per address. A caller that funds accounts uses this to answer
+// before it queues anything: a second payout is refused by the service, and
+// queueing it anyway would spend a nonce that the service is not going to
+// advance, leaving the sender's next item out of step with the chain forever.
+func (v *View) FaucetClaimed(address string) (bool, error) {
+	normalized, err := NormalizeAddress(address)
+	if err != nil {
+		return false, err
+	}
+	stored, ok := v.Raw(claimKey(keyFaucet, normalized))
+	if !ok {
+		return false, nil
+	}
+	return len(stored) > 0, nil
+}
+
 // EVMNonce is the number of Ethereum transactions this chain has already
 // accepted from an address, which is the number a wallet has to sign the next
 // one with. It is not the PAPU nonce: the chain keeps that sequence of its own

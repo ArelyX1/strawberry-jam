@@ -1,6 +1,7 @@
 package svc_test
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -33,9 +34,13 @@ func TestPVMExecutorAppliesEveryReportInABatch(t *testing.T) {
 	}
 
 	reports := make([]svc.RefinedItem, 0, len(wallets))
-	for _, wallet := range wallets {
+	for i, wallet := range wallets {
+		// The nonces have to count up: the guest only takes an op whose nonce is
+		// the one it expects next, so a batch that reused a single number would
+		// prove nothing about batching, it would only prove that the first report
+		// arrived.
 		reports = append(reports, svc.RefinedItem{
-			Report: []byte(`{"op":"faucet","actor":"` + papucoinMethodTestIssuer + `","sender":"` + papucoinMethodTestIssuer + `","nonce":1,"to":"` + wallet + `"}`),
+			Report: []byte(`{"op":"faucet","actor":"` + papucoinMethodTestIssuer + `","sender":"` + papucoinMethodTestIssuer + `","nonce":` + strconv.Itoa(i+1) + `,"to":"` + wallet + `"}`),
 		})
 	}
 

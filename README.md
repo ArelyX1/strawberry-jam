@@ -2,6 +2,14 @@
 
 Fork de [eigerco/strawberry](https://github.com/eigerco/strawberry) con modificaciones para ejecutar un nodo JAM en modo desarrollo con producción de bloques, RPC WebSocket/HTTP, telemetry, y más.
 
+## Documentación
+
+| Documento | Qué cubre |
+| --- | --- |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Cómo está armado el nodo. |
+| [docs/PAPU-ECONOMY.md](docs/PAPU-ECONOMY.md) | El precio de PAPU: cómo se mueve, por qué el bloque vacío importa, y por qué el runtime de `pkg/devnet` es el del servidor. |
+| [docs/PVM-CONFORMANCE.md](docs/PVM-CONFORMANCE.md) | Estado de los vectores de conformidad del PVM, qué se descartó como causa y cómo retomarlo. |
+
 ## Estructura del proyecto
 
 El repositorio son **dos módulos Go** unidos por un `go.work`, para que cada uno

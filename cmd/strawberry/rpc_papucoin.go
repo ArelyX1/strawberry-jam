@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -133,12 +134,16 @@ func (s *papucoinHandlers) supply() (map[string]interface{}, error) {
 	items, octets := s.runtime.View().StorageFootprint()
 	decimals := s.runtime.Genesis().Service.Decimals
 	return map[string]interface{}{
-		"supply":        papucoin.FormatRaw(raw, decimals),
-		"raw":           raw.String(),
-		"decimals":      decimals,
-		"maxSupply":     papucoin.FormatRaw(s.runtime.Params().MaxSupply, decimals),
-		"maxSupplyRaw":  s.runtime.Params().MaxSupply.String(),
-		"transferFee":   papucoin.FormatRaw(s.runtime.Params().TransferFee, decimals),
+		"supply":       papucoin.FormatRaw(raw, decimals),
+		"raw":          raw.String(),
+		"decimals":     decimals,
+		"maxSupply":    papucoin.FormatRaw(s.runtime.Params().MaxSupply, decimals),
+		"maxSupplyRaw": s.runtime.Params().MaxSupply.String(),
+		// The price the next block charges, which moves with load. Reporting the
+		// genesis figure here would tell a client a number the chain is not
+		// charging.
+		"transferFee": papucoin.FormatRaw(
+			papucoin.CurrentFee(context.Background(), s.runtime.View(), s.runtime.Params()), decimals),
 		"firstNonce":    s.runtime.Params().FirstNonce,
 		"stateRoot":     hashToHex(crypto.Hash(s.runtime.Root())),
 		"storageItems":  items,
@@ -365,10 +370,14 @@ func (s *papucoinHandlers) evmGetTransactionCount(params []json.RawMessage) (str
 	return fmt.Sprintf("0x%x", nonce), nil
 }
 
-// evmGasPrice is zero, and it is zero because the chain charges a fee that is a
-// part of the transfer rather than a price per unit of gas. A wallet that shows a
-// gas price will show zero, which is the price.
-func (s *papucoinHandlers) evmGasPrice() (string, error) { return "0x0", nil }
+// evmGasPrice quotes the price the next block charges. It used to be zero on the
+// grounds that the fee is part of the transfer rather than a price per unit of
+// gas, and that is still true of the shape. But a wallet that shows a price of
+// zero shows a price, and the one the chain will actually charge is not zero, so
+// the figure reported was not a zero price, it was a wrong one.
+func (s *papucoinHandlers) evmGasPrice() (string, error) {
+	return currentFeeHex(s), nil
+}
 
 // evmGetBlockByNumber describes a block of this chain in the fields Ethereum
 // clients read, so a wallet can watch the chain advance without a second
@@ -406,7 +415,7 @@ func (s *papucoinHandlers) evmGetBlockByNumber(params []json.RawMessage) (map[st
 		"stateRoot":     hashToHex(header.PriorStateRoot),
 		"gasUsed":       "0x0",
 		"gasLimit":      "0x0",
-		"baseFeePerGas": "0x0",
+		"baseFeePerGas": currentFeeHex(s),
 		"extraData":     "0x",
 		"transactions":  []interface{}{},
 		// The timeslot is this chain's clock, and a client that has to guess where
@@ -571,4 +580,18 @@ func (s *papucoinHandlers) storage(params []json.RawMessage) (map[string]interfa
 		"value": "0x" + hex.EncodeToString(value),
 		"size":  len(value),
 	}, nil
+}
+
+// currentFeeHex is the price in the form an Ethereum client reads, which is a
+// quantity of wei per unit of gas rather than an amount of PAPU. A block of
+// this chain spends no gas a client can meter, so the whole transfer fee is
+// priced against the one intrinsic unit of gas a transfer is charged.
+func currentFeeHex(s *papucoinHandlers) string {
+	fee := papucoin.CurrentFee(context.Background(), s.runtime.View(), s.runtime.Params())
+	// The fee is kept in raw units. A client prices in wei, and a raw unit is
+	// worth however many wei one PAPU's decimals say it is, so that is the factor
+	// to scale by. Scaling by the decimals instead would report a figure 10^6
+	// too large for a chain with twelve decimals and eighteen.
+	perGas := new(big.Int).Mul(fee, s.runtime.WeiPerRaw())
+	return "0x" + perGas.Text(16)
 }

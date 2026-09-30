@@ -58,8 +58,43 @@ jobs:
           version: v2.8.0
           args: --timeout=5m
 
+  guest:
+    name: Guest
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2025-05-10
+          profile: minimal
+          override: true
+
+      # The economy is a Rust program the node runs inside the PVM, and every Go
+      # test that touches it only ever sees the blob committed next to it.
+      # Nothing in this repository checked the blob at all, so the whole economy
+      # could be replaced, or go missing, and the suite stayed green.
+      - name: the guest blob is the one that was reviewed
+        run: cd guests && sha256sum --check papucoin.pol.sha256
+
+      # The half of the guest that is ordinary computation, with its tests. Two
+      # of its assumptions were wrong and neither showed from the outside: the
+      # nonce it wrote was sixteen bytes wide and the one it read accepted at
+      # most eight, so an account could never move past its first number, and the
+      # Ethereum nonce it reported in every report was compared to nothing.
+      #
+      # Rebuilding the blob is not here on purpose. The linker lives in
+      # references/polkavm, which is a checkout of someone else's fork outside
+      # this repository, so a job here cannot build it. `make build-guest` does
+      # it locally and fails if the committed blob is not what the source
+      # produces.
+      - name: test the part of the guest that needs no PVM
+        run: cargo +nightly-2025-05-10 test --manifest-path guests/core/Cargo.toml
+
   test:
-    needs: [ lint ]
+    needs: [ lint, guest ]
     name: Run Tests
     runs-on: ubuntu-latest
 

@@ -1,11 +1,14 @@
 package devnet
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"math/big"
 	"os"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/eigerco/strawberry/internal/state/serialization/statekey"
@@ -110,7 +113,12 @@ func shippedGuest(t *testing.T) []byte {
 	}
 	blob, err := os.ReadFile("../../guests/papucoin.pol")
 	if err != nil {
-		t.Skip("no guest blob; build it or set BLOB")
+		// The blob travels with the repository, so it being unreadable means the
+		// checkout is broken or the file was dropped, not that this test has
+		// nothing to say. Skipping here would let a green run hide a chain whose
+		// entire economy is missing, which is the one thing these tests exist
+		// to notice.
+		t.Fatalf("the guest blob that ships in the repository cannot be read: %v", err)
 	}
 	return blob
 }
@@ -122,4 +130,78 @@ func bridgeKey(t *testing.T) ed25519.PrivateKey {
 		t.Fatal(err)
 	}
 	return priv
+}
+
+// The transfer fee is state, and this chain can run the economy two ways: the
+// service written in Go, or the same economy as a polkavm guest. Both read the
+// same storage key with the same constants and both have to arrive at the same
+// figure, or a client is quoted one price by one node and charged another by
+// the next. A chain whose two implementations disagree on a number is not
+// running one chain, it is running two.
+func TestNativeAndGuestChargeTheSamePrice(t *testing.T) {
+	// One burst past the target, run through both chains: the price has to move
+	// off where it started, so the comparison is somewhere other than the
+	// resting figure where both would agree for the wrong reason.
+	senders := make([]ed25519.PrivateKey, papucoin.FeeBusyTarget+1)
+	addresses := make([]string, len(senders))
+	for i := range senders {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		require.NoError(t, err)
+		addr, err := papucoin.AddressFromPublicKey(pub)
+		require.NoError(t, err)
+		senders[i], addresses[i] = priv, addr
+	}
+
+	run := func(t *testing.T, genesis *Genesis) *big.Int {
+		t.Helper()
+		rt, err := New(Options{Genesis: genesis})
+		require.NoError(t, err)
+
+		start := papucoin.CurrentFee(context.Background(), rt.View(), rt.Params())
+
+		for i, addr := range addresses {
+			fund, err := papucoin.SignItem(papucoin.Item{
+				Method: "faucet", Sender: addr, Nonce: 1, MustBeSigned: true,
+			}, senders[i])
+			require.NoError(t, err)
+			require.NoError(t, rt.Submit(fund))
+			require.NoError(t, rt.Step(rt.Timeslot()))
+
+			move, err := papucoin.SignItem(papucoin.Item{
+				Method: "transfer", Sender: addr, Nonce: 2,
+				To: addresses[0], Amount: "1", MustBeSigned: true,
+			}, senders[i])
+			require.NoError(t, err)
+			require.NoError(t, rt.Submit(move))
+			require.NoError(t, rt.Step(rt.Timeslot()))
+		}
+
+		// The price the workload left behind, read before anything else happens
+		// to it: read afterwards it would be compared with itself.
+		busy := papucoin.CurrentFee(context.Background(), rt.View(), rt.Params())
+
+		// Then a run of blocks that carry nothing at all. An idle block is still
+		// evidence that the chain is quiet, so it has to bring the price down, and
+		// both implementations have to do it: this is where a service that
+		// returned early on an empty block and one that did not would drift apart,
+		// and the two would then quote different prices for the same chain.
+		for i := 0; i < 3; i++ {
+			require.NoError(t, rt.Step(rt.Timeslot()))
+		}
+
+		end := papucoin.CurrentFee(context.Background(), rt.View(), rt.Params())
+		if genesis.Service.Code != "" {
+			assert.NotEqual(t, start.String(), busy.String(),
+				"a workload past the target has to move the price, or it is a tariff again")
+			assert.Less(t, end.Cmp(busy), 0,
+				"blocks that carry nothing have to bring the price back down")
+		}
+		return end
+	}
+
+	native := run(t, testGenesis(t))
+	guest := run(t, guestGenesis(t))
+
+	assert.Equal(t, native.String(), guest.String(),
+		"the same workload has to leave both implementations at the same price")
 }

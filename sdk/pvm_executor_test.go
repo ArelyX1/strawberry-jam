@@ -132,7 +132,12 @@ func guestBlob(t *testing.T) []byte {
 	}
 	blob, err := os.ReadFile("../guests/papucoin.pol")
 	if err != nil {
-		t.Skip("no guest blob; build it or set BLOB")
+		// The blob travels with the repository, so it being unreadable means the
+		// checkout is broken or the file was dropped, not that this test has
+		// nothing to say. Skipping here would let a green run hide a chain whose
+		// entire economy is missing, which is the one thing these tests exist
+		// to notice.
+		t.Fatalf("the guest blob that ships in the repository cannot be read: %v", err)
 	}
 	return blob
 }

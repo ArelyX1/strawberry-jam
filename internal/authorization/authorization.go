@@ -46,14 +46,44 @@ func (a *Authorization) InvokePVM(
 		return nil, err
 	}
 
-	// F ∈ Ω⟨{}⟩∶ (n, ϱ, φ, µ)
+	encodedCodeWithMeta, err := workPackage.GetAuthorizationCode(a.state.Services)
+	if err != nil {
+		return nil, err
+	}
+
+	var pvmCode service.CodeWithMetadata
+	if err := jam.Unmarshal(encodedCodeWithMeta, &pvmCode); err != nil {
+		return nil, err
+	}
+
+	// The entry point and the ecall indices come from the blob, because the
+	// linker decides both. Assuming zero named an offset the current linker
+	// does not produce, so an authorization blob would start executing in the
+	// middle of whatever the linker laid out first.
+	guest, err := pvm.PrepareGuest(pvmCode.Code, "")
+	if err != nil {
+		return nil, err
+	}
+	guestCode, err := guest.Code()
+	if err != nil {
+		return nil, err
+	}
+
+	// F ∈ Ω⟨{}⟩∶ (n, ϱ, φ, µ)
 	hostCall := func(
-		hostCall uint64,
+		ecall uint64,
 		gasCounter pvm.Gas,
 		regs pvm.Registers,
 		mem pvm.Memory,
 		ctx EmptyContext,
 	) (pvm.Gas, pvm.Registers, pvm.Memory, EmptyContext, error) {
+		// The index the guest emits is assigned by the linker, so it is
+		// translated to the canonical id before anything switches on it.
+		hostCall, ok := guest.HostCallID(ecall)
+		if !ok {
+			return gasCounter, regs, mem, ctx, pvm.ErrPanicf("unknown ecall %d", ecall)
+		}
+
 		log.VM.Debug().
 			Str("host_call", host_call.HostCallName(hostCall)).
 			Uint16("core", coreCode).
@@ -61,9 +91,9 @@ func (a *Authorization) InvokePVM(
 			Msg("Host call invoked")
 
 		switch hostCall {
-		case host_call.GasID:
+		case uint64(host_call.GasID):
 			gasCounter, regs, err = host_call.GasRemaining(gasCounter, regs)
-		case host_call.FetchID:
+		case uint64(host_call.FetchID):
 			gasCounter, regs, mem, err = host_call.Fetch(gasCounter, regs, mem, &workPackage, nil, nil, nil, nil, nil, nil)
 		default:
 			// (▸, ϱ−10, [φ0,…,φ6, WHAT, φ8,…], µ)
@@ -78,21 +108,10 @@ func (a *Authorization) InvokePVM(
 		return gasCounter, regs, mem, ctx, err
 	}
 
-	encodedCodeWithMeta, err := workPackage.GetAuthorizationCode(a.state.Services)
-	if err != nil {
-		return nil, err
-	}
-
-	var pvmCode service.CodeWithMetadata
-	err = jam.Unmarshal(encodedCodeWithMeta, &pvmCode)
-	if err != nil {
-		return nil, err
-	}
-
-	// (g, r, ∅) = ΨM(pc, 0, GI , E(p, c), F, ∅)
+	// (g, r, ∅) = ΨM(pc, 𝒺, GI , E(p, c), F, ∅)
 	_, result, _, err := pvm.InvokeWholeProgram(
-		pvmCode.Code, // pc
-		0,
+		guestCode, // pc
+		guest.Entry,
 		constants.MaxAllocatedGasIsAuthorized,
 		args,
 		hostCall,

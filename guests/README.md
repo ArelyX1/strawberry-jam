@@ -8,11 +8,40 @@ La economia PAPU como guest polkavm, compilada a un blob que el PVM ejecuta.
 Hace falta el nightly que soporta el target de polkavm y el polkatool de
 nuestro fork, que es quien sabe enlazar para ReviveV1.
 
+El target y el `build-std` van en la linea de comandos y no en un
+`.cargo/config.toml`. No es una preferencia: un `.cargo/config.toml` se hereda
+hacia abajo y no se puede anular, de modo que el crate que hay en `core/` se
+buildaba para polkavm al probar sus tests y Cargo se quejaba de que el target no
+tiene biblioteca estandar. Puesto en la linea de comandos, cada comando ve solo
+lo que necesita.
+
 ```sh
-cargo +nightly-2025-05-10 build --release
+cargo +nightly-2025-05-10 build --release \
+  --target riscv64emac-unknown-none-polkavm.json -Zbuild-std=core,alloc
 ../../references/polkavm/target/release/polkatool link -i revive_v1 \
   -o papucoin.pol target/riscv64emac-unknown-none-polkavm/release/papucoin-guest
 ```
+
+## Probar
+
+La mitad de este codigo no necesita el PVM para nada, y eso es lo que permite
+probarla. Un test corre en esta maquina, con la biblioteca estandar de verdad:
+
+```sh
+cd core && cargo +nightly-2025-05-10 test
+```
+
+O desde la raiz de `node-go`, `make test-guest`.
+
+El blob va con su suma: `papucoin.pol.sha256`, que la CI comprueba. El enlace se
+puede reconstruir igual bit a bit, asi que si la suma no cuadra es que el blob
+commiteado no sale del codigo que tiene al lado.
+
+Cuando todo estaba dentro del binario del guest no habia forma de ejecutar un
+test contra el, y dos supuestos suyos estaban mal sin que nada lo delatara: el
+nonce que escribia era de dieciseis bytes y el que leia aceptaba ocho como
+mucho, con lo que una cuenta no podia pasar de su primer numero; y el nonce
+Ethereum que anunciaba en cada reporte no se comparaba con nada.
 
 ## Por que el enlace necesita `-i revive_v1`
 
@@ -26,12 +55,14 @@ bytes, y un blob enlazado con ellas se detiene en la primera llamada al host.
 sobre el storage del servicio. Un solo export sirve para las dos fases; el byte
 NUL final en los argumentos es lo que las distingue.
 
-`src/crypto.rs` tiene las direcciones de cadena (base58 + blake2b-256) y la
-verificacion de firmas Ed25519.
+`core/src/crypto.rs` tiene las direcciones de cadena (base58 + blake2b-256) y la
+verificacion de firmas Ed25519. `core/src/evm.rs` tiene lo que hace falta para
+aceptar una transaccion de una wallet que solo habla Ethereum: RLP, keccak y la
+decodificacion de la transaccion tipada.
 
-`src/evm.rs` tiene lo que hace falta para aceptar una transaccion de una wallet
-que solo habla Ethereum: RLP, keccak y la decodificacion de la transaccion
-tipada 0x02.
+Esas dos estan en un crate aparte porque no dependen de la maquina. El binario
+del guest depende de el, no lo contiene: lo que necesita del PVM son las llamadas
+al host y el `exit`, y eso se queda en `main.rs`.
 
 **El guest no verifica la firma secp256k1.** `k256::ecrecover` compila pero
 entra en panic en no_std: la aritmetica de curva necesita algo que un programa
