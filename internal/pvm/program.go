@@ -45,12 +45,16 @@ func ParseBlob(data []byte) (program *ProgramBlob, err error) {
 		return nil, fmt.Errorf("rw data size mismatch")
 	}
 
+	// |c| is E4 (fixed four bytes), not a compact integer (eq. A.38 v0.7.2).
+	// Decoding it as compact reads the first length byte as a tag, which
+	// silently truncates the count and makes every real service blob fail to
+	// frame.
 	var codeSize uint32
-	if err := dec.Decode(&codeSize); err != nil {
+	if err := dec.DecodeFixedLength(&codeSize, 4); err != nil {
 		return nil, err
 	}
 	if len(buff.Bytes()) != int(codeSize) {
-		return nil, fmt.Errorf("code size mismatch")
+		return nil, fmt.Errorf("code size mismatch: have %d bytes, header claims %d", len(buff.Bytes()), codeSize)
 	}
 
 	program.CodeAndJumpTable = buff.Bytes()

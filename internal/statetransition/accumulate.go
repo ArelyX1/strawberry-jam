@@ -193,7 +193,16 @@ func (a *Accumulator) InvokePVM(accState state.AccumulationState, newTime jamtim
 	}
 
 	errPanic := &pvm.ErrPanic{}
-	gasUsed, ret, newCtxPair, err := pvm.InvokeWholeProgram(guestCode, guest.Entry, pvm.UGas(gas), args, hostCallFunc, newCtxPair)
+	// ΨA enters the PVM at ι = 5 (eq. B.9 v0.7.2), not at the start of the code
+	// as refine does. A polkavm container names its own entry through its
+	// export table and keeps it; a bare A.38 framing has nothing to look one up
+	// in, so the phase's entry point is the only thing that can be used.
+	entry := guest.Entry
+	if guest.Framed {
+		entry = pvm.AccumulateEntryPoint
+	}
+
+	gasUsed, ret, newCtxPair, err := pvm.InvokeWholeProgram(guestCode, entry, pvm.UGas(gas), args, hostCallFunc, newCtxPair)
 	if err != nil && (errors.Is(err, pvm.ErrOutOfGas) || errors.As(err, &errPanic)) {
 		log.VM.Error().Err(err).Msgf("Program invocation failed")
 		return AccumulationOutput{

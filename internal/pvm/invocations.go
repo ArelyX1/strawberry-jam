@@ -5,6 +5,15 @@ import (
 	"math"
 )
 
+// AccumulateEntryPoint is the ι that accumulation starts the PVM at.
+//
+// Refine and accumulation do not enter the program at the same place. Ψ_R
+// begins at 0 (eq. B.8 v0.7.2) whereas Ψ_A begins at 5 (eq. B.9 v0.7.2). A bare
+// A.38 framing carries no export table to look an entry point up in, so the
+// phase decides where execution starts; entering accumulation at 0 makes the
+// guest run its preamble instead of its entry trampoline.
+const AccumulateEntryPoint uint64 = 5
+
 // InvokeWholeProgram the marshalling whole-program pvm machine state-transition function: (ΨM eq. A.44 v0.7.2)
 // returns remaining gas and:
 // if error is nil (meaning halt or ∎) should return a result as bytes otherwise

@@ -13,6 +13,11 @@ type GuestProgram struct {
 	Entry       uint64
 	EcallToHost map[uint64]uint64
 	StackSize   uint32
+	// InitialHeapPages is the z of A.38: pages the program may touch without
+	// ever calling sbrk. It is part of the program's memory image, not a knob
+	// the host gets to pick, so a round trip through the framing has to carry
+	// it or the guest faults on the first access to its own heap.
+	InitialHeapPages uint16
 	// Framed records that the blob was a bare A.38 program with no import
 	// table, so that an ecall index is the host call id rather than a position
 	// in a list this program does not have.
@@ -64,10 +69,11 @@ func prepareFromFraming(framed *ProgramBlob) *GuestProgram {
 		stack = framed.ProgramMemorySizes.StackSize
 	}
 	return &GuestProgram{
-		Blob:      framingToBlob(framed),
-		Entry:     0,
-		Framed:    true,
-		StackSize: stack,
+		Blob:             framingToBlob(framed),
+		Entry:            0,
+		Framed:           true,
+		StackSize:        stack,
+		InitialHeapPages: framed.ProgramMemorySizes.InitialHeapPages,
 	}
 }
 
@@ -118,7 +124,7 @@ func prepareFromContainer(parsed *PolkavmBlob, entryName string) (*GuestProgram,
 
 // Code returns the A.38 framing to hand to the PVM.
 func (g *GuestProgram) Code() ([]byte, error) {
-	return g.Blob.ToA38(0, g.StackSize)
+	return g.Blob.ToA38(g.InitialHeapPages, g.StackSize)
 }
 
 // HostCallID translates an ecall index into the canonical host call id, so the

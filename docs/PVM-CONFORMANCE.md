@@ -112,3 +112,73 @@ resto de la transición está bien.
 - `https://github.com/w3f/jamtestvectors` — los vectores.
 - `jam-pvm-common` — la implementación de referencia.
 - `https://playground.jamcha.in/` — para comparar traces a mano.
+
+## Hallazgo confirmado: dos bugs de framing A.38 (corregidos)
+
+Los vectores de expulsión fallaban por dos motivos que no eran de gas ni de
+lógica de estado, sino de decodificación del programa. Los dos están corregidos
+y cubiertos por `internal/pvm/program_framing_test.go`.
+
+**1. `|c|` no es un entero compacto.** En el framing A.38 el tamaño del código es
+`E4(|c|)`, un entero fijo de cuatro bytes (eq. A.38 v0.7.2), no un entero
+compacto. `ParseBlob` lo leía como compacto, así que el primer byte de la
+longitud se interpretaba como etiqueta: `0xb8` daba `46` en vez de `123320`, el
+programa se rechazaba con `code size mismatch`, y `InvokePVM` convertía ese
+fallo de framing en un accumulate vacío sin ejecutar nada. El servicio no
+expulsaba a nadie porque nunca llegó a arrancar.
+
+**2. `z` se perdía al rearmar el programa.** `GuestProgram` guardaba el tamaño de
+pila del blob pero no el número de páginas de heap iniciales, y `Code()` pasaba
+`0` a `ToA38`. El PVM se levantaba con `z=0`, de modo que el heap acababa en
+`0x31000` cuando el programa necesita `0x33000`, y el guest moría en su primer
+acceso con `page fault inaccessible memory: address=204800`. `z` forma parte de
+la imagen de memoria del programa, no es un parámetro que el host pueda elegir,
+así que ahora viaja en `GuestProgram.InitialHeapPages`.
+
+Con ambos arreglos el blob de bootstrap (`d1b097b4...`) se encuadra como
+`|o|=13600, |w|=40, z=2, s=8192, |c|=123320`, el programa corre ~3050 gas en vez
+de morir en 65, y aparecen llamadas a `fetch` y `log` reales.
+
+### El bug de fondo: el punto de entrada de accumulate
+
+Los tres vectores de expulsión seguían fallando, y el síntoma engañaba: el gas
+salía siempre en `3007` para los catorce vectores, mientras lo esperado iba de
+`4364` a `26117`. Un número constante para catorce entradas con trabajo distinto
+significa que el PVM estaba ejecutando siempre lo mismo, sin mirar el work
+report. La hipótesis fácil —que faltaba la tabla de costes por instrucción— era
+falsa, y comprobarlo fue lo que destapó la causa real.
+
+Contra el gray paper v0.7.2 (`gavofyork/graypaper`, tag `v0.7.2`):
+
+- **ϱ∆ vale `1` para las 139 instrucciones.** No hay tabla que rellenar: la
+  tabla del apéndice es uniforme. Nuestro modelo de 1 gas por instrucción ya
+  era correcto.
+- **Cada host call cuesta `10`**, vía `gascounter' = gascounter - 10` en el
+  context mutator `F`. Nuestro bloque `const` con iota repetido ya daba `10`
+  para todas. También correcto.
+
+El gas no estaba mal medido: el guest no estaba haciendo el trabajo.
+
+**ΨR y ΨA no entran en el mismo sitio.** El refine arranca en `ι = 0` (eq. B.8)
+y el accumulate en `ι = 5` (eq. B.9). Como el framing A.38 no trae tabla de
+exports, el punto de entrada lo decide la fase. Nosotros pasábamos el mismo
+`guest.Entry` (=`0`) a los dos, así que accumulate entraba por el preámbulo en
+vez de por su trampolín de entrada, el guest recorría su inicialización y
+terminaba por `explicit trap` sin llegar nunca a `Transfer` ni a `Eject`.
+
+Ahora `pvm.AccumulateEntryPoint` fija el `5`, y solo se aplica al framing A.38:
+un contenedor polkavm sigue usando el offset que declara su tabla de exports.
+
+### Efecto
+
+Los 30 vectores de `TestAccumulate` pasan, en `tiny` y en `full`. Con ello caen
+también los traces de estado y preimages que llevaban tiempo en rojo
+(`TestTraceStorage`, `TestTraceStorageLight`, `TestTracePreimages`,
+`TestTracePreimagesLight`: 606 subtests, antes en fallo).
+
+En total: tres arreglos —dos de framing (`E4(|c|)` y `z`) y uno de punto de
+entrada—, cero regresiones en los 36 paquetes de pruebas unitarias y los 88 del
+SDK, y la integración completa en verde tanto en `tiny` como en `full`.
+
+Lo único que queda sin comprobar es `TestTraceFuzzy`, que lanza el fuzzer y satura
+la máquina; no se ha tocado.
