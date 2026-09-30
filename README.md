@@ -6,6 +6,7 @@ Fork de [eigerco/strawberry](https://github.com/eigerco/strawberry) con modifica
 
 | Documento | Qué cubre |
 | --- | --- |
+| [../COMO-ARRANQUE.md](../COMO-ARRANQUE.md) | Cómo compilar y encender la red, comprobarla y apagarla. |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Cómo está armado el nodo. |
 | [docs/PAPU-ECONOMY.md](docs/PAPU-ECONOMY.md) | El precio de PAPU: cómo se mueve, por qué el bloque vacío importa, y por qué el runtime de `pkg/devnet` es el del servidor. |
 | [docs/PVM-CONFORMANCE.md](docs/PVM-CONFORMANCE.md) | Estado de los vectores de conformidad del PVM, qué se descartó como causa y cómo retomarlo. |
