@@ -314,7 +314,7 @@ Dos cosas salieron por el camino y estan corregidas:
   tenia por donde empezar. Ahora las cabeceras pendientes se miran primero: son
   las unicas que saben que falta algo.
 - **Pedia bloques que ya tenia.** Anadia la hoja sin mirar si el bloque estaba,
-  de modo que una cadena entera se|reportaba| con un bloque todavia ausente.
+  de modo que una cadena entera se reportaba con un bloque todavia ausente.
   Eso era tambien el `stillMissing: 1` que aparecia en el log.
 
 ### Pendiente
