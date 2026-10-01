@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/eigerco/strawberry/internal/block"
 	"github.com/eigerco/strawberry/internal/chain"
@@ -29,6 +30,10 @@ type rpcServer struct {
 	// papucoin serves the economy, and is nil only on a node built without a
 	// runtime, which cannot happen on a node that produces blocks.
 	papucoin *papucoinHandlers
+	// startedAt is when this process came up, which is what uptime has to be
+	// measured from. It is not the chain's age: a node replays from genesis, so
+	// the chain is much older than the process serving it.
+	startedAt time.Time
 	// rebuilt is closed once this node has rebuilt the state its blocks describe.
 	//
 	// Until then the state in memory is a state part way through a replay, and a
@@ -45,6 +50,7 @@ type subscribeEvent struct {
 
 func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainStore *store.Chain, bs *chain.BlockService) *rpcServer {
 	srv := &rpcServer{
+		startedAt:   time.Now(),
 		nodeName:    nodeName,
 		chainName:   chainName,
 		nodeVersion: nodeVersion,
@@ -381,6 +387,7 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 				"eth_gasPrice", "eth_estimateGas", "eth_getBlockByNumber", "eth_sendRawTransaction", "eth_call",
 				"papucoin_chainParams", "papucoin_balance", "papucoin_supply",
 				"papucoin_submit", "papucoin_faucet",
+				"jam_getTelemetry", "jam_getWorks", "jam_getBlockLog", "jam_joinAccumulate",
 			},
 		}}
 	case "system_chain":
@@ -392,6 +399,17 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 	case "system_health":
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: map[string]interface{}{
 			"peers": 0, "isSyncing": false, "shouldHavePeers": false,
+		}}
+	case "system_uptime":
+		// How long this process has been up, which is the only uptime that can be
+		// asked for over the wire. The age of the chain is a different number: a
+		// node replays from genesis, so the head it serves is far ahead of the
+		// moment the process started.
+		up := time.Since(s.startedAt)
+		return &rpcResp{JSONRPC: "2.0", ID: id, Result: map[string]interface{}{
+			"ms":        up.Milliseconds(),
+			"seconds":   int64(up.Seconds()),
+			"startedAt": s.startedAt.UTC().Format(time.RFC3339),
 		}}
 	case "system_peers":
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: []interface{}{}}
@@ -483,7 +501,7 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: sid}
 	case "state_unsubscribeRuntimeVersion", "state_unsubscribeMetadata":
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: true}
-	case "papucoin_chainParams", "papucoin_balance", "papucoin_supply", "papucoin_submit", "papucoin_faucet", "jam_stateRoot", "jam_serviceAccount", "jam_getStorage", "jam_getHeader",
+	case "papucoin_chainParams", "papucoin_balance", "papucoin_supply", "papucoin_submit", "papucoin_faucet", "jam_stateRoot", "jam_serviceAccount", "jam_getStorage", "jam_getHeader", "jam_getTelemetry", "jam_getWorks", "jam_getBlockLog", "jam_joinAccumulate",
 		"eth_chainId", "eth_blockNumber", "eth_getBalance", "eth_getTransactionCount",
 		"eth_gasPrice", "eth_estimateGas", "eth_getBlockByNumber", "eth_sendRawTransaction", "eth_call":
 		return s.papucoinCall(req)
@@ -536,6 +554,14 @@ func (s *rpcServer) papucoinCall(req rpcReq) *rpcResp {
 		result, err = s.papucoin.faucet(params)
 	case "jam_getHeader":
 		result, err = s.papucoin.header()
+	case "jam_getTelemetry":
+		return s.papucoin.telemetryCall(req)
+	case "jam_getWorks":
+		return s.papucoin.worksCall(req)
+	case "jam_getBlockLog":
+		return s.papucoin.blockLogCall(req)
+	case "jam_joinAccumulate":
+		return s.papucoin.joinAccumulateCall(req)
 	case "eth_chainId":
 		result, err = s.papucoin.evmChainID()
 	case "eth_blockNumber":

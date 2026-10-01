@@ -79,9 +79,13 @@ type Runtime struct {
 	state *state.State
 	root  crypto.Hash
 
-	registry   *svc.Registry
-	executor   svc.Runtime
-	scheduler  *svc.Scheduler
+	registry  *svc.Registry
+	executor  svc.Runtime
+	scheduler *svc.Scheduler
+	// telemetry is the per timeslot record of what ran. It is written under mu
+	// and read over the RPC, so an operator can see the work and the gas rather
+	// than infer them from state roots.
+	telemetry  *TelemetryStore
 	papucoinID block.ServiceId
 	trie       *store.Trie
 	// stateDB is where the state is written after every timeslot, and read from at
@@ -236,6 +240,7 @@ func New(opts Options) (*Runtime, error) {
 		bridgeKey:  opts.BridgeKey,
 		issued:     map[string]uint64{},
 		undecided:  map[string]int{},
+		telemetry:  NewTelemetryStore(),
 		logf:       logf,
 	}
 	rt.state.ValidatorState = validators
@@ -511,21 +516,46 @@ func (r *Runtime) runLocked(timeslot jamtime.Timeslot) ([]BlockWork, error) {
 	r.state.TimeslotIndex = timeslot
 
 	var work []BlockWork
+	rec := TimeslotRecord{Timeslot: timeslot}
+
 	// A timeslot hands its cores out once, and every assigned service runs
 	// refine then accumulate on the state it is given.
 	assignments := r.scheduler.Plan(int(constants.TotalNumberOfCores))
+	rec.Assignments = len(assignments)
 	for _, assignment := range assignments {
+		bytes := 0
+		for _, item := range assignment.Items {
+			bytes += len(item.Payload)
+		}
+		rec.Services = append(rec.Services, Work{
+			ServiceID: assignment.ServiceID,
+			Items:     len(assignment.Items),
+			Bytes:     bytes,
+		})
+
 		// The work a service was given is the work its block names, whether or not
 		// it survives: a refused item is still an item the timeslot carried.
 		for _, item := range assignment.Items {
 			work = append(work, BlockWork{ServiceID: assignment.ServiceID, Payload: item.Payload})
 		}
-		if err := r.runServiceLocked(assignment, timeslot); err != nil {
+
+		out, err := r.runServiceLocked(assignment, timeslot)
+		if err != nil {
 			// A service that fails leaves its items queued rather than losing
 			// them, because nothing was charged to anybody.
 			r.logf("service %d did not run in timeslot %d: %v", assignment.ServiceID, timeslot, err)
-			r.scheduler.Settle([]svc.Assignment{assignment})
-			continue
+			rec.Errors = append(rec.Errors, fmt.Sprintf("service %d: %v", assignment.ServiceID, err))
+			rec.Failed++
+		}
+		rec.RefineCalls += out.RefineCalls
+		rec.AccumCalls++
+		rec.RefineGas += out.RefineGas
+		rec.AccumulateGas += out.AccumulateGas
+		if out.Refined > 0 {
+			rec.Refined += out.Refined
+		}
+		if out.Accumulated {
+			rec.Accumulated++
 		}
 		r.scheduler.Settle([]svc.Assignment{assignment})
 	}
@@ -540,16 +570,22 @@ func (r *Runtime) runLocked(timeslot jamtime.Timeslot) ([]BlockWork, error) {
 		result, err := r.executor.Accumulate(
 			r.papucoinID, nil, r.scheduler.Transfers(r.papucoinID), timeslot, constants.MaxAllocatedGasAccumulation, r.state.Services,
 		)
+		rec.AccumCalls++
+		rec.AccumulateGas += result.GasUsed
 		if err != nil {
 			r.logf("the economy service did not settle its price in timeslot %d: %v", timeslot, err)
+			rec.Errors = append(rec.Errors, fmt.Sprintf("economy service: %v", err))
 		} else if err := checkThreshold(result.Account); err != nil {
 			r.logf("the economy service failed its threshold in timeslot %d: %v", timeslot, err)
+			rec.Errors = append(rec.Errors, fmt.Sprintf("economy threshold: %v", err))
 		} else {
 			r.state.Services[r.papucoinID] = result.Account
+			rec.Accumulated++
 		}
 	}
 
 	r.updateRoot()
+	r.telemetry.Record(rec)
 	return work, nil
 }
 
@@ -564,22 +600,36 @@ func assignedThisSlot(id block.ServiceId, assignments []svc.Assignment) bool {
 	return false
 }
 
+// serviceOutcome is what one service's run cost, so the timeslot record can
+// total it. It is returned even when the run failed: the gas is gone either way.
+type serviceOutcome struct {
+	RefineCalls   uint64
+	Refined       int
+	AccumulateGas uint64
+	RefineGas     uint64
+	Accumulated   bool
+}
+
 // runServiceLocked refines and accumulates one service, leaving the state untouched
 // if either stage fails.
-func (r *Runtime) runServiceLocked(assignment svc.Assignment, timeslot jamtime.Timeslot) error {
+func (r *Runtime) runServiceLocked(assignment svc.Assignment, timeslot jamtime.Timeslot) (serviceOutcome, error) {
+	var out serviceOutcome
 	account, ok := r.state.Services[assignment.ServiceID]
 	if !ok {
-		return fmt.Errorf("the service has no account")
+		return out, fmt.Errorf("the service has no account")
 	}
 
 	refined := make([]svc.RefinedItem, 0, len(assignment.Items))
 	for _, item := range assignment.Items {
 		result, err := r.executor.Refine(assignment.ServiceID, item.Payload, timeslot, maxGas, r.state.Services)
+		out.RefineCalls++
+		out.RefineGas += result.GasUsed
 		if err != nil {
 			// A refused item is an ordinary outcome, not a chain fault.
 			r.logf("service %d refused an item from %q: %v", assignment.ServiceID, item.Origin, err)
 			continue
 		}
+		out.Refined++
 		// A guest that emits nothing, or emits a refusal of its own, is saying
 		// why in the report; without this the operator only sees a balance that
 		// did not move.
@@ -592,12 +642,14 @@ func (r *Runtime) runServiceLocked(assignment svc.Assignment, timeslot jamtime.T
 	}
 
 	result, err := r.executor.Accumulate(assignment.ServiceID, refined, r.scheduler.Transfers(assignment.ServiceID), timeslot, maxGas, r.state.Services)
+	out.AccumulateGas += result.GasUsed
 	if err != nil {
-		return fmt.Errorf("accumulate: %w", err)
+		return out, fmt.Errorf("accumulate: %w", err)
 	}
 	if err := checkThreshold(result.Account); err != nil {
-		return err
+		return out, err
 	}
+	out.Accumulated = true
 
 	account = result.Account
 	r.state.Services[assignment.ServiceID] = account
@@ -607,7 +659,7 @@ func (r *Runtime) runServiceLocked(assignment svc.Assignment, timeslot jamtime.T
 	// settled here too, because this is the point where what the chain kept is
 	// known: a number whose item was refused is free to be handed out again.
 	r.settleNoncesLocked()
-	return nil
+	return out, nil
 }
 
 // fundBridgeLocked moves the faucet reserve out of the genesis issuer account
@@ -928,4 +980,36 @@ func (a guestRelayAdapter) Recover(rawHex string) (string, error) {
 		return "", err
 	}
 	return fields.From, nil
+}
+
+// ServiceAccount returns a copy of a service's account, and whether it exists.
+func (r *Runtime) ServiceAccount(id block.ServiceId) (service.ServiceAccount, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	acc, ok := r.state.Services[id]
+	return acc, ok
+}
+
+// QueueDepth reports how much work is waiting to be refined, and how many cores
+// the timeslot will hand out.
+func (r *Runtime) QueueDepth() (int, int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.scheduler.Pending(), int(constants.TotalNumberOfCores)
+}
+
+// IsScheduled reports whether the scheduler is currently holding work for a
+// service, which is what stops a service that is already running from being told
+// it may join again.
+func (r *Runtime) IsScheduled(id block.ServiceId) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, rec := range r.telemetry.History(1) {
+		for _, w := range rec.Services {
+			if w.ServiceID == id {
+				return true
+			}
+		}
+	}
+	return false
 }

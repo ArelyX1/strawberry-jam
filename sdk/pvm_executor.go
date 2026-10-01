@@ -135,7 +135,7 @@ func (e *PVMExecutor) Refine(id block.ServiceId, item []byte, _ jamtime.Timeslot
 		return gas, regs, mem, x, err
 	}
 
-	_, report, _, err := pvm.InvokeWholeProgram(code, guest.Entry, pvm.UGas(gasLimit), item, call, pvm.RefineContextPair{
+	gasUsed, report, _, err := pvm.InvokeWholeProgram(code, guest.Entry, pvm.UGas(gasLimit), item, call, pvm.RefineContextPair{
 		IntegratedPVMMap: make(map[uint64]pvm.IntegratedPVM),
 		Segments:         []work.Segment{},
 	})
@@ -144,10 +144,10 @@ func (e *PVMExecutor) Refine(id block.ServiceId, item []byte, _ jamtime.Timeslot
 	}
 	if len(report) == 0 {
 		// An empty report means the guest declined the item, which is a valid
-		// outcome and not a failure.
-		return Result{Account: working}, nil
+		// outcome and not a failure. The gas still went, so it is still counted.
+		return Result{Account: working, GasUsed: uint64(gasUsed)}, nil
 	}
-	return Result{Report: report, Account: working}, nil
+	return Result{Report: report, Account: working, GasUsed: uint64(gasUsed)}, nil
 }
 
 // Accumulate applies the refined reports. They are concatenated into one
@@ -195,10 +195,11 @@ func (e *PVMExecutor) Accumulate(id block.ServiceId, items []RefinedItem, _ []se
 		return gas, regs, mem, x, err
 	}
 
-	if _, _, _, err := pvm.InvokeWholeProgram(code, guest.Entry, pvm.UGas(gasLimit), args, call, pvm.AccumulateContextPair{}); err != nil {
+	gasUsed, _, _, err := pvm.InvokeWholeProgram(code, guest.Entry, pvm.UGas(gasLimit), args, call, pvm.AccumulateContextPair{})
+	if err != nil {
 		return Result{}, fmt.Errorf("accumulate guest: %w", err)
 	}
-	return Result{Account: working}, nil
+	return Result{Account: working, GasUsed: uint64(gasUsed)}, nil
 }
 
 // Seed is what a guest needs in order to write the genesis state of the economy

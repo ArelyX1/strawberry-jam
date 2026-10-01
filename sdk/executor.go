@@ -21,6 +21,11 @@ type Result struct {
 	Transfers []service.DeferredTransfer
 	// Logs are the log lines the handler produced.
 	Logs []LogEntry
+	// GasUsed is what the guest actually consumed, not what it was allowed.
+	// The PVM executor fills this in from what InvokeWholeProgram reports; the
+	// native executor runs in Go and has no gas to meter, so it leaves it at
+	// zero rather than inventing a number.
+	GasUsed uint64
 }
 
 // Executor runs service handlers against real JAM state. Handlers always run
