@@ -290,14 +290,45 @@ Tres cosas, y las tres hubo que encontrarlas mirando el error de verdad:
    y la segunda reemplaza a la primera, tirando el stream. Con la clave
    Ed25519 del vecino, un vecino ya conectado se deja tranquilo.
 
+### Hecho: rellenar los bloques que faltan (A2)
+
+Anunciar un bloque y tenerlo son cosas distintas. Al announced una cabecera que
+este nodo no puede recorrer, el recorrido que comprueba que desciende de lo
+finalizado se para en el primer padre que no tiene, y la cabecera se descartaba
+como si fuera invalida. Un nodo que se quedaba atras no se ponia al dia por
+mucho que esperase.
+
+Ahora el hueco tiene nombre propio: `ErrMissingAncestors` distingue "no puedo
+comprobarlo porque me faltan los bloques" de "esto no es mio y hay que tirarlo",
+que antes llegaban como el mismo fallo generico. La cabecera se guarda como
+agarrador de lo que falta, se piden los bloques por el protocolo CE 128 en
+lotes de 32, y cuando el hueco se cierra lo que esperaba se coloca solo.
+
+Verificado con dos nodos: B arranca cuando A ya tiene historia y trae 13 bloques
+de A. Una sola vez, sin bucle de peticiones.
+
+Dos cosas salieron por el camino y estan corregidas:
+
+- **El relleno no encontraba el hueco.** Recorria las hojas, pero una cabecera
+  que no se pudo colocar nunca llega a ser hoja, asi que un nodo atrasado no
+  tenia por donde empezar. Ahora las cabeceras pendientes se miran primero: son
+  las unicas que saben que falta algo.
+- **Pedia bloques que ya tenia.** Anadia la hoja sin mirar si el bloque estaba,
+  de modo que una cadena entera se|reportaba| con un bloque todavia ausente.
+  Eso era tambien el `stillMissing: 1` que aparecia en el log.
+
 ### Pendiente
 
-Conectarse y anunciarse no es sincronizarse. Cada nodo sigue escribiendo su
-propia cadena y no pide al otro los bloques que le faltan, asi que si uno se
-apaga y vuelve, sigue por su cuenta sin mirar lo que produjo el otro. Tampoco
-hay eleccion de tip: el productor escribe sin comprobar si el suyo sigue siendo
-el canonico. Eso es A2 (rellenar huecos) y A3 (elegir tip), y la autoria por
-rotacion y la finalizacion por quorum de B.
+Rellenar el almacen de bloques no es alcanzar ahi. Un nodo pide los bloques que
+le faltan y los guarda, pero su productor sigue escribiendo su propia cadena sin
+mirar la del otro, asi que todavia no elige tip. Eso es A3. Tampoco se ejecuta
+la cadena ajena: reproducirla antes de decidir cual es la canonica seria
+ejecutar una rama que despues se puede abandonar.
+
+Sigue en pie lo de la autoria: los dos nodos se atribuyen los mismos bloques,
+porque cada uno produce los suyos sin coordinarse y la cadena sale identica. La
+verificacion por indice existe, pero no hay regla que decida quien firma cada
+timeslot.
 
 Nota sobre `blockAuthorIndex`: hoy los dos nodos se atribuyen los mismos
 bloques, porque cada uno produce los suyos sin coordinarse y la cadena resulta

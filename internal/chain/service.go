@@ -26,6 +26,10 @@ type BlockService struct {
 	KnownLeaves     map[crypto.Hash]jamtime.Timeslot // Maps leaf block hashes to their timeslots
 	LatestFinalized LatestFinalized                  // Tracks the most recently finalized block
 	Store           *store.Chain                     // Persistent block storage
+	// pending holds headers that arrived before the blocks they build on. They
+	// are the way back out of a gap: the head is the handle to ask for
+	// everything that is missing behind it.
+	pending map[crypto.Hash]block.Header
 }
 
 // LatestFinalized represents the latest finalized block in the chain.
@@ -200,6 +204,13 @@ func (bs *BlockService) HandleNewHeader(header *block.Header) error {
 	// before considering it as a potential leaf
 	isDescendant, err := bs.IsDescendantOfFinalized(header)
 	if err != nil {
+		// The walk stops when it cannot find a parent. That is a gap, not a
+		// reason to throw the header away: the node is behind, and this header
+		// is exactly what it needs to go and ask for the blocks it missed.
+		if errors.Is(err, store.ErrHeaderNotFound) {
+			bs.trackPending(*header, hash)
+			return fmt.Errorf("%w: block %s: %v", ErrMissingAncestors, hash, err)
+		}
 		return fmt.Errorf("check if block is descendant of finalized: %w", err)
 	}
 	if !isDescendant {

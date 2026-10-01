@@ -307,6 +307,20 @@ func main() {
 	// sirva su propia cadena.
 	go connectToNeighbours(ctx, n)
 
+	// Rellenar los bloques que falten. Solo tiene sentido con pares, asi que
+	// espera a que ConnectToNeighbours haya hecho su trabajo: antes de eso el
+	// bucle solo encontraria huecos que no puede cerrar.
+	go func() {
+		for len(n.GetAllPeers()) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backfillEvery):
+			}
+		}
+		backfillLoop(ctx, n, n.BlockService)
+	}()
+
 	chainName := fmt.Sprintf("Strawberry %s", chainSpec)
 
 	// Start RPC server (before block producer so it's ready for subscriptions)
