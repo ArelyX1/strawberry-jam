@@ -12,6 +12,7 @@ import (
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/store"
 	"github.com/eigerco/strawberry/pkg/log"
+	p2pnode "github.com/eigerco/strawberry/pkg/network/node"
 	"golang.org/x/net/websocket"
 )
 
@@ -30,6 +31,13 @@ type rpcServer struct {
 	// papucoin serves the economy, and is nil only on a node built without a
 	// runtime, which cannot happen on a node that produces blocks.
 	papucoin *papucoinHandlers
+	// node is the network node, so the peer methods can report who is actually
+	// connected instead of an empty list. nil only on a node built without a
+	// network, which the dev node never is.
+	node *p2pnode.Node
+	// listenAddr is the address this node is reachable on. It is passed in
+	// because the transport keeps no accessor for its own address.
+	listenAddr string
 	// startedAt is when this process came up, which is what uptime has to be
 	// measured from. It is not the chain's age: a node replays from genesis, so
 	// the chain is much older than the process serving it.
@@ -48,8 +56,10 @@ type subscribeEvent struct {
 	params interface{}
 }
 
-func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainStore *store.Chain, bs *chain.BlockService) *rpcServer {
+func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainStore *store.Chain, bs *chain.BlockService, node *p2pnode.Node, listenAddr string) *rpcServer {
 	srv := &rpcServer{
+		node:        node,
+		listenAddr:  listenAddr,
 		startedAt:   time.Now(),
 		nodeName:    nodeName,
 		chainName:   chainName,
@@ -397,8 +407,14 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 	case "system_version":
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: s.nodeVersion}
 	case "system_health":
+		// El numero de pares es el de verdad. Estaba en cero fijo, y es el campo
+		// que lee el panel, asi que un nodo con uno al lado reportaba cero.
+		peers := 0
+		if s.node != nil {
+			peers = len(s.node.GetAllPeers())
+		}
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: map[string]interface{}{
-			"peers": 0, "isSyncing": false, "shouldHavePeers": false,
+			"peers": peers, "isSyncing": false, "shouldHavePeers": false,
 		}}
 	case "system_uptime":
 		// How long this process has been up, which is the only uptime that can be
@@ -412,9 +428,28 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 			"startedAt": s.startedAt.UTC().Format(time.RFC3339),
 		}}
 	case "system_peers":
-		return &rpcResp{JSONRPC: "2.0", ID: id, Result: []interface{}{}}
+		// Los pares de verdad. Antes devolvia una lista vacia fijada en el
+		// codigo, asi que un nodo conectado a otros parecia no tener ninguno, y
+		// el panel no podia decir quantos habia.
+		out := make([]interface{}, 0)
+		if s.node != nil {
+			for _, p := range s.node.GetAllPeers() {
+				entry := map[string]interface{}{
+					"address": fmt.Sprintf("%v", p.Address),
+				}
+				if p.BAnnouncer != nil {
+					entry["announcing"] = true
+				}
+				out = append(out, entry)
+			}
+		}
+		return &rpcResp{JSONRPC: "2.0", ID: id, Result: out}
 	case "system_localListenAddresses":
-		return &rpcResp{JSONRPC: "2.0", ID: id, Result: []string{}}
+		out := []string{}
+		if s.listenAddr != "" {
+			out = append(out, s.listenAddr)
+		}
+		return &rpcResp{JSONRPC: "2.0", ID: id, Result: out}
 	case "chain_getBlockHash":
 		s.mu.RLock()
 		hash := s.latestHash

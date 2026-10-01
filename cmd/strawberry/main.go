@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/eigerco/strawberry/internal/block"
 	"github.com/eigerco/strawberry/internal/constants"
@@ -298,19 +299,27 @@ func main() {
 			Msg("node start failed")
 	}
 
+	// Conectar con los validadores vecinos. Hasta ahora no se llamaba nunca, de
+	// modo que el nodo escuchaba y nunca ": conectaba con nadie, y por eso dos
+	// nodos en la misma maquina eran dos cadenas calculadas por separado en vez
+	// de una red. Se hace en segundo plano y con reintentos porque un vecino
+	// puede no estar arrancado todavia, y eso no puede impedir que este nodo
+	// sirva su propia cadena.
+	go connectToNeighbours(ctx, n)
+
 	chainName := fmt.Sprintf("Strawberry %s", chainSpec)
 
 	// Start RPC server (before block producer so it's ready for subscriptions)
 	rpcAddr := fmt.Sprintf(":%d", rpcPort)
 	rpcSrv := startRPCServer(rpcAddr, nodeName, chainName, version,
-		n.BlockService.Store, n.BlockService)
+		n.BlockService.Store, n.BlockService, n, udpAddress.String())
 	rpcSrv.papucoin = newPapucoinHandlers(runtime, rpcSrv)
 
 	// Start block producer
 	startBlockProducer(n.BlockService, runtime, index,
 		func(hash crypto.Hash, num uint, h block.Header) {
 			rpcSrv.updateBlock(hash, num, h)
-		}, rpcSrv.markRebuilt)
+		}, rpcSrv.markRebuilt, n, ctx)
 
 	// Connect telemetry
 	startTelemetry(telemetryURL, nodeName, version, chainName)
@@ -353,4 +362,54 @@ func validatorListenAddrs(vs []FullValidatorInfo) []string {
 		addrs = append(addrs, net.JoinHostPort(v.IP, strconv.Itoa(v.Port)))
 	}
 	return addrs
+}
+
+// connectToNeighbours keeps trying to reach the neighbouring validators.
+//
+// The first attempt waits: in a local dev setup the other node is usually still
+// starting when this one is ready, and a single attempt would leave the two of
+// them talking to nobody. The backoff stops growing so a peer that comes up
+// late is still picked up, at the cost of a periodic attempt that mostly does
+// nothing, which is fine for two nodes and for a dev machine.
+func connectToNeighbours(ctx context.Context, n *node.Node) {
+	delay := 2 * time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Solo se marca si no hay ninguno. ConnectToPeer rechaza cuando ya
+		// existe, pero compara por direccion y el par se guarda con el puerto
+		// efimero de la conexion, no con el que se marco: asi que nunca
+		// coincidia, el bucle reconectaba cada 30s y cada reconexion cerraba el
+		// par anterior con su anunciador, dejando a todos los bloques
+		// siguientes con "context canceled" al anunciarse.
+		if peers := n.GetAllPeers(); len(peers) > 0 {
+			log.Internal.Info().Int("peers", len(peers)).Msg("connected to neighbour validators")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+			continue
+		}
+
+		if err := n.ConnectToNeighbours(); err != nil {
+			log.Internal.Debug().Err(err).Msg("no neighbours reachable yet, will retry")
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
+	}
 }

@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"strings"
 
 	"crypto/tls"
 	"fmt"
@@ -289,7 +290,22 @@ func (n *Node) ConnectToNeighbours() error {
 	if err != nil {
 		return fmt.Errorf("failed to get neighbors: %w", err)
 	}
+	// A neighbour already connected is left alone. The check is by validator key
+	// and not by address, because the stored peer carries the ephemeral port the
+	// connection came from, which never matches the port it was dialled on: with
+	// the address as the key every pass found a "new" neighbour, dialled again,
+	// and OnConnection tore down the connection it had just made along with the
+	// announcement stream built on it. Two nodes starting together both dial each
+	// other, so this happened on the very first block and left every later
+	// announcement failing against a stream the other side had closed.
 	for _, neighbor := range neighbors {
+		n.peersLock.RLock()
+		have := n.PeersSet.GetByEd25519Key(neighbor.Ed25519)
+		n.peersLock.RUnlock()
+		if have != nil {
+			continue
+		}
+
 		// Extract IPv6/port from validator metadata as specified in the JAMNP
 		address, err := peer.NewPeerAddressFromMetadata(neighbor.Metadata[:])
 		if err != nil {
@@ -520,6 +536,36 @@ func (n *Node) UpdateCoreAssignments() error {
 //   - V = total number of validators
 func (n *Node) assignedShardIndex(coreIndex, validatorIndex uint16) uint16 {
 	return (coreIndex*uint16(constants.ErasureCodingOriginalShards) + validatorIndex) % constants.NumberOfValidators
+}
+
+// AnnounceBlockToAll tells every peer we are connected to about a block we just
+// produced.
+//
+// AnnounceBlock takes a single peer because the protocol is per connection. A
+// block author has to tell all of them, though, and without this there is no
+// caller: the block producer has no way to reach the node from where it makes a
+// block, so nothing ever told anybody about anything.
+//
+// A peer that cannot be told is not fatal. One unreachable node must not stop
+// the chain, so the failures are collected and returned for the log to say what
+// happened, and the block is still announced to the rest.
+func (n *Node) AnnounceBlockToAll(ctx context.Context, header *block.Header) error {
+	peers := n.GetAllPeers()
+	if len(peers) == 0 {
+		return nil
+	}
+
+	var failures []string
+	for _, p := range peers {
+		if err := n.AnnounceBlock(ctx, header, p); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", p.Address, err))
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("announced to %d of %d peers: %s",
+			len(peers)-len(failures), len(peers), strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // AnnounceBlock implements the UP 0 block announcement protocol from the JAM spec.

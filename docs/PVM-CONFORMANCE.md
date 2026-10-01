@@ -248,3 +248,59 @@ of memory` y el test falla.
 De paso, `Log` ya no se traga el error de lectura: registraba el fallo con
 `log.VM.Error()` y continuaba, devolviendo éxito sobre memoria a la que el guest
 no tenía acceso, mientras el resto de host calls convierten eso en panic.
+
+## Red entre nodos
+
+### Hecho: los nodos se conectan y se anuncian (A1)
+
+Antes de esto un nodo escuchaba y no `: se conectaba con nadie. Dos nodos en
+la misma maquina eran dos cadenas calculadas por separado, no una red.
+`ConnectToNeighbours()` y `AnnounceBlock()` ya existian en el arbol y no los
+llamaba nadie.
+
+Ahora `main.go` marca con los validadores vecinos al arrancar, con reintentos
+porque en local el otro nodo suele estar todavia levantandose, y el productor
+anuncia cada bloque que escribe. `system_peers` y el campo `peers` de
+`system_health` devuelven los pares de verdad; antes devolvian una lista vacia
+y un cero fijos en el codigo, asi que un nodo con uno al lado reportaba que no
+tenia ninguno. Ese `peers` es el campo que lee el panel.
+
+Verificado con dos nodos: se ven, anuncian sin un solo fallo y se quedan en el
+mismo tip. El modo de un solo nodo sigue igual, con el smoke test y la
+conformidad en verde.
+
+### Lo que faltaba y hacia que fallara
+
+Tres cosas, y las tres hubo que encontrarlas mirando el error de verdad:
+
+1. **El bucle de reconexion destruia el anunciador.** `ConnectToPeer` rechaza
+   marcar un par que ya existe, pero compara por direccion, y el par se guarda
+   con el puerto efimero de la conexion, no con el que se marco. Asi que nunca
+   coincidia: el bucle reconectaba cada 30s y cada reconexion cerraba el par
+   anterior con su stream de anuncio puesto. Todos los bloques siguientes
+   fallaban con `context canceled`.
+
+2. **El contexto del anuncio no se podia cancelar.** Cancelar el contexto por
+   bloque dejaba muerto el stream del anunciador para siempre, porque el
+   anotador queda ligado al contexto que lo creo. El anuncio va ahora en su
+   propia goroutine con el contexto del nodo.
+
+3. **La deduplicacion era por direccion en vez de por clave de validador.** Dos
+   nodos que arrancan a la vez se marcan el uno al otro, se crean dos conexiones
+   y la segunda reemplaza a la primera, tirando el stream. Con la clave
+   Ed25519 del vecino, un vecino ya conectado se deja tranquilo.
+
+### Pendiente
+
+Conectarse y anunciarse no es sincronizarse. Cada nodo sigue escribiendo su
+propia cadena y no pide al otro los bloques que le faltan, asi que si uno se
+apaga y vuelve, sigue por su cuenta sin mirar lo que produjo el otro. Tampoco
+hay eleccion de tip: el productor escribe sin comprobar si el suyo sigue siendo
+el canonico. Eso es A2 (rellenar huecos) y A3 (elegir tip), y la autoria por
+rotacion y la finalizacion por quorum de B.
+
+Nota sobre `blockAuthorIndex`: hoy los dos nodos se atribuyen los mismos
+bloques, porque cada uno produce los suyos sin coordinarse y la cadena resulta
+identica. La autorizacion por indice existe y se verifica contra el conjunto de
+validadores, pero no hay ninguna regla que decida quien debe firmar cada
+timeslot.

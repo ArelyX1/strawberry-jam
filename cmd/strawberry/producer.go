@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/eigerco/strawberry/internal/jamtime"
 	"github.com/eigerco/strawberry/pkg/devnet"
 	"github.com/eigerco/strawberry/pkg/log"
+	p2pnode "github.com/eigerco/strawberry/pkg/network/node"
 )
 
 // blockProducer builds one block per timeslot out of what the runtime did in it.
@@ -24,6 +26,12 @@ type blockProducer struct {
 	parentHash  crypto.Hash
 	blockNum    uint
 	onBlock     func(crypto.Hash, uint, block.Header)
+	// net is the network node, so a block this node writes can be told to the
+	// others. nil when there is no network, which is the case in tests.
+	net *p2pnode.Node
+	// ctx bounds the announcement; announcing opens a stream per peer and must
+	// not hold up the next timeslot if a peer is unresponsive.
+	ctx context.Context
 }
 
 // startBlockProducer starts producing a block per timeslot.
@@ -36,8 +44,10 @@ type blockProducer struct {
 // before it starts producing. A node that cannot rebuild its own state is not a
 // node that is a little late: it is a node that would write a second chain over the
 // first, so it stops instead.
-func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorIndex uint16, onBlock func(crypto.Hash, uint, block.Header), onReady func()) *blockProducer {
+func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorIndex uint16, onBlock func(crypto.Hash, uint, block.Header), onReady func(), net *p2pnode.Node, ctx context.Context) *blockProducer {
 	bp := &blockProducer{
+		net:         net,
+		ctx:         ctx,
 		bs:          bs,
 		runtime:     runtime,
 		authorIndex: authorIndex,
@@ -292,6 +302,21 @@ func (bp *blockProducer) produceBlock(slot jamtime.Timeslot) {
 	}
 	if err := bp.bs.HandleNewHeader(&header); err != nil {
 		log.Internal.Warn().Err(err).Str("hash", hashToHex(hash)).Uint64("slot", uint64(slot)).Msg("HandleNewHeader warning")
+	}
+
+	// Tell the other nodes. It goes in its own goroutine and with the node's own
+	// context, not a per block one: the announcer holds a stream that is bound to
+	// whatever context created it, so cancelling that context here left every
+	// peer with a dead stream and every later block failed with "context
+	// canceled". A peer that stops answering must also not hold up the next
+	// timeslot, which is why this is not on this path.
+	if bp.net != nil && len(bp.net.GetAllPeers()) > 0 {
+		announced := &header
+		go func() {
+			if err := bp.net.AnnounceBlockToAll(bp.ctx, announced); err != nil {
+				log.Internal.Debug().Err(err).Uint64("slot", uint64(slot)).Msg("could not announce the block to every peer")
+			}
+		}()
 	}
 
 	bp.parentHash = hash
