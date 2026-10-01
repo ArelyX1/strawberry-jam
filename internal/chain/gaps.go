@@ -3,6 +3,7 @@ package chain
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sort"
 
 	"github.com/eigerco/strawberry/internal/block"
@@ -206,4 +207,78 @@ func (bs *BlockService) Gap() GapReport {
 		}
 	}
 	return report
+}
+
+// CanonicalChain walks back from a tip to the point this node's chain starts and
+// returns the blocks in forward order, so a chain can be executed the way it
+// was written.
+//
+// Walking by parent hash and not by timeslot is the point. Timeslots do not
+// identify a block in a chain that forked: two blocks can share a timeslot, and
+// a map keyed by timeslot keeps whichever arrived last, which is how a node ends
+// up replaying a mixture of two branches and landing on a state that no branch
+// ever described.
+func (bs *BlockService) CanonicalChain(tip crypto.Hash, limit int) ([]block.Block, error) {
+	if limit <= 0 {
+		limit = 4096
+	}
+
+	backwards := make([]block.Block, 0, limit)
+	seen := make(map[crypto.Hash]bool)
+	current := tip
+
+	for len(backwards) < limit {
+		if seen[current] {
+			return nil, fmt.Errorf("the chain loops at %x", current)
+		}
+		seen[current] = true
+
+		b, err := bs.Store.GetBlock(current)
+		if err != nil {
+			// A header without its block is a hole, and walking into it would
+			// mean guessing what came before. The backfill has to run first.
+			return nil, fmt.Errorf("no block for %x: %w", current, err)
+		}
+		backwards = append(backwards, b)
+		current = b.Header.ParentHash
+
+		// The chain ends where the parent stops having a block, which is the
+		// genesis: there is no block for it because nothing produced it.
+		if _, err := bs.Store.GetBlock(current); err != nil {
+			break
+		}
+	}
+
+	for i, j := 0, len(backwards)-1; i < j; i, j = i+1, j-1 {
+		backwards[i], backwards[j] = backwards[j], backwards[i]
+	}
+	return backwards, nil
+}
+
+// LeafBlock is a tip with its header, so that choosing between tips does not
+// need a store read for each one.
+type LeafBlock struct {
+	Header block.Header
+	Slot   jamtime.Timeslot
+}
+
+// Leaves gives the block service's view of the tips, as blocks rather than
+// hashes so a caller does not have to fetch each one.
+func (bs *BlockService) Leaves() []LeafBlock {
+	bs.mu.RLock()
+	hashes := make([]crypto.Hash, 0, len(bs.KnownLeaves))
+	for hash := range bs.KnownLeaves {
+		hashes = append(hashes, hash)
+	}
+	bs.mu.RUnlock()
+
+	out := make([]LeafBlock, 0, len(hashes))
+	for _, hash := range hashes {
+		header, err := bs.Store.GetHeader(hash)
+		if err != nil {
+			continue
+		}
+		out = append(out, LeafBlock{Header: header, Slot: header.TimeSlotIndex})
+	}
+	return out
 }

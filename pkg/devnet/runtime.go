@@ -82,6 +82,15 @@ type Runtime struct {
 	registry  *svc.Registry
 	executor  svc.Runtime
 	scheduler *svc.Scheduler
+	// genesisServices is the state the chain started from, kept so that a switch
+	// to another chain can put the runtime back at the beginning. A dev chain
+	// replays from genesis in a few seconds, which is a fair price for not having
+	// to keep a state per slot.
+	genesisServices service.ServiceState
+	// validators are the chain's validator set, kept so a rewind can restore it.
+	// They come from the caller rather than from the genesis definition, which
+	// describes the economy and not who is validating.
+	validators []Validator
 	// telemetry is the per timeslot record of what ran. It is written under mu
 	// and read over the RPC, so an operator can see the work and the gas rather
 	// than infer them from state roots.
@@ -226,22 +235,24 @@ func New(opts Options) (*Runtime, error) {
 	validators := ValidatorState(opts.Validators)
 
 	rt := &Runtime{
-		genesis:    genesis,
-		params:     params,
-		state:      newStateWith(services, opts.Validators),
-		registry:   registry,
-		executor:   executor,
-		scheduler:  scheduler,
-		papucoinID: id,
-		trie:       store.NewTrie(trieDB),
-		issuer:     issuer,
-		evmChainID: relay.ChainID,
-		weiPerRaw:  weiPerRaw(genesis.EVM.Decimals, params.Decimals),
-		bridgeKey:  opts.BridgeKey,
-		issued:     map[string]uint64{},
-		undecided:  map[string]int{},
-		telemetry:  NewTelemetryStore(),
-		logf:       logf,
+		genesis:         genesis,
+		params:          params,
+		state:           newStateWith(services, opts.Validators),
+		registry:        registry,
+		executor:        executor,
+		scheduler:       scheduler,
+		genesisServices: services.Clone(),
+		validators:      append([]Validator(nil), opts.Validators...),
+		papucoinID:      id,
+		trie:            store.NewTrie(trieDB),
+		issuer:          issuer,
+		evmChainID:      relay.ChainID,
+		weiPerRaw:       weiPerRaw(genesis.EVM.Decimals, params.Decimals),
+		bridgeKey:       opts.BridgeKey,
+		issued:          map[string]uint64{},
+		undecided:       map[string]int{},
+		telemetry:       NewTelemetryStore(),
+		logf:            logf,
 	}
 	rt.state.ValidatorState = validators
 	if rt.bridgeKey != nil {
@@ -1012,4 +1023,70 @@ func (r *Runtime) IsScheduled(id block.ServiceId) bool {
 		}
 	}
 	return false
+}
+
+// Rewind puts the runtime back at the state the chain started from.
+//
+// This is what a switch between chains needs. When a node adopts a chain written
+// by somebody else, the state it is holding describes a branch that is about to
+// be abandoned, and there is no way forward from there: the work that produced
+// it cannot be un-run. So the runtime goes back to genesis and the canonical
+// chain is replayed over it, which is exactly what a node does at startup, and
+// gives the same answer for the same reason.
+//
+// The cost is a full replay, a few seconds on the dev chain. The alternative
+// would be a state per slot, which is a lot of memory to save a replay that
+// happens when a chain actually changes, and a chain does not change often.
+//
+// Anything the node handed out and the abandoned chain never settled is
+// forgotten, because the numbers that mattered were the ones the chain it
+// followed accepted. Keeping them would make the node sign an item the chain has
+// already spent a nonce on.
+func (r *Runtime) Rewind() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.state = newStateWith(r.genesisServices.Clone(), r.validators)
+	r.state.ValidatorState = ValidatorState(r.validators)
+	// The scheduler is rebuilt rather than emptied: what it holds is work queued
+	// for the branch being abandoned, and carrying that over would execute a
+	// service's work against a state it was never queued for.
+	r.scheduler = svc.NewScheduler(r.registry, int(constants.MaxNumberOfItems))
+	r.issued = map[string]uint64{}
+	r.undecided = map[string]int{}
+	r.updateRoot()
+	return nil
+}
+
+// Replay executes a chain written by somebody else over the current state.
+//
+// It is the other half of [Runtime.Rewind]: the node goes back to genesis and
+// then this walks the chain it is adopting, so the state it ends up carrying is
+// the state that chain describes and not one of its own.
+//
+// Each block is asked for the work its timeslot carried and that work is queued
+// before the timeslot runs, because a timeslot that settles no work lands on
+// the state alone and would otherwise be skipped. The state root of the last
+// block is compared with the one that block claims, which is what makes this a
+// check rather than a replay: a chain that does not describe the state it
+// produced is refused instead of being followed.
+func (r *Runtime) Replay(work []BlockWork, through jamtime.Timeslot) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.replaying = true
+	for _, w := range work {
+		if _, err := r.scheduler.Submit(w.ServiceID, svc.WorkItem{Payload: w.Payload, Origin: "replay"}); err != nil {
+			r.replaying = false
+			return fmt.Errorf("the queue is full: %w", err)
+		}
+	}
+	r.replaying = false
+
+	for slot := r.state.TimeslotIndex; slot <= through; slot++ {
+		if _, err := r.runLocked(slot); err != nil {
+			return fmt.Errorf("replay timeslot %d: %w", slot, err)
+		}
+	}
+	return nil
 }

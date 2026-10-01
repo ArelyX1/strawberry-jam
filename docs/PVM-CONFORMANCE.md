@@ -317,13 +317,43 @@ Dos cosas salieron por el camino y estan corregidas:
   de modo que una cadena entera se reportaba con un bloque todavia ausente.
   Eso era tambien el `stillMissing: 1` que aparecia en el log.
 
-### Pendiente
+### A3: elegir tip. Escrito, sin verificar de extremo a extremo
 
-Rellenar el almacen de bloques no es alcanzar ahi. Un nodo pide los bloques que
-le faltan y los guarda, pero su productor sigue escribiendo su propia cadena sin
-mirar la del otro, asi que todavia no elige tip. Eso es A3. Tampoco se ejecuta
-la cadena ajena: reproducirla antes de decidir cual es la canonica seria
-ejecutar una rama que despues se puede abandonar.
+El codigo esta todo y las pruebas unitarias pasan, pero **no se ha podido
+comprobar que dos nodos acaben de acuerdo**, y conviene no darlo por bueno.
+
+Lo que hay:
+
+- `CanonicalChain` recorre la cadena por hash de padre y no por timeslot. En una
+  cadena bifurcada dos bloques pueden compartir timeslot, y una coleccion ordenada
+  por timeslot se queda con el que llego el ultimo: asi se acaba reproduciendo una
+  mezcla de dos ramas y con un estado que ninguna describio.
+- `Runtime.Rewind` devuelve el runtime al estado de génesis, y `Replay` ejecuta
+  encima la cadena adoptada. Cambiar de rama no tiene vuelta atras: el trabajo
+  que produjo el estado que se abandona no se puede deshacer, asi que se vuelve
+  al principio y se reproduce, que es justo lo que hace un nodo al arrancar.
+- El productor consulta la mejor punta conocida antes de escribir y adopta la de
+  un par si esta mas adelante, con desempate por hash para que todos los nodos
+  elijan la misma rama.
+- Los anuncios llevan un tiempo de espera tras fallar. Sin eso, un par al que no
+  se le puede abrir el stream se reintenta cada timeslot, y cada intento abre y
+  abandona otro stream, que es bastante para que el otro lado tire la conexion.
+
+Lo que **no** funciona: un nodo que vuelve despues de estar parado **no consigue
+abrir el stream de anuncio hacia el par que ya esta en marcha**. El error es
+`open stream: failed to open QUIC stream: Application error 0x0 (remote)`, o sea
+que lo rechaza el otro lado. Consecuencia: el que vuelve no se entera de la
+cadena del otro, no hay nada que seguir, y los dos siguen en ramas distintas
+asiendo falta lo unico que sabrian hacer. El anuncio al recien conectado se
+intenta (`announceTipToNewPeers`) pero falla por lo mismo.
+
+Es un problema de la capa de red, no de la eleccion de tip: abrir un stream de
+anuncio contra un par ya establecido. A1 (conectarse y verse) y A2 (rellenar
+huecos) estan comprobados; A3 se queda ahi hasta que eso se arregle.
+
+Lo siguiente seria mirar por que el lado remoto rechaza el stream: si es que
+rechaza un segundo stream de anuncio al mismo par, o si hay una condicion de
+carrera al abrir los dos nodos a la vez.
 
 Sigue en pie lo de la autoria: los dos nodos se atribuyen los mismos bloques,
 porque cada uno produce los suyos sin coordinarse y la cadena sale identica. La

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/eigerco/strawberry/internal/block"
@@ -12,6 +14,7 @@ import (
 	"github.com/eigerco/strawberry/pkg/devnet"
 	"github.com/eigerco/strawberry/pkg/log"
 	p2pnode "github.com/eigerco/strawberry/pkg/network/node"
+	"github.com/eigerco/strawberry/pkg/network/peer"
 )
 
 // blockProducer builds one block per timeslot out of what the runtime did in it.
@@ -32,7 +35,20 @@ type blockProducer struct {
 	// ctx bounds the announcement; announcing opens a stream per peer and must
 	// not hold up the next timeslot if a peer is unresponsive.
 	ctx context.Context
+	// announceBackoff is when each peer may next be told about a block.
+	//
+	// Without it a peer whose announcement stream will not open is retried every
+	// timeslot, forever: each attempt opens and abandons another stream, and the
+	// hammering is enough for the other side to tear the connection down. Then
+	// neither node can tell the other anything, which is the opposite of what
+	// announcing is for.
+	announceBackoff map[string]time.Time
 }
+
+// announceRetryWait is how long a peer is left alone after an announcement to it
+// failed. Long enough that the retries are not a stream flood, short enough that
+// a peer that comes back is picked up while the chain is still moving.
+const announceRetryWait = 45 * time.Second
 
 // startBlockProducer starts producing a block per timeslot.
 //
@@ -46,12 +62,13 @@ type blockProducer struct {
 // first, so it stops instead.
 func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorIndex uint16, onBlock func(crypto.Hash, uint, block.Header), onReady func(), net *p2pnode.Node, ctx context.Context) *blockProducer {
 	bp := &blockProducer{
-		net:         net,
-		ctx:         ctx,
-		bs:          bs,
-		runtime:     runtime,
-		authorIndex: authorIndex,
-		onBlock:     onBlock,
+		net:             net,
+		ctx:             ctx,
+		announceBackoff: map[string]time.Time{},
+		bs:              bs,
+		runtime:         runtime,
+		authorIndex:     authorIndex,
+		onBlock:         onBlock,
 	}
 	time.Sleep(500 * time.Millisecond)
 
@@ -257,6 +274,16 @@ func blockExtrinsic(work []devnet.BlockWork) block.Extrinsic {
 // The root of the state as it stands is the parent state of this block, so it is
 // read before the timeslot's work runs.
 func (bp *blockProducer) produceBlock(slot jamtime.Timeslot) {
+	// Before writing anything, make sure this node is still on the chain. If a
+	// peer got ahead, following it here means the block this timeslot produces
+	// builds on what everyone else is building on, instead of two nodes writing
+	// one block each for the same slot and diverging.
+	if moved, err := bp.followCanonical(); err != nil {
+		log.Internal.Warn().Err(err).Uint64("slot", uint64(slot)).Msg("could not follow the chain a peer wrote; staying on this node's own")
+	} else if moved {
+		log.Internal.Info().Uint64("slot", uint64(slot)).Msg("now producing on the chain it adopted")
+	}
+
 	parentRoot := bp.runtime.Root()
 
 	work, err := bp.runtime.Run(slot)
@@ -310,13 +337,15 @@ func (bp *blockProducer) produceBlock(slot jamtime.Timeslot) {
 	// peer with a dead stream and every later block failed with "context
 	// canceled". A peer that stops answering must also not hold up the next
 	// timeslot, which is why this is not on this path.
-	if bp.net != nil && len(bp.net.GetAllPeers()) > 0 {
-		announced := &header
-		go func() {
-			if err := bp.net.AnnounceBlockToAll(bp.ctx, announced); err != nil {
-				log.Internal.Debug().Err(err).Uint64("slot", uint64(slot)).Msg("could not announce the block to every peer")
-			}
-		}()
+	// A peer that has just connected is told where the chain is straight away.
+	// Announcing only on new blocks was not enough: a node that had been away
+	// missed the blocks that were produced while it was gone, and the peer it
+	// reconnected to only ever mentioned them if it happened to produce another
+	// one. Two nodes could sit on different chains for ever with no way to learn
+	// that it had happened.
+	if bp.net != nil {
+		bp.announceTipToNewPeers()
+		bp.announceWithBackoff(&header)
 	}
 
 	bp.parentHash = hash
@@ -335,4 +364,171 @@ func (bp *blockProducer) produceBlock(slot jamtime.Timeslot) {
 	if bp.onBlock != nil {
 		bp.onBlock(hash, bp.blockNum, header)
 	}
+}
+
+// bestKnownTip is the tip this node should be following: the block with the
+// highest timeslot among all the leaves it knows about, whichever node wrote it.
+//
+// "Whichever node wrote it" is the whole point. Until now the producer only ever
+// looked at the blocks it had written itself, so a node that fell behind kept
+// producing a branch nobody else was on and the two drifted apart for good.
+func (bp *blockProducer) bestKnownTip() (block.Header, crypto.Hash, bool) {
+	leaves := bp.bs.Leaves()
+	if len(leaves) == 0 {
+		return block.Header{}, crypto.Hash{}, false
+	}
+
+	// Sorted by slot and, for two leaves on the same slot, by hash. The tie break
+	// has to be the same on every node or they would pick different branches and
+	// the fork would never settle.
+	sort.Slice(leaves, func(i, j int) bool {
+		hi, _ := leaves[i].Header.Hash()
+		hj, _ := leaves[j].Header.Hash()
+		if leaves[i].Slot != leaves[j].Slot {
+			return leaves[i].Slot > leaves[j].Slot
+		}
+		return bytes.Compare(hi[:], hj[:]) < 0
+	})
+
+	best := leaves[0]
+	hash, err := best.Header.Hash()
+	if err != nil {
+		return block.Header{}, crypto.Hash{}, false
+	}
+	return best.Header, hash, true
+}
+
+// followCanonical makes the node's tip and state agree with the chain everyone
+// else is on, and reports whether it had to move.
+//
+// It only moves when the best known tip is not a block this node produced. When
+// it is, there is nothing to do: the node is already on the chain and its state
+// describes it.
+func (bp *blockProducer) followCanonical() (bool, error) {
+	tip, tipHash, ok := bp.bestKnownTip()
+	if !ok {
+		return false, nil
+	}
+
+	// Already following it: either it is the block we wrote last, or it is at a
+	// slot we have not reached and our own tip is still ahead of everything.
+	if tipHash == bp.parentHash {
+		return false, nil
+	}
+	if tip.TimeSlotIndex <= bp.lastSlot() {
+		return false, nil
+	}
+
+	log.Internal.Info().
+		Uint64("tipSlot", uint64(tip.TimeSlotIndex)).
+		Uint64("ourSlot", uint64(bp.lastSlot())).
+		Str("tip", hashToHex(tipHash)).
+		Msg("another node is ahead; following its chain")
+
+	chain, err := bp.bs.CanonicalChain(tipHash, 0)
+	if err != nil {
+		return false, fmt.Errorf("walk the chain a peer wrote: %w", err)
+	}
+
+	// The state this node is holding describes the branch it is leaving, and
+	// there is no un-run for the work that produced it, so it goes back to
+	// genesis and the other branch is executed over that.
+	if err := bp.runtime.Rewind(); err != nil {
+		return false, fmt.Errorf("rewind to the start of the chain: %w", err)
+	}
+
+	work := make([]devnet.BlockWork, 0, len(chain))
+	for _, b := range chain {
+		work = append(work, blockWork(b)...)
+	}
+	if err := bp.runtime.Replay(work, chain[len(chain)-1].Header.TimeSlotIndex); err != nil {
+		return false, fmt.Errorf("replay the chain a peer wrote: %w", err)
+	}
+
+	last := chain[len(chain)-1].Header
+	bp.parentHash = tipHash
+	bp.blockNum = uint(last.TimeSlotIndex) + 1
+	return true, nil
+}
+
+func (bp *blockProducer) lastSlot() jamtime.Timeslot {
+	if bp.blockNum == 0 {
+		return 0
+	}
+	return jamtime.Timeslot(bp.blockNum - 1)
+}
+
+// announceTipToNewPeers tells every peer that does not have an announcer yet
+// where the chain is, so a node that has been away or that just started finds
+// out what it missed instead of waiting for the other side to produce.
+func (bp *blockProducer) announceTipToNewPeers() {
+	header, hash, ok := bp.bestKnownTip()
+	if !ok {
+		return
+	}
+
+	now := time.Now()
+	var fresh []*peer.Peer
+	for _, p := range bp.net.GetAllPeers() {
+		if p.BAnnouncer != nil {
+			continue
+		}
+		// Mismo-compensacion: un par al que no se le puede abrir el stream se
+		// reintenta cada timeslot, y cada intento abre y abandona otro stream.
+		if wait, ok := bp.announceBackoff[p.Address.String()]; ok && now.Before(wait) {
+			continue
+		}
+		fresh = append(fresh, p)
+	}
+	if len(fresh) == 0 {
+		return
+	}
+
+	for _, p := range fresh {
+		ctx, cancel := context.WithTimeout(bp.ctx, 5*time.Second)
+		err := bp.net.AnnounceBlock(ctx, &header, p)
+		cancel()
+		if err != nil {
+			bp.announceBackoff[p.Address.String()] = now.Add(announceRetryWait)
+			log.Internal.Debug().Err(err).Str("tip", hashToHex(hash)).Msg("could not tell a newly connected peer where the chain is; will wait before trying again")
+			continue
+		}
+		delete(bp.announceBackoff, p.Address.String())
+		log.Internal.Info().Str("tip", hashToHex(hash)).Msg("told a newly connected peer where the chain is")
+	}
+}
+
+// announceWithBackoff tells the peers about a block, but only those that are not
+// still inside the wait that follows a failed attempt.
+func (bp *blockProducer) announceWithBackoff(header *block.Header) {
+	peers := bp.net.GetAllPeers()
+	if len(peers) == 0 {
+		return
+	}
+
+	now := time.Now()
+	var due []*peer.Peer
+	for _, p := range peers {
+		if wait, ok := bp.announceBackoff[p.Address.String()]; ok && now.Before(wait) {
+			continue
+		}
+		due = append(due, p)
+	}
+	if len(due) == 0 {
+		return
+	}
+
+	go func() {
+		for _, p := range due {
+			ctx, cancel := context.WithTimeout(bp.ctx, 5*time.Second)
+			err := bp.net.AnnounceBlock(ctx, header, p)
+			cancel()
+			if err != nil {
+				bp.announceBackoff[p.Address.String()] = time.Now().Add(announceRetryWait)
+				log.Internal.Debug().Err(err).Str("peer", p.Address.String()).Msg("could not announce the block to a peer; will wait before trying again")
+				continue
+			}
+			delete(bp.announceBackoff, p.Address.String())
+		}
+	}()
 }
