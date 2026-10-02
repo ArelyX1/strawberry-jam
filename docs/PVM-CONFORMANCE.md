@@ -485,48 +485,58 @@ Y dos fallos propios de esta sesion, por si quedan:
   de log en un par de minutos y lleno el disco. El reintento espera ahora y lo dice
   una vez por vez.
 
-### Donde se queda, con medidas
+### El modelo: turno fijo y los N nodos a la vez
 
-Medido en una malla de tres, en la etapa en la que se une el tercero:
+Se eligio el modelo seguro: el turno de escribir se reparte entre N validadores y
+los N se levantan a la vez.
 
-| nodo | anuncios recibidos | peticiones de bloque | ejecuciones | backfill |
-|------|------------------:|---------------------:|------------:|---------:|
-| 0    | 2                 | 3                    | 1           | 0        |
-| 1    | 0                 | 2                    | 1           | 0        |
-| 2    | 0                 | 0                    | 0           | 0        |
+No es una preferencia de estilo. En JAM cada timeslot tiene exactamente un autor, y
+si ese autor no esta en marcha ese timeslot no lo escribe nadie. Montar la red de
+uno en uno choca de frente con esa regla, y se notaba: los timeslots de los
+validadores que aun no habian llegado se quedaban sin escribir y una malla asi se
+quedaba parada o se dividia, porque no habia manera de que los nodos se pusieran de
+acuerdo en quien escribia cada hueco. Con el turno repartido y todos en marcha, cada
+timeslot tiene su autor y la cadena avanza sola.
 
-Tres cosas de ahi:
+Por lo mismo el genesis se fecha **en el presente**: las timeslots anteriores a la
+fundacion no las ha escrito nadie, y con el turno repartido cada validator espera a
+que le toque en vez de escribir un pasado que no es suyo.
 
-- **El ultimo nodo no recibe ni un anuncio.** Tiene sus dos conexiones, la malla
-  esta completa, y no le llega nada: ni anuncios, ni peticiones, ni ejecuciones.
-  Con dos nodos el anuncio funciona; al tercero no. El aviso de que un bloque
-  anunciado va por delante de este nodo es lo unico que delata el camino, y sale
-  cero veces.
-- **El backfill no pide nada en ningun nodo.** Cada uno cree que su cadena esta
-  completa, y `BackfillHashes` no ve ningun hueco. O no encuentra por donde entrar,
-  o lo que le falta son cabeceras y no bloques, que es justo lo que `gapHashes` no
-  distingue.
-- **Los dos primeros reciben poco tambien.** Dos anuncios y una ejecucion en un
-  nodo que lleva mas de un minuto en marcha.
+Tres cosas mas que hacia falta:
 
-O sea que el bloqueo no es de ejecucion ni de eleccion de tip: es que **el camino
-de anuncio no llega al nodo nuevo**. Todo lo de catching up, de la raiz de estado y
-del reparto de autoria que se ha estado tocando son sintoma de esto.
+- **El padre de un bloque es el ultimo bloque escrito**, no el del timeslot
+  inmediatamente anterior. Exigir el segundo hacia que la cadena no arrancara
+  nunca: un timeslot se queda sin escribir cuando el validador de su turno no esta,
+  y entre dos bloques escritos puede haber un hueco de varios timeslots sin que la
+  cadena este mala. Esperar un bloque que nadie va a escribir es esperar para
+  siempre.
+- **Sin rafaga de arranque.** Al arrancar, un nodo rellenaba de golpe todas las
+  timeslots que se habia perdido, sin mirar de quien eran. Un nodo que entraba en
+  una malla de cinco escribio veintiocho bloques mientras sus pares escribian tres
+  cada uno, y dos de ellos acabaron en cadenas distintas. El pasado ya lo ha escrito
+  quien le tocaba.
+- **No escribir un timeslot que ya tiene bloque.** Dos nodos que discrepan un
+  momento sobre de quien es el turno escriben los dos, y dos bloques para un
+  timeslot son una bifurcacion de la que la cadena no vuelve.
 
-### La decision que falta
+Comprobado con 3 nodos: la cadena arranca sola, los tres comparten bloque y raiz de
+estado, la malla esta completa, uno se cae, la cadena sigue sin el y al volver se
+sincroniza.
 
-Es un modelo, no un arreglo. En JAM cada timeslot tiene exactamente un autor, y si
-ese autor no esta en marcha ese timeslot no lo escribe nadie. Levantar una red de
-uno en uno choca de frente con esa regla, y las dos salidas tienen un precio:
+### Lo que queda
 
-- **Turno fijo sobre N y levantar los N a la vez.** La malla se monta de una
-  sentada, sin escenario intermedio, y lo que se prueba de verdad es apagar y
-  encender un nodo. El levantamiento escalonado deja de tener sentido.
-- **Turno sobre quien este de verdad conectado.** Es lo que hace que un nodo solo
-  pueda arrancar la cadena, y funciona mientras el conjunto no cambia; durante el
-  levantamiento cambia, y los nodos cuentan distinto mientras dura el cambio. Se
-  salva con la comprobacion de no escribir un timeslot que ya tiene bloque, que
-  convierte el desacuerdo en nada, pero el desacuerdo sigue existiendo.
+Un caso, y es concreto. Despues de que uno se va y vuelve, dos de los que llevan
+mas tiempo corriendo acabam nombrando **el mismo bloque con dos raices de estado
+distintas**. Mismo bloque, dos estados: los dos aceptan la cadena, ejecutan cosas
+distintas y luego la publican igual.
 
-Lo que no se ha probado es la combinacion completa de las dos con el problema de
-anadido resuelto, y es lo que haria falta para cerrar esto.
+Lo que ya se ha descartado: dos validadores que se van turnando la autoria y se
+reconstruyen mutuamente los bloques dan la misma raiz, timeslot a timeslot. Hay un
+test que lo comprueba y pasa. O sea que reconstruir el bloque de otro reproduce el
+estado del autor cuando se va de uno en uno.
+
+Lo que ese test no cubre, y es lo que queda: **el replay de un tramo con huecos**.
+Un nodo que va atrasado ejecuta de una vez todo lo que le ha llegado, y `bp.replay`
+recorre timeslot a timeslot incluyendo los que no tienen bloque. Ese camino no esta
+fijado por ningun test, y es por donde un nodo puede quedarse con un estado que no
+es el del autor.

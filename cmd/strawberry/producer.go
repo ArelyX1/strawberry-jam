@@ -183,22 +183,27 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 
 	slot := tipSlot + 1
 	if current := jamtime.Now().ToTimeslot(); slot < current {
-		// The node was asleep, so the timeslots that passed while it was are
-		// produced now, quickly, to catch the chain up with the clock.
+		// The node was asleep, or is joining a chain that has moved on. It does not
+		// write the timeslots that passed.
+		//
+		// Every timeslot has exactly one author, and on a network the authors of
+		// those timeslots are other nodes that have already written them. Writing
+		// them again is a second block for a timeslot that already has one, and that
+		// is not a near miss: it is how a node joining a mesh wrote twenty-eight
+		// blocks while its peers wrote three each, and how two of them ended up on
+		// different chains with no way back.
+		//
+		// Carrying on from the present is the same path from a different timeslot,
+		// not a different path, so the loop starts either way.
 		log.Internal.Info().
 			Uint64("from", uint64(slot)).
 			Uint64("to", uint64(current)).
-			Msg("catching the chain up with the clock")
-		for ; slot < current; slot++ {
-			bp.produceBlock(slot)
-		}
-		// The burst caught up with the clock, and the node carries on producing
-		// from the timeslot the clock is at.
-		go bp.run(current)
-	} else {
-		bp.waitFor(slot)
-		go bp.run(slot)
+			Msg("the timeslots that passed are not this node's to write; carrying on from the present")
+		slot = current
 	}
+
+	go bp.run(slot)
+
 	return bp
 }
 
@@ -231,7 +236,7 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 		// because there is one author per timeslot, so the chain stopped there.
 		bp.catchUpBehind()
 		switch {
-		case authorFor(slot, bp.authorIndex, bp.authorCount):
+		case authorFor(slot, bp.authorIndex, bp.authorCount) && !bp.timeslotHasABlock(slot):
 			// Not writing and moving on is what stopped the chain. The next
 			// author needs the block this one did not write, waits for a block
 			// nobody is going to produce, and the chain stands still with every
@@ -242,7 +247,7 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 			//
 			// Not writing at all is still better than writing on the wrong
 			// parent, which is a fork rather than a pause.
-			if !bp.catchUpTo(slot-1, "the previous timeslot's block") {
+			if !bp.waitUntilAtTip() {
 				// Hold the timeslot and try again, but slowly and quietly. Retrying
 				// straight away with a line each time wrote hundreds of megabytes
 				// of log in a couple of minutes and filled the disk: the wait
@@ -264,6 +269,45 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 		}
 		slot++
 	}
+}
+
+// waitUntilAtTip waits for this node's state to be at the chain it knows, and
+// reports whether it got there.
+//
+// "The block of the timeslot before this one" is the wrong thing to wait for, and
+// waiting for it is how the chain failed to start. A block names as its parent the
+// last block of the chain, whichever timeslot that was, so what an author has to be
+// level with before it writes is the tip, not the timeslot immediately behind it.
+// The genesis is where a fresh chain begins and no block names the timeslot before
+// it, so demanding one is demanding something that cannot exist.
+func (bp *blockProducer) waitUntilAtTip() bool {
+	deadline := jamtime.Now().ToTime().Add(authorRetryWait * 4)
+	for {
+		header, _, ok := bp.bestKnownTip()
+		if !ok || bp.runtime.Timeslot() >= header.TimeSlotIndex {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		bp.catchUpBehind()
+		time.Sleep(foreignSlotPoll)
+	}
+}
+
+// timeslotHasABlock reports whether some block already names this timeslot.
+//
+// A node writes when the rotation says it is its turn. Two nodes briefly
+// disagreeing about that means both write, and two blocks for one timeslot is a
+// fork the chain does not come back from. One lookup turns that disagreement into
+// nothing at all.
+func (bp *blockProducer) timeslotHasABlock(slot jamtime.Timeslot) bool {
+	for _, leaf := range bp.bs.Leaves() {
+		if leaf.Slot == slot {
+			return true
+		}
+	}
+	return false
 }
 
 // catchUpBehind runs the chain this node is behind on, and reports whether there

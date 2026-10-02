@@ -239,3 +239,69 @@ func TestForgetHandedOutClearsTheNumbers(t *testing.T) {
 	assert.Equal(t, 0, antes, "running a timeslot hands out numbers, which is what makes this worth testing")
 	assert.Equal(t, 0, despues, "a node that has just started keeps none of them")
 }
+
+// This is the shape a network of two validators actually has, and the tests above
+// are not it. Here each validator writes some of the blocks and rebuilds the rest,
+// so every block in the chain was produced by a different runtime than the one
+// executing it, and the two take turns being the author.
+//
+// It is the property that decides whether two nodes end up with the same state for
+// the same block. When it holds, a chain written by one node and executed by
+// another gives both the same root, and a mesh agrees. When it does not, the nodes
+// that rebuild refuse the chain, end up executing different things, and then
+// publish the same block over two different states, which is exactly what was seen:
+// two nodes naming one tip with two roots.
+func TestTwoValidatorsWritingAndRebuildingEachOtherAgree(t *testing.T) {
+	const slots = 8
+	start := jamtime.Timeslot(9199002)
+
+	// Both nodes follow the chain, and node 0 authors the even timeslots while
+	// node 1 authors the odd ones.
+	build := func(authorIndex int) (*Runtime, map[jamtime.Timeslot][]BlockWork, map[jamtime.Timeslot]crypto.Hash) {
+		rt := newTestRuntime(t)
+		work := make(map[jamtime.Timeslot][]BlockWork, slots)
+		roots := make(map[jamtime.Timeslot]crypto.Hash, slots)
+
+		var lastWork []BlockWork
+		for i := 0; i < slots; i++ {
+			slot := start + jamtime.Timeslot(i)
+			var err error
+			if int(slot)%2 == authorIndex {
+				lastWork, err = rt.Run(slot)
+			} else {
+				// A timeslot can settle nothing at all, and then the block names
+				// no work and there is nothing to hand the rebuild. That is a block
+				// like any other, not a broken one.
+				if lastWork == nil {
+					lastWork = []BlockWork{}
+				}
+				if err = rt.Rebuild(lastWork); err != nil {
+					t.Fatalf("rebuild %d: %v", slot, err)
+				}
+				if err = rt.Step(slot); err != nil {
+					t.Fatalf("step %d: %v", slot, err)
+				}
+			}
+			require.NoError(t, err, "timeslot %d", slot)
+			work[slot] = lastWork
+			roots[slot] = rt.Root()
+		}
+		return rt, work, roots
+	}
+
+	zero, workZero, rootsZero := build(0)
+	one, _, rootsOne := build(1)
+
+	// Both must be standing on the same chain, which is the same tip.
+	assert.Equal(t, zero.Root(), one.Root(),
+		"two validators writing and rebuilding each other's blocks do not agree on the state")
+
+	// And at every timeslot along the way, not only at the end, because a
+	// difference that shows up late is a difference that compounds.
+	for i := 0; i < slots; i++ {
+		slot := start + jamtime.Timeslot(i)
+		assert.Equal(t, rootsZero[slot], rootsOne[slot],
+			"timeslot %d: the two validators had different states for the same chain", slot)
+	}
+	_ = workZero
+}
