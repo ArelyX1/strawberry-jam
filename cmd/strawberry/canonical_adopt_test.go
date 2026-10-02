@@ -27,7 +27,7 @@ import (
 func TestAdoptingAPeerBlockNeedsTheBlocksBeforeItNotJustTheTip(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := chain.NewBlockService(db)
+	bs, err := chain.NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	fin := bs.GetLatestFinalized()
@@ -106,7 +106,7 @@ func TestAdoptingAPeerBlockNeedsTheBlocksBeforeItNotJustTheTip(t *testing.T) {
 func TestChainByTimeslotCoversEverySlotBetweenTheParentAndTheTip(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := chain.NewBlockService(db)
+	bs, err := chain.NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	fin := bs.GetLatestFinalized()

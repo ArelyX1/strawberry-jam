@@ -341,7 +341,14 @@ func main() {
 		log.Internal.Fatal().Err(err).Msg("runtime build failed")
 	}
 
-	n, err := node.NewNodeWithStore(ctx, udpAddress, vkeys, state, index, kvStore)
+	// The chain is founded at the timeslot the genesis names, so that every node
+	// of the network founds it at the same moment. A node whose genesis does not
+	// say is on its own and dates its own chain when it starts.
+	var nodeOpts []node.NodeOption
+	if genesis.GenesisTimeslot != 0 {
+		nodeOpts = append(nodeOpts, node.WithGenesisTimeslot(genesis.GenesisTimeslot))
+	}
+	n, err := node.NewNodeWithStore(ctx, udpAddress, vkeys, state, index, kvStore, nodeOpts...)
 	if err != nil {
 		log.Internal.Fatal().
 			Err(err).

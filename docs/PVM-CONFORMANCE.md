@@ -436,48 +436,57 @@ Tres bugs que solo aparecen con mas de dos nodos:
 Comprobado con 3 nodos: los tres comparten bloque, la cadena avanza, y cada nodo
 ve a los otros dos.
 
-### Lo que faltaba para que los nodos se pusieran de acuerdo
+### La causa de fondo: cada nodo fundaba su propia cadena
 
-Cuatro cosas, y la ultima todavia no esta.
+El bloque de genesis se fechaba con `jamtime.Now()` al arrancar, con el razonamiento
+de que un nodo solo no tiene a nadie con quien acordar la fecha. Para una red eso
+significa que el nodo 0 funda su cadena en T0 y el nodo 1 en T1: mismo bloque de
+genesis en la forma, distinto timeslot, distinto hash. Son dos cadenas desde el
+primer bloque, y el genesis es el padre de todo, asi que ningun bloque que uno
+escribiera descendia del genesis del otro. Toda cabecera que llegara por el otro
+lado se rechazaba por no descender del bloque finalizado, y los dos no se ponian de
+acuerdo en nada. No era un problema de red ni de finalizacion: era que no estaban
+en la misma cadena.
 
-**Un hueco no puede saltarse la peticion del bloque.** Al arreglar que una
-cabecera que llega antes que sus ancestres no es un error, el retorno temprano se
-quedo antes de pedir el bloque de esa cabecera. Toda cabecera que llegaba sobre un
-hueco—no pedia nunca su bloque, asi que el nodo se enteraba de una punta que no
-podria alcanzar nunca. La cabecera se guarda y el bloque se pide igual.
+Ahora el genesis lleva `genesisTimeslot` en su fichero, y todos los nodos de una
+red lo leen. El script de malla escribe uno por ejecucion con un momento concreto
+y un par de timeslots de margen, y se lo pasa a todos. Un nodo cuyo genesis no lo
+diga sigue fechando el suyo al arrancar, que es lo que le vale a uno solo.
 
-**Un nodo que acaba de llegar no puede ejecutar hasta tener la cadena entera.**
-`adoptSlot` pedia la cadena completa hasta genesis y un solo hueco hacia fallar
-el recorrido entero, asi que un nodo recien llegado no ejecutaba nada hasta que el
-relleno habia llenado todo: su estado se quedaba quieto mientras la cadena crecia
-por delante, y el tip que publica nombraba un bloque al que su estado nunca habia
-llegado. Ahora toma la parte continua que hay (`AvailableChain`, que para donde se
-acaban los bloques en vez de fallar) y ejecuta esa, cada timeslot, que es lo que le
-deja alcanzar mientras llega el resto.
+Con esto dos nodos comparten bloque **y raiz de estado**.
 
-**La finalizacion por profundidad de generaciones es una suposicion, y hacia
-dañar la cadena.** `checkFinalization` fijaba como finalizado un bloque de seis
-generaciones atras sin comprobar nada. En una cadena bifurcada eso elige una rama,
-y la rama puede perder: el punto final queda en una rama que nadie sigue, toda
-cabecera posterior llega por la que gano, baja hasta el timeslot finalizado,
-encuentra alli otro bloque, y se rechaza por no descender de el. El nodo deja de
-aceptar bloques, la cadena se para, y lo unico que se ve son cabeceras descartadas
-en silencio. Ahora la finalizacion se puede apagar, y el devnet la apaga: no hay
-consenso detras, asi que no hay en que basarse para decidir que rama es la real.
-Sigue encendida por defecto para todo lo demas, que es el comportamiento contra el
-que esta escrito el resto. El quorum es donde vuelve.
+### Lo que faltaba todavia
 
-**Y las cabeceras descartadas se decian.** `RetryPending` soltaba en silencio las
-que no eran de esta cadena, y asi el contador de cabeceras colocadas se quedaba en
-cero mientras la cadena se paraba en silencio, sin decir por que. Ahora se dice.
+**El estado se retrasa un bloque.** Cuando los dos nodos nombran el mismo bloque,
+el que no lo ha ejecutado tiene su estado en el anterior. Y hay un fallo mas
+grave: la cadena puede **pararse**. Un autor que no tiene el bloque del timeslot
+anterior no escribe, que es lo correcto porque escribir sobre un padre viejo
+bifurca la cadena; pero si el bloque anterior no llega, ese timeslot no lo escribe
+nadie, el siguiente autor espera el mismo bloque que no existe, y asi la cadena se
+queda quieta con los nodosrezagados的 muchos timeslots. Evitar la bifurcacion y no
+pararse son las dos cosas que hay que conseguir a la vez, y ahora solo esta la
+primera.
 
-### Lo que sigue sin estar
+El motivo por el que el bloque no llega es la latencia: la peticion CE 128 pide un
+bloque por anuncio, y el bloque lo escribe el autor **durante** su timeslot, asi que
+quien lo espera al principio del suyo todavia no lo tiene. Los anuncios ya se
+mandan en paralelo, que era necesario en cuanto habia mas de un par, pero el bloque
+sigue llegando tarde.
 
-El estado. Los nodos de una malla comparten el bloque y la malla esta completa,
-pero la raiz de estado de cada uno no es la misma: el nodo que no ha ejecutado un
-bloque publishes su cabecera y su estado sigue en el anterior. Y no llega a
-ejecutarlo a tiempo: `adoptSlot` devuelve que el bloque todavia no esta, veces y
-veces, porque la peticion CE 128 que lo trae pide un bloque por anuncio y el
-timeslot es mas corto que lo que tarda en llegar. Ese es el punto a mirar: la
-latencia de traer un bloque, no la eleccion de cadena ni la ejecucion, que ya
-coinciden timeslot a timeslot con los tests.
+### Lo que se ha arreglado por el camino
+
+- **Los anuncios iban en serie.** Cada uno tiene cinco segundos para abrir su
+  stream y completar el handshake, y con dos pares eran diez segundos de un
+  timeslot de seis: el segundo par no se enteraba de nada. Se quedaba conectado
+  sin recibir announcements, sin poder alcanzar una cadena de la que nadie le
+  hablaba. Ahora van en paralelo, con el mapa de esperas protegido.
+- **El padre tras ejecutar.** Al ejecutar se ponia como padre la punta, que puede
+  estar por delante de lo ejecutado, con lo que el bloque siguiente nombraba un
+  padre del futuro. Dos nodos con el mismo estado acababan en bloques distintos.
+  Ahora es el ultimo bloque ejecutado.
+- **Las hojas no se rehacen al reiniciar.** El conjunto de hojas vive en memoria y
+  no se reconstruye, asi que un nodo que vuelve no tiene ninguna y la eleccion de
+  punta no encuentra nada que hacer. Anadir el genesis como hoja sin mas lo hacia
+  peor: el nodo creia que la cadena seguia en el genesis y construia encima.
+  Ahora una cadena nueva arranca con el genesis como cabeza y una reanudada, con su
+  tip.

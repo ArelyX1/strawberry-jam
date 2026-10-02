@@ -19,7 +19,7 @@ import (
 func TestCanonicalChainFollowsParentsNotTimeslots(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := NewBlockService(db)
+	bs, err := NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	fin := bs.GetLatestFinalized()
@@ -85,7 +85,7 @@ func TestCanonicalChainFollowsParentsNotTimeslots(t *testing.T) {
 func TestCanonicalChainRefusesToWalkPastAHole(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := NewBlockService(db)
+	bs, err := NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	fin := bs.GetLatestFinalized()
@@ -104,7 +104,7 @@ func TestCanonicalChainRefusesToWalkPastAHole(t *testing.T) {
 func TestLeavesOnTheSameSlotAreOrderedDeterministically(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := NewBlockService(db)
+	bs, err := NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	fin := bs.GetLatestFinalized()

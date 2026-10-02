@@ -17,6 +17,7 @@ import (
 	p2pnode "github.com/eigerco/strawberry/pkg/network/node"
 	"github.com/eigerco/strawberry/pkg/network/peer"
 	"os"
+	"sync"
 )
 
 // blockProducer builds one block per timeslot out of what the runtime did in it.
@@ -33,9 +34,12 @@ type blockProducer struct {
 	// a handful and the constant is not: rotating over the constant means a
 	// lone node writes one timeslot in five hundred and the chain crawls.
 	authorCount uint16
-	parentHash  crypto.Hash
-	blockNum    uint
-	onBlock     func(crypto.Hash, uint, block.Header)
+	// mu guards announceBackoff, which the announcement goroutines write and the
+	// producer loop reads.
+	mu         sync.Mutex
+	parentHash crypto.Hash
+	blockNum   uint
+	onBlock    func(crypto.Hash, uint, block.Header)
 	// net is the network node, so a block this node writes can be told to the
 	// others. nil when there is no network, which is the case in tests.
 	net *p2pnode.Node
@@ -103,12 +107,27 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 	// placed there.
 	bp.runtime.AlignToGenesis(genesisHeader.TimeSlotIndex)
 
+	// The genesis is the head of the chain only while nothing is built on it. The
+	// leaf set is in memory and is not rebuilt on a restart, so a resumed node
+	// would otherwise come up with no leaves at all and tip choice would find
+	// nothing to do. Adding the genesis there unconditionally was worse than
+	// adding nothing: the resumed node then believed the chain was still at
+	// genesis and built its next block on top of it.
+	//
+
 	// The tip is the last block this node produced, and it is the point the chain
 	// is at. The blocks are indexed by timeslot on the way, because every one of
 	// them carries the work its timeslot ran and a claim about the state that has
 	// to be checked during the replay.
 	blocks := map[jamtime.Timeslot]block.Block{}
 	tip, tipHash, found := bp.findTip(blocks)
+	if !found {
+		// Nothing to resume, so the chain is at the block it was founded at and
+		// that is its head. The leaf set is what tip choice and executing a peer's
+		// block both start from, and with it empty the node finds nothing to do
+		// and sits still. A resumed node gets its real head further down instead.
+		bs.AddLeaf(genesisHash, genesisHeader.TimeSlotIndex)
+	}
 
 	// A chain that has not produced a block yet is at its genesis, and the genesis
 	// is not a claim about any state: it is where the state starts.
@@ -140,6 +159,10 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 		}
 		bp.parentHash = tipHash
 		bp.blockNum = uint(tipSlot-genesisHeader.TimeSlotIndex) + 1
+		// The chain this node is actually on: its tip is the head, not the
+		// genesis it was founded at.
+		bs.ResetLeaves()
+		bs.AddLeaf(tipHash, tipSlot)
 		log.Internal.Info().
 			Str("hash", hashToHex(tipHash)).
 			Str("stateRoot", hashToHex(runtime.Root())).
@@ -176,23 +199,68 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 }
 
 // run produces a block in the timeslots this validator authors, and executes the
-// ones another validator authored, following the clock.
+// ones another validator wrote, following the clock.
 //
 // A timeslot has exactly one author, this node's index modulo the number of
 // validators. Without that rule every validator wrote a block in every timeslot,
 // and since two blocks for one slot are a fork and not a merge, the nodes spent
-// the whole run disagreeing while each of them was behaving perfectly. The
-// height still matched, which is what made it look like a network that worked:
-// the nodes agreed on how far the chain went and on nothing else.
+// the whole run disagreeing while each of them was behaving perfectly.
+//
+// Before writing, the node waits for the block of the timeslot before its own.
+// The author of a timeslot writes it while that timeslot runs, so at the start of
+// a timeslot the block that timeslot is about to name does not exist yet, and a
+// node that wrote anyway would build on the block it had, which is the one before
+// that. Two nodes then each hold a block for the same timeslot and the chain
+// splits, and no amount of syncing afterwards puts it back together. Not writing
+// is much better than writing on the wrong parent.
 func (bp *blockProducer) run(slot jamtime.Timeslot) {
 	for {
 		bp.waitFor(slot)
-		if authorFor(slot, bp.authorIndex, bp.authorCount) {
-			bp.produceBlock(slot)
-		} else {
+		switch {
+		case authorFor(slot, bp.authorIndex, bp.authorCount):
+			if bp.catchUpTo(slot-1, "the previous timeslot's block") {
+				bp.produceBlock(slot)
+			} else {
+				log.Internal.Warn().Uint64("slot", uint64(slot)).
+					Msg("not writing this timeslot: the block it has to build on has not arrived")
+			}
+		default:
 			bp.runForeignSlot(slot)
 		}
 		slot++
+	}
+}
+
+// catchUpTo executes the chain up to and including the given timeslot, waiting up
+// to the end of the timeslot after that one plus a grace period. It reports
+// whether the state got there.
+func (bp *blockProducer) catchUpTo(target jamtime.Timeslot, what string) bool {
+	if bp.runtime.Timeslot() >= target {
+		return true
+	}
+	// The block for the timeslot being waited on is written while that timeslot
+	// runs, so the wait has to reach the end of the timeslot after it. Stopping
+	// earlier is what left nodes permanently a block behind: they were waiting
+	// for something that had not been written yet, on a schedule that guaranteed
+	// they would stop looking before it appeared.
+	deadline := jamtime.FromTimeslot(target + 2).ToTime().Add(foreignSlotGrace)
+	said := ""
+	for {
+		ok, why := bp.executeUpTo(target)
+		if ok {
+			return true
+		}
+		if said == "" {
+			said = why
+			log.Internal.Debug().Uint64("slot", uint64(target)).
+				Msg("cannot get to this timeslot yet: " + why)
+		}
+		if !time.Now().Before(deadline) {
+			log.Internal.Debug().Uint64("slot", uint64(target)).
+				Msg("gave up waiting for " + what)
+			return false
+		}
+		time.Sleep(foreignSlotPoll)
 	}
 }
 
@@ -213,32 +281,13 @@ func authorFor(slot jamtime.Timeslot, validatorIndex, authorCount uint16) bool {
 }
 
 // runForeignSlot executes the block another validator wrote for this timeslot.
-//
-// The wait has to reach the end of the timeslot. The author writes its block
-// while the slot is running, so a node that gave up part way through the slot it
-// was waiting in always timed out, and then sat one block behind for as long as
-// it ran: it was waiting for something that had not been written yet, on a
-// schedule that guaranteed it would stop looking before it appeared.
 func (bp *blockProducer) runForeignSlot(slot jamtime.Timeslot) {
-	// The block should be there once the timeslot is over. The grace covers the
-	// author writing it at the very end, plus the announcement landing.
-	deadline := jamtime.FromTimeslot(slot + 1).ToTime().Add(foreignSlotGrace)
-	for {
-		if bp.adoptSlot(slot) {
-			return
-		}
-		if !time.Now().Before(deadline) {
-			log.Internal.Debug().Uint64("slot", uint64(slot)).
-				Msg("the block for this timeslot never arrived; staying where this node is")
-			return
-		}
-		time.Sleep(foreignSlotPoll)
-	}
+	bp.catchUpTo(slot, "the block this timeslot's author wrote")
 }
 
-// adoptSlot executes as much of the chain as this node can actually walk, up to
-// and including the given timeslot. It reports whether the timeslot is now
-// executed.
+// executeUpTo runs as much of the chain as this node can actually walk, up to and
+// including the given timeslot, and reports whether it got there along with why
+// not when it did not.
 //
 // It takes the unbroken run of blocks that ends at the tip rather than the whole
 // chain. A node that has only just joined is missing something below almost every
@@ -246,35 +295,34 @@ func (bp *blockProducer) runForeignSlot(slot jamtime.Timeslot) {
 // anything means it executes nothing at all until the backfill has filled the lot:
 // its state stands still while the chain grows past it, and the tip it publishes
 // keeps naming a block its state has never reached. Executing the part that is
-// there, every timeslot, is what lets it catch up while the rest arrives.
-func (bp *blockProducer) adoptSlot(slot jamtime.Timeslot) bool {
+// there is what lets it catch up while the rest arrives.
+func (bp *blockProducer) executeUpTo(slot jamtime.Timeslot) (bool, string) {
 	_, leaf, ok := bp.bestKnownTip()
 	if !ok {
-		return false
+		return false, "no tip known yet"
 	}
 	tipHeader, err := bp.bs.Store.GetHeader(leaf)
-	if err != nil || tipHeader.TimeSlotIndex < slot {
-		return false
+	if err != nil {
+		return false, "the tip header is not in the store"
+	}
+	if tipHeader.TimeSlotIndex < slot {
+		return false, fmt.Sprintf("the tip is at slot %d and this timeslot is %d", tipHeader.TimeSlotIndex, slot)
 	}
 
 	available := bp.bs.AvailableChain(leaf, 0)
 	if len(available) == 0 {
-		return false
+		return false, "not one block of the chain is in the store yet"
 	}
 	last := available[len(available)-1].Header
 	if last.TimeSlotIndex < slot {
-		return false
+		return false, fmt.Sprintf("the blocks run out at slot %d and this timeslot is %d", last.TimeSlotIndex, slot)
 	}
 
-	// Already executed: the state stands at or past this timeslot.
 	if bp.runtime.Timeslot() >= slot {
 		bp.parentHash = leaf
-		return true
+		return true, ""
 	}
 
-	// Only the blocks this node has not run yet. The walk stops at the tip, which
-	// may be ahead of the timeslot being adopted; running past the timeslot would
-	// put the state somewhere the node was never asked to be.
 	bySlot := make(map[jamtime.Timeslot]block.Block, len(available))
 	through := bp.runtime.Timeslot()
 	for _, b := range available {
@@ -290,17 +338,27 @@ func (bp *blockProducer) adoptSlot(slot jamtime.Timeslot) bool {
 		}
 	}
 	if len(bySlot) == 0 {
-		return false
+		return false, fmt.Sprintf("the run of blocks starts at slot %d and the state stands at %d",
+			available[0].Header.TimeSlotIndex, bp.runtime.Timeslot())
 	}
 
 	if _, err := bp.replay(bp.runtime.Timeslot()+1, through, bySlot); err != nil {
-		log.Internal.Debug().Err(err).Uint64("slot", uint64(slot)).
-			Msg("could not execute the block this timeslot's author wrote")
-		return false
+		return false, "replaying it did not rebuild the state: " + err.Error()
 	}
-	bp.parentHash = leaf
+
+	// The parent is the last block that was run, not the tip. The tip can be
+	// several blocks ahead of the state, and building on it would name a parent
+	// from the future: the block would not sit on the chain the node has, and the
+	// next node to look at it would find a parent whose state does not match the
+	// one the block claims. It is also what made two nodes that had reached the
+	// same state still be on different blocks.
+	lastRun, herr := bySlot[through].Header.Hash()
+	if herr != nil {
+		return false, "the block it just ran does not hash"
+	}
+	bp.parentHash = lastRun
 	bp.blockNum = uint(through)
-	return true
+	return true, ""
 }
 
 // waitFor sleeps until the timeslot begins.
@@ -651,18 +709,27 @@ func (bp *blockProducer) announceTipToNewPeers() {
 		return
 	}
 
+	var wg sync.WaitGroup
 	for _, p := range fresh {
-		ctx, cancel := context.WithTimeout(bp.ctx, 5*time.Second)
-		err := bp.net.AnnounceBlock(ctx, &header, p)
-		cancel()
-		if err != nil {
-			bp.announceBackoff[p.Address.String()] = now.Add(announceRetryWait)
-			log.Internal.Debug().Err(err).Str("tip", hashToHex(hash)).Msg("could not tell a newly connected peer where the chain is; will wait before trying again")
-			continue
-		}
-		delete(bp.announceBackoff, p.Address.String())
-		log.Internal.Info().Str("tip", hashToHex(hash)).Msg("told a newly connected peer where the chain is")
+		wg.Add(1)
+		go func(p *peer.Peer) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(bp.ctx, 5*time.Second)
+			err := bp.net.AnnounceBlock(ctx, &header, p)
+			cancel()
+			bp.mu.Lock()
+			defer bp.mu.Unlock()
+			if err != nil {
+				bp.announceBackoff[p.Address.String()] = now.Add(announceRetryWait)
+				log.Internal.Debug().Err(err).Str("tip", hashToHex(hash)).
+					Msg("could not tell a newly connected peer where the chain is; will wait before trying again")
+				return
+			}
+			delete(bp.announceBackoff, p.Address.String())
+			log.Internal.Info().Str("tip", hashToHex(hash)).Msg("told a newly connected peer where the chain is")
+		}(p)
 	}
+	go wg.Wait()
 }
 
 // announceWithBackoff tells the peers about a block, but only those that are not
@@ -685,17 +752,30 @@ func (bp *blockProducer) announceWithBackoff(header *block.Header) {
 		return
 	}
 
-	go func() {
-		for _, p := range due {
+	// One at a time is not good enough once there is more than one peer. Each
+	// announcement to a peer that has no announcer yet has to open a stream and
+	// wait for its handshake, and that is allowed five seconds. With two peers
+	// that is ten seconds of a six second timeslot, so the second peer was never
+	// told about anything: it sat connected, receiving nothing, and could not
+	// catch up with a chain it was never being told about. They go in parallel.
+	var wg sync.WaitGroup
+	for _, p := range due {
+		wg.Add(1)
+		go func(p *peer.Peer) {
+			defer wg.Done()
 			ctx, cancel := context.WithTimeout(bp.ctx, 5*time.Second)
 			err := bp.net.AnnounceBlock(ctx, header, p)
 			cancel()
+			bp.mu.Lock()
+			defer bp.mu.Unlock()
 			if err != nil {
 				bp.announceBackoff[p.Address.String()] = time.Now().Add(announceRetryWait)
-				log.Internal.Debug().Err(err).Str("peer", p.Address.String()).Msg("could not announce the block to a peer; will wait before trying again")
-				continue
+				log.Internal.Debug().Err(err).Str("peer", p.Address.String()).
+					Msg("could not announce the block to a peer; will wait before trying again")
+				return
 			}
 			delete(bp.announceBackoff, p.Address.String())
-		}
-	}()
+		}(p)
+	}
+	go wg.Wait()
 }

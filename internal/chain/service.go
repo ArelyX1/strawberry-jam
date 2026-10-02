@@ -33,6 +33,9 @@ type BlockService struct {
 	// finalization says whether blocks may be recorded as finalized without
 	// anyone having agreed on them. See SetFinalization.
 	finalization bool
+	// genesisAt is the timeslot a chain not yet on disk is founded at. Zero means
+	// the moment the node starts, which only a node on its own can afford.
+	genesisAt jamtime.Timeslot
 }
 
 // LatestFinalized represents the latest finalized block in the chain.
@@ -55,7 +58,16 @@ type Leaf struct {
 // - Empty leaf block set
 // - Persistent block storage using PebbleDB
 // - Genesis block as the latest finalized block
-func NewBlockService(kvStore *pebble.KVStore) (*BlockService, error) {
+// NewBlockService opens the chain.
+//
+// genesisAt is the timeslot a chain that is not on disk yet is founded at. Every
+// node has to be given the same one, because the genesis block is the first thing
+// two nodes have to agree on: it is the parent of everything, and two nodes that
+// founded theirs at different moments are on two different chains from the first
+// block and nothing either of them writes will ever be accepted by the other.
+// Pass zero to have it dated at the moment the node starts, which is fine for a
+// node on its own and wrong for a network.
+func NewBlockService(kvStore *pebble.KVStore, genesisAt jamtime.Timeslot) (*BlockService, error) {
 	chain := store.NewChain(kvStore)
 	bs := &BlockService{
 		Store:       chain,
@@ -65,6 +77,8 @@ func NewBlockService(kvStore *pebble.KVStore) (*BlockService, error) {
 		// anyone having agreed on the block is a decision it has no basis to make.
 		finalization: true,
 	}
+	bs.genesisAt = genesisAt
+
 	// Initialize by finding leaves and finalized block
 	if err := bs.initializeState(); err != nil {
 		// Log error but continue - we can recover state as we process blocks
@@ -98,12 +112,20 @@ func (bs *BlockService) initializeState() error {
 		return nil
 	}
 
-	// A dev chain is dated when it is started. JAM's genesis sits at the beginning
-	// of JAM time, which is millions of timeslots ago, and a node that started
-	// there would have to produce every timeslot since to reach the present.
+	// A dev chain is dated when it is told to be, which is to say the same moment
+	// for every node on the network. JAM's genesis sits at the beginning of JAM
+	// time, which is millions of timeslots ago, and a node that started there
+	// would have to produce every timeslot since to reach the present, so a
+	// network passes the timeslot it was founded at instead of taking the moment
+	// it happens to be started at. A node on its own has nobody to agree with and
+	// dates its own.
+	at := bs.genesisAt
+	if at == 0 {
+		at = jamtime.Now().ToTimeslot()
+	}
 	genesisHeader := block.Header{
 		ParentHash:       GenesisParent,
-		TimeSlotIndex:    jamtime.Now().ToTimeslot(),
+		TimeSlotIndex:    at,
 		BlockAuthorIndex: 0,
 	}
 	hash, err := genesisHeader.Hash()
@@ -271,6 +293,18 @@ func (bs *BlockService) UpdateLatestFinalized(hash crypto.Hash, slot jamtime.Tim
 	defer bs.mu.Unlock()
 	bs.LatestFinalized = LatestFinalized{Hash: hash, TimeSlotIndex: slot}
 	network.LogBlockEvent(time.Now(), "finalizing", hash, slot.ToEpoch(), slot)
+}
+
+// ResetLeaves empties the set of heads the node knows about.
+//
+// The set is in memory and is not rebuilt on a restart, so a node that comes back
+// has to say where its chain is again. Getting this wrong is not a small thing:
+// tip choice and executing a peer's block both start from the leaves, so a stale
+// set has the node building on a block the chain left long ago.
+func (bs *BlockService) ResetLeaves() {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.KnownLeaves = make(map[crypto.Hash]jamtime.Timeslot)
 }
 
 // AddLeaf adds a block to the set of known leaves.

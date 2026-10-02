@@ -16,7 +16,7 @@ func TestCheckFinalization(t *testing.T) {
 	require.NoError(t, err)
 
 	// Create a new BlockService
-	bs, err := NewBlockService(db)
+	bs, err := NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	// Create a chain of 7 headers (0->1->2->3->4->5->6)

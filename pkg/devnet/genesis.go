@@ -5,6 +5,8 @@
 package devnet
 
 import (
+	"github.com/eigerco/strawberry/internal/jamtime"
+
 	"bytes"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -26,10 +28,21 @@ type Genesis struct {
 	Description string `json:"description"`
 	// GeneratedFrom records which genesis this was derived from, so a state
 	// root can always be traced back to an economy definition.
-	GeneratedFrom string      `json:"generatedFrom"`
-	TimeslotSecs  int         `json:"timeslotSecs"`
-	Service       *ServiceCfg `json:"service"`
-	EVM           *EVMCfg     `json:"evm"`
+	GeneratedFrom string `json:"generatedFrom"`
+	TimeslotSecs  int    `json:"timeslotSecs"`
+	// GenesisTimeslot is the timeslot the chain is founded at, and every node
+	// that joins has to found it at the same one.
+	//
+	// Dating the genesis when the node starts is what made a network of nodes
+	// impossible: two nodes started seconds apart founded two different chains,
+	// with different genesis blocks at different timeslots and so different
+	// hashes. No block one of them wrote could descend from the other's genesis,
+	// so every header the other sent was rejected as not being a descendant of
+	// the finalized block, and the two never agreed on anything. The chain's
+	// first block has to be the same block for everybody.
+	GenesisTimeslot jamtime.Timeslot `json:"genesisTimeslot"`
+	Service         *ServiceCfg      `json:"service"`
+	EVM             *EVMCfg          `json:"evm"`
 	// Extra only exists so a test can prove an unknown genesis field is a load
 	// error rather than something silently dropped.
 	Extra int `json:"extra,omitempty"`

@@ -20,6 +20,7 @@ import (
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/d3l"
 	"github.com/eigerco/strawberry/internal/guaranteeing"
+	"github.com/eigerco/strawberry/internal/jamtime"
 	"github.com/eigerco/strawberry/internal/refine"
 	"github.com/eigerco/strawberry/internal/state"
 	"github.com/eigerco/strawberry/internal/store"
@@ -91,7 +92,26 @@ func NewNode(nodeCtx context.Context, listenAddr *net.UDPAddr, keys validator.Va
 // NewNodeWithStore is [NewNode] over a caller supplied key-value store. A dev
 // node passes a store rooted in a directory so the chain and the state trie are
 // not lost on every restart.
-func NewNodeWithStore(nodeCtx context.Context, listenAddr *net.UDPAddr, keys validator.ValidatorKeys, state state.State, validatorIdx uint16, kvStore *pebble.KVStore) (*Node, error) {
+// NodeOption is something a node is set up with that used to be a parameter and
+// grew past its place in the signature.
+type NodeOption func(*nodeOptions)
+
+type nodeOptions struct {
+	genesisAt jamtime.Timeslot
+}
+
+// WithGenesisTimeslot sets the timeslot a chain not yet on disk is founded at.
+//
+// It has to be the same on every node of a network. The genesis block is the
+// parent of everything, so two nodes that founded theirs at different moments are
+// on two different chains from the very first block, and neither will ever accept
+// a block from the other. Left unset, a chain is dated at the moment the node
+// starts, which is all a node on its own needs.
+func WithGenesisTimeslot(at jamtime.Timeslot) NodeOption {
+	return func(o *nodeOptions) { o.genesisAt = at }
+}
+
+func NewNodeWithStore(nodeCtx context.Context, listenAddr *net.UDPAddr, keys validator.ValidatorKeys, state state.State, validatorIdx uint16, kvStore *pebble.KVStore, opts ...NodeOption) (*Node, error) {
 	availabilityStore := store.NewShards(kvStore)
 	nodeCtx, cancel := context.WithCancel(nodeCtx)
 	peerSet := peer.NewPeerSet()
@@ -128,8 +148,13 @@ func NewNodeWithStore(nodeCtx context.Context, listenAddr *net.UDPAddr, keys val
 		MaxBuilderSlots: 20,
 	}
 
+	options := nodeOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	// Create block service
-	bs, err := chain.NewBlockService(kvStore)
+	bs, err := chain.NewBlockService(kvStore, options.genesisAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create block service: %w", err)
 	}

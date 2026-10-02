@@ -17,7 +17,7 @@ func newTestService(t *testing.T) *BlockService {
 	t.Helper()
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := NewBlockService(db)
+	bs, err := NewBlockService(db, 0)
 	require.NoError(t, err)
 	return bs
 }
@@ -162,7 +162,7 @@ func TestIsMissingHeaderIsAboutAncestorsOnly(t *testing.T) {
 func TestBackfillAsksForBlocksUnderKnownHeaders(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := NewBlockService(db)
+	bs, err := NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	fin := bs.GetLatestFinalized()
@@ -197,7 +197,7 @@ func TestBackfillAsksForBlocksUnderKnownHeaders(t *testing.T) {
 func TestBackfillStopsAtTheFirstBlockItHas(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)
-	bs, err := NewBlockService(db)
+	bs, err := NewBlockService(db, 0)
 	require.NoError(t, err)
 
 	fin := bs.GetLatestFinalized()

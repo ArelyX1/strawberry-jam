@@ -41,6 +41,12 @@ RUN="/tmp/strawberry-mesh"
 # igual, leyendo el mismo fichero; lo que cambia de una ejecucion a otra es
 # cuantos hay, no lo que cada nodo cree que hay.
 VALFILE="$RUN/validators-$N.json"
+# El genesis se comparte y se fecha una sola vez para toda la malla. El bloque de
+# genesis es el padre de todo, asi que dos nodos que lo fundaran en momentos
+# distintos estarian en dos cadenas distintas desde el primer bloque, y ninguno
+# aceptaria nunca un bloque del otro. Por eso el fichero lleva un
+# genesisTimeslot y todos los nodos de la ejecucion leen el mismo.
+GENFILE="$RUN/genesis-$N.json"
 PIDS=()
 NODES=()
 
@@ -53,7 +59,25 @@ if ! GOMAXPROCS=1 go run ./scripts/gen-validators -out "$VALFILE" -count "$N" -p
   echo "no se pudo generar el fichero de validadores para $N nodos" >&2
   exit 1
 fi
+rm -f "$GENFILE"
+python3 - "$GENFILE" "$N" <<'PYGEN'
+import datetime, json, sys, time
+out, n = sys.argv[1], sys.argv[2]
+g = json.load(open("genesis/chain-dev.json"))
+# Un momento concreto, el mismo para todos los nodos de la ejecucion, y un poco
+# antes del presente para que al levantarse tengan timeslots que producir en
+# lugar de tener que alcanzar al presente desde el genesis.
+#
+# El timeslot no es la cuenta de segundos desde epoch: la cadena cuenta desde su
+# propia epoca, asi que hay que restarla antes de dividir. Sin esa resta el
+# genesis queda fechado decades en el futuro y cada nodo se duerme hasta ahi.
+epoch = int(datetime.datetime(2025, 1, 1, 12, 0, 0,
+                              tzinfo=datetime.timezone.utc).timestamp())
+g["genesisTimeslot"] = (int(time.time()) - epoch) // g["timeslotSecs"] - 3
+json.dump(g, open(out, "w"), indent=4)
+PYGEN
 echo "fichero de validadores: $VALFILE ($N entradas)"
+echo "genesis compartido:    $GENFILE"
 
 q() { # q <rpcPort> <method> [params]
   curl -s -m 4 -X POST -H 'content-type: application/json' \
@@ -87,6 +111,7 @@ arranca() { # arranca <indice>
   # lo mismo que un nodo en una malla de tres.
   GOMAXPROCS=1 "$BIN" --name "mesh-$i" --validator-index "$i" \
     --validators-file "$VALFILE" --author-count "$N" --full-mesh \
+    --genesis "$GENFILE" \
     --rpc-port "$rpc" --port "$net" --data-dir "$dir" \
     > "$RUN/n$i.log" 2>&1 &
   PIDS+=("$!")
