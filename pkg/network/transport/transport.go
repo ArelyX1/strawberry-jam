@@ -17,6 +17,25 @@ import (
 // MaxIdleTimeout defines the maximum duration a connection can be idle before timing out
 const MaxIdleTimeout = 30 * time.Minute
 
+// InitialPacketSize is the largest packet a connection sends before it has measured
+// the path.
+//
+// QUIC requires an Initial packet to be at least 1200 bytes so that a middlebox
+// cannot tell it from a middlebox, and quic-go's own default is 1280. That default
+// does not fit on every path a node can sit behind: 1280 bytes of UDP plus 28 bytes
+// of IP and UDP headers is 1308 bytes on the wire, and the socket sets the don't
+// fragment bit, so on any path whose MTU is under that the kernel refuses to send
+// the packet at all. Nothing arrives, the handshake runs out its idle timeout, and
+// the node reports the peer as unreachable while the peer is right there.
+//
+// A Tailscale interface is exactly such a path: it is 1280 bytes to survive any
+// link underneath it. The two nodes were on one network, reachable both ways by
+// every payload size, and could not talk, because quic-go's first packet was 28
+// bytes too big for the tunnel. The number below is the smallest legal one and
+// fits everywhere, and path MTU discovery raises it again once the handshake is
+// over and the real path size is known.
+const InitialPacketSize = 1200
+
 // ConnectionHandler defines how new connections are processed at the protocol level.
 // This interface separates transport-level connection handling from protocol-specific
 // behaviors.
@@ -111,8 +130,9 @@ func (t *Transport) Start() error {
 	}
 
 	listener, err := quic.ListenAddr(t.config.ListenAddr.AddrPort().String(), tlsConfig, &quic.Config{
-		EnableDatagrams: true,
-		MaxIdleTimeout:  MaxIdleTimeout,
+		EnableDatagrams:   true,
+		MaxIdleTimeout:    MaxIdleTimeout,
+		InitialPacketSize: InitialPacketSize,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrListenerFailed, err)
@@ -150,8 +170,9 @@ func (t *Transport) Connect(addr *net.UDPAddr) error {
 	}
 
 	quicConn, err := quic.DialAddr(t.ctx, addr.AddrPort().String(), tlsConf, &quic.Config{
-		EnableDatagrams: true,
-		MaxIdleTimeout:  MaxIdleTimeout,
+		EnableDatagrams:   true,
+		MaxIdleTimeout:    MaxIdleTimeout,
+		InitialPacketSize: InitialPacketSize,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrDialFailed, err)
