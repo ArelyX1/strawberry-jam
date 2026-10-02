@@ -169,3 +169,73 @@ func TestAdoptingOneBlockMidRunKeepsTheState(t *testing.T) {
 			"timeslot %d: adopting one block in the middle changed the state", slot)
 	}
 }
+
+// Rebuilding a block that a peer wrote is not a restart, and the node must not
+// treat it as one.
+//
+// The numbers a node has handed out are its own bookkeeping, and they decide
+// which nonce the next item gets, so they end up in the state. A node that is
+// running and adopts one block still has the right ones: they describe the chain
+// it is already on. Clearing them at the end of every rebuild meant a node that
+// had just adopted a block started counting nonces from nothing while its peers
+// carried on counting, so the two wrote different items onto a chain they all
+// agreed on, and the state roots of one block came out different on different
+// nodes.
+func TestAdoptingABlockDoesNotForgetTheNumbersTheNodeHandedOut(t *testing.T) {
+	const slots = 8
+	start := jamtime.Timeslot(9197000)
+
+	author := newTestRuntime(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	steps := make([]step, 0, slots)
+	for i := 0; i < slots; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	// The follower runs some timeslots and rebuilds the rest, ending every
+	// rebuild the way a node adopting blocks from peers does.
+	follower := newTestRuntime(t)
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		if i%2 == 0 {
+			_, err := follower.Run(slot)
+			require.NoError(t, err)
+		} else {
+			before := len(follower.issued)
+			require.NoError(t, follower.Rebuild(s.work))
+			require.NoError(t, follower.Step(slot))
+			follower.FinishRebuild()
+			assert.Equal(t, before, len(follower.issued),
+				"timeslot %d: adopting a block forgot the numbers this node had handed out", slot)
+		}
+		assert.Equal(t, s.root, follower.Root(),
+			"timeslot %d: the state came out different from the one that was written", slot)
+	}
+}
+
+// And a node that has just started does forget them, because its state comes out
+// of the blocks it replays and those numbers are part of that state.
+func TestForgetHandedOutClearsTheNumbers(t *testing.T) {
+	rt := newTestRuntime(t)
+	const slots = 3
+	for i := 0; i < slots; i++ {
+		_, err := rt.Run(jamtime.Timeslot(9198000 + jamtime.Timeslot(i)))
+		require.NoError(t, err)
+	}
+	rt.mu.Lock()
+	antes := len(rt.issued)
+	rt.mu.Unlock()
+
+	rt.ForgetHandedOut()
+	rt.mu.RLock()
+	despues := len(rt.issued)
+	rt.mu.RUnlock()
+
+	assert.Equal(t, 0, antes, "running a timeslot hands out numbers, which is what makes this worth testing")
+	assert.Equal(t, 0, despues, "a node that has just started keeps none of them")
+}

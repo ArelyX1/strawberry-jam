@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/eigerco/strawberry/internal/block"
-	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/crypto/ed25519"
 	"github.com/eigerco/strawberry/internal/safrole"
@@ -117,26 +116,35 @@ func (f FullValidatorInfo) ToMetadata() ([]byte, error) {
 
 func main() {
 	var (
-		configFile     string
-		validatorIndex int
-		authorCount    int
-		chainSpec      string
-		isValidator    bool
-		nodeName       string
-		telemetryURL   string
-		portOverride   int
-		rpcPort        int
-		help           bool
-		genesisPath    string
-		dataDir        string
-		bridgeWallet   string
+		configFile         string
+		validatorIndex     int
+		authorCount        int
+		flagValidatorCount int
+		validatorsFile     string
+		fullMesh           bool
+		chainSpec          string
+		isValidator        bool
+		nodeName           string
+		telemetryURL       string
+		portOverride       int
+		rpcPort            int
+		help               bool
+		genesisPath        string
+		dataDir            string
+		bridgeWallet       string
 	)
 
 	flag.StringVar(&configFile, "config", "appconfig.json", "path to config file")
 	flag.IntVar(&validatorIndex, "validator-index", -1,
 		"which validator from test_validators.json this process is, overriding the config file")
 	flag.IntVar(&authorCount, "author-count", 0,
-		"how many validators the authorship turn rotates over; 1 makes a lone node write every timeslot, 0 uses the chain's validator count")
+		"how many validators the authorship turn rotates over; 1 makes a lone node write every timeslot, 0 follows the size of the validator set")
+	flag.IntVar(&flagValidatorCount, "validator-count", 0,
+		"how many validators the network has; 0 takes them from the validator file")
+	flag.StringVar(&validatorsFile, "validators-file", "test_validators.json",
+		"the validator file: who exists and where to reach them")
+	flag.BoolVar(&fullMesh, "full-mesh", false,
+		"connect to every configured validator, not only the grid neighbours")
 	flag.StringVar(&chainSpec, "chain", "dev", "chain specification")
 	flag.BoolVar(&isValidator, "validator", false, "run as validator")
 	flag.StringVar(&nodeName, "name", "Strawberry-Node", "node name")
@@ -190,7 +198,7 @@ func main() {
 
 	index := uint16(appConfig.ValidatorIndex)
 
-	vs, err := loadFullValidatorInfos("test_validators.json")
+	vs, err := loadFullValidatorInfos(validatorsFile)
 	if err != nil {
 		log.Internal.Fatal().
 			Err(err).
@@ -282,9 +290,34 @@ func main() {
 		log.Internal.Fatal().Str("genesis", genesisPath).Err(err).Msg("genesis load failed")
 	}
 
-	devValidators, err := devnet.DevValidatorKeys(constants.NumberOfValidators, validatorListenAddrs(vs))
+	// How many validators this network has comes from the validator file, not
+	// from a constant compiled into the binary. The constant is the real chain's
+	// size, which is nothing like the handful of nodes a devnet actually runs, and
+	// taking the validator set from it meant a devnet could only ever be as big
+	// as whatever the build tag said. Adding a node to the file is now all it
+	// takes to add it to the network.
+	validatorCount := len(vs)
+	if flagValidatorCount > 0 {
+		validatorCount = flagValidatorCount
+	}
+	if validatorCount > len(vs) {
+		log.Internal.Fatal().
+			Int("wanted", validatorCount).
+			Int("configured", len(vs)).
+			Msg("more validators were asked for than the validator file has")
+	}
+
+	devValidators, err := devnet.DevValidatorKeys(validatorCount, validatorListenAddrs(vs))
 	if err != nil {
 		log.Internal.Fatal().Err(err).Msg("validator state build failed")
+	}
+
+	// The authorship turn rotates over the validators that are actually here, so
+	// a mesh of N nodes has one author per timeslot out of N. Left at the chain's
+	// own count, or at one, a node writes a timeslot in a thousand or writes every
+	// one of them, and N nodes fork on every slot.
+	if authorCount == 0 && validatorCount > 1 {
+		authorCount = validatorCount
 	}
 
 	kvStore, err := openStore(dataDir)
@@ -337,6 +370,7 @@ func main() {
 			case <-time.After(backfillEvery):
 			}
 		}
+		n.FullMesh = fullMesh
 		backfillLoop(ctx, n, n.BlockService)
 	}()
 
@@ -412,9 +446,14 @@ func validatorListenAddrs(vs []FullValidatorInfo) []string {
 //
 // The first attempt waits: in a local dev setup the other node is usually still
 // starting when this one is ready, and a single attempt would leave the two of
-// them talking to nobody. The backoff stops growing so a peer that comes up
-// late is still picked up, at the cost of a periodic attempt that mostly does
-// nothing, which is fine for two nodes and for a dev machine.
+// them talking to nobody. The backoff stops growing so a peer that comes up late
+// is still picked up, at the cost of a periodic attempt that mostly does
+// nothing, which is fine on a dev machine.
+//
+// Every pass goes through the whole neighbour list rather than stopping once
+// there is a peer: the list is short, the peers already held are skipped, and a
+// node that stopped looking after the first connection would never build a
+// mesh.
 func connectToNeighbours(ctx context.Context, n *node.Node) {
 	delay := 2 * time.Second
 	for {
@@ -424,24 +463,20 @@ func connectToNeighbours(ctx context.Context, n *node.Node) {
 		default:
 		}
 
-		// Solo se marca si no hay ninguno. ConnectToPeer rechaza cuando ya
-		// existe, pero compara por direccion y el par se guarda con el puerto
-		// efimero de la conexion, no con el que se marco: asi que nunca
-		// coincidia, el bucle reconectaba cada 30s y cada reconexion cerraba el
-		// par anterior con su anunciador, dejando a todos los bloques
-		// siguientes con "context canceled" al anunciarse.
+		// Se sigue buscando en cada pasada, no solo mientras no haya ninguno.
+		//
+		// Parar en cuanto hubiera un par valia para dos nodos, donde ese par es el
+		// unico que hace falta, y hacia muy mal para una malla: un nodo que se
+		// conectaba con el primero que encontraba se quedaba ahi para siempre y
+		// nunca marcaba a los demas. Con tres nodos, el segundo solo conocia al
+		// primero y el tercero solo al primero tambien, y los dos no se veian
+		// entre si. Que un vecino falle no es motivo para no intentar el
+		// siguiente, y ConnectToNeighbours ya se salta a quien ya tiene.
+		if err := n.ConnectToNeighbours(); err != nil {
+			log.Internal.Debug().Err(err).Msg("some neighbours are not reachable yet, will retry")
+		}
 		if peers := n.GetAllPeers(); len(peers) > 0 {
 			log.Internal.Info().Int("peers", len(peers)).Msg("connected to neighbour validators")
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(30 * time.Second):
-			}
-			continue
-		}
-
-		if err := n.ConnectToNeighbours(); err != nil {
-			log.Internal.Debug().Err(err).Msg("no neighbours reachable yet, will retry")
 		}
 
 		select {

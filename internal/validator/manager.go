@@ -54,7 +54,48 @@ func (vm *ValidatorManager) GetNeighbors() ([]crypto.ValidatorKey, error) {
 		return nil, err
 	}
 	// With full ValidatorState, this is probably not necessary
+	//
+	// The validator set is a fixed-size array, so when fewer validators are
+	// configured than the chain allows, the tail of it is left as zero keys. The
+	// grid hands those out as neighbours like any other, and dialling one fails
+	// because it has no address to dial. A run with three validators in a chain
+	// that allows six therefore got neighbours that do not exist, which is one
+	// step away from a node that cannot reach the ones that do.
+	return filterOutSelfFromValidators(dropEmpty(all), vm.Keys.EdPub), nil
+}
+
+// GetAllValidators returns every validator that is really configured, this one
+// left out.
+//
+// The grid only makes neighbours of validators that share a row or a column, and
+// a grid is square: with three validators in a chain that allows six the grid is
+// two by two, so the third sits on its own and is only reachable through the
+// first. That is the protocol's definition of a neighbour and it is not
+// something to change, but it does mean the grid is not a mesh, and a local
+// network of a few nodes wants one node in it to be able to reach every other
+// directly rather than through a third.
+func (vm *ValidatorManager) GetAllValidators() ([]crypto.ValidatorKey, error) {
+	all := make([]crypto.ValidatorKey, 0, len(vm.GridMapper.currentValidators))
+	for _, v := range vm.GridMapper.currentValidators {
+		if ed25519.IsEmpty(v.Ed25519) {
+			continue
+		}
+		all = append(all, v)
+	}
 	return filterOutSelfFromValidators(all, vm.Keys.EdPub), nil
+}
+
+// dropEmpty removes the validators that are not really there: an entry of the
+// set that was never filled in is a zero key with no address behind it.
+func dropEmpty(validators []crypto.ValidatorKey) []crypto.ValidatorKey {
+	out := make([]crypto.ValidatorKey, 0, len(validators))
+	for _, v := range validators {
+		if ed25519.IsEmpty(v.Ed25519) {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // IsNeighbor checks if the given validator key represents a neighbor in the grid structure.

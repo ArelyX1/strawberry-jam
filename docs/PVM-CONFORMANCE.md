@@ -384,45 +384,75 @@ Con esto los dos nodos comparten cadena: 36 de 40 muestras con el mismo tip,
 antes 0 de 40.
 
 
-### Lo que falta
+### N nodos, y una malla de verdad
 
-La raiz de estado, y aqui ya no hay ambiguedad posible. Reiniciando los dos nodos
-desde disco, cada uno reproduce su cadena entera desde genesis y los dos
-terminan con el mismo bloque, y las raices **no** coinciden. No es retardo: tras
-el reinicio los dos han ejecutado la misma cadena.
-Lo que si se ha descartado: ejecutar una cadena y reconstruirla desde el trabajo
-que nombran sus bloques dan la misma raiz, timeslot a timeslot, tanto desde
-genesis como rebobinando antes, y tambien intercalando las dos formas, que es lo
-que hace un nodo de dos validadores. O sea que los dos caminos son el mismo y la
-divergencia es de algo que solo aparece cuando los dos nodos estan en marcha. No
-esta aislada.
-La raiz de estado, en la red viva. A y B terminan en el mismo bloque, pero la raiz
-que tiene A no es la que tiene B en ese bloque.
-Lo que ya se sabe: no es que el replay y la ejecucion sean distintas por si
-mismos. Hay tests queしたもの y lo otro sobre la misma cadena y las dos rutas
-coinciden, con y sin rebobinar antes. Asi que la divergencia es de algo que solo
-aparece con los dos nodos en marcha, y no esta aislada.
-Lo que se ha corregido en el camino, y si era la causa: `followCanonical` pasaba
-al runtime toda la cadena de golpe, de modo que la cola de trabajo era
-compartida y un timeslot podia liquidar trabajo del bloque siguiente. Ahora
-adopta por el mismo camino que usa un nodo al reiniciar: un timeslot cada vez, el
-trabajo de ese timeslot antes de su paso, y la raiz comprobada contra el bloque
-que se va a reconstruir. Una cadena que no se reconstruye se rechaza en vez de
-adoptarse. `Runtime.Replay`, que encolaba todo de golpe, no le quedaba ningun
-llamador y se ha quitado en vez de dejarla a mano para el siguiente.
-ba y hacia que fallara
-Tres cosas, y las tres hubo que encontrarlas mirando el error de verdad:
-1. **El bucle de reconexion destruia el anunciador.** `ConnectToPeer` rechaza
-   marcar un par que ya existe, pero compara por direccion, y el par se guarda
-   con el puerto efimero de la conexion, no con el que se marco. Asi que nunca
-   coincidia: el bucle reconectaba cada 30s y cada reconexion cerraba el par
-   anterior con su stream de anuncio puesto. Todos los bloques siguientes
-   fallaban con `context canceled`.
-2. **El contexto del anuncio no se podia cancelar.** Cancelar el contexto por
-   bloque dejaba muerto el stream del anunciador para siempre, porque el
-   anotador queda ligado al contexto que lo creo. El anuncio va ahora en su
-   propia goroutine con el contexto del nodo.
-3. **La deduplicacion era por direccion en vez de por clave de validador.** Dos
-   nodos que arrancan a la vez se marcan el uno al otro, se crean dos conexiones
-   y la segunda reemplaza a la primera, tirando el stream. Con la clave
-   Ed25519 del vecino, un vecino ya conectado se deja tranquilo.
+El numero de nodos ya no esta escrito en ningun sitio. `scripts/devnet-mesh.sh N`
+genera un fichero de validadores con N entradas, levanta los nodos de uno en uno y
+comprueba despues de cada uno que el recien llegado se ha sincronizado con los que
+ya estaban, y que la malla esta completa.
+
+Lo que hacia falta para eso, y estaba atado a dos validadores:
+
+- **El conjunto de validadores es un parametro de la cadena, y por eso no puede
+  ser dinamico por proceso.** Dos nodos que discrepan de el estan en cadenas
+  distintas, asi que lo fijan todos por igual leyendo el mismo fichero. Lo que si
+  cambia de una ejecucion a otra es cuantos hay, y eso lo decide el fichero. El
+  techo del dev estaba en 2, y el conjunto es un array de tamano fijo, asi que un
+  tercer validador era un indice fuera de rango. Ahora el techo es 6 y el
+  fichero dice cuantos se usan.
+- **El turno de escribir rota entre los que hay.** `--author-count` lo pone el
+  que lanza la malla, y con N nodos cada nodo escribe uno de cada N slots. Con 1
+  significa que ese nodo escribe todos, que es el modo de un solo nodo.
+- **`--full-mesh`**: el grid del protocolo solo hace vecinos a los validadores que
+  comparten fila o columna, y un grid es cuadrado, asi que con tres validadores en
+  una cadena que admite seis el grid es de dos por dos y el tercero solo se
+  alcanza a traves del primero. Eso es la definicion del protocolo y no se cambia,
+  pero significa que el grid no es una malla, y una red local de unos pocos nodos
+  quiere que cada uno llegue a todos los demos directamente.
+
+Tres bugs que solo aparecen con mas de dos nodos:
+
+- **Un vecino inalcanzable paraba el bucle entero.** `ConnectToNeighbours` hacia
+  `return` en el primer fallo, con lo que un solo vecino con una direccion que no
+  salia impedia marcar a los demas y el nodo se quedaba sin pares. Y el grid
+  entrega como vecinos las entradas del conjunto que no se rellenaron, que son
+  claves vacias sin direccion: por eso el nodo se quedaba a cero. Ahora se sigue
+  con el resto y se dice al final cuales no se alcanzaron.
+- **En cuanto un nodo tenia un par, dejaba de buscar los demas.** El bucle hacia
+  `continue` mientras tuviera alguno, asi que un nodo que se conectaba con el
+  primero que encontraba se quedaba ahi para siempre. Con dos nodos no se notaba,
+  porque ese par era el unico que hacia falta; con tres, el segundo solo conocia al
+  primero y el tercero tambien, y no se veian entre si.
+- **Adoptar un bloque no es un reinicio, pero se trataba como uno.**
+  `FinishRebuild` olvidaba los numeros que el nodo habia repartido, y eso esta bien
+  para un nodo que acaba de arrancar, cuyo estado sale de los bloques que
+  reproduce. En vivo no: el nodo que adopta el bloque de otro sigue siendo el
+  nodo que lleva la cadena, y el numero que le toca a la siguiente operacion se
+  cuenta desde ahi. Borrarlos hacia que dos nodos con el mismo bloque escribieran
+  operaciones distintas sobre la misma cadena, y por eso las raices de estado de un
+  bloque salian distintas en cada nodo. Ahora `FinishRebuild` solo termina la
+  repeticion y el olvido es explicito, con `ForgetHandedOut`, en el reinicio.
+
+Comprobado con 3 nodos: los tres comparten bloque, la cadena avanza, y cada nodo
+ve a los otros dos.
+
+### Lo que sigue sin estar
+
+La raiz de estado. Los nodos comparten el bloque y la cadena avanza, pero la raiz
+que tiene cada uno no es la misma. No es la eleccion de tip ni la coneccion: con
+`STRAWBERRY_TRACE_REPLAY=1` cada nodo deja una linea por timeslot reproducido, y
+las lineas coinciden hasta que uno reproduce un timeslot mas que el otro. Es decir,
+las dos cadenas no tienen el mismo numero de bloques, aunque acaben nombrando el
+mismo bloque. Eso apunta a la cadena que cada uno guarda y a como se recoge al
+reiniciar, no a la ejecucion: ejecutar una cadena y reconstruirla dan la misma raiz
+timeslot a timeslot, y eso esta fijado con tests.
+
+
+En el camino se corrigio tambien que `followCanonical` pasaba al runtime toda la
+cadena de golpe, de modo que la cola de trabajo era compartida y un timeslot podia
+liquidar trabajo del bloque siguiente. Ahora adopta por el mismo camino que usa un
+nodo al reiniciar: un timeslot cada vez, el trabajo de ese timeslot antes de su
+paso, y la raiz comprobada contra el bloque que se va a reconstruir. Una cadena que
+no se reconstruye se rechaza en vez de adoptarse. `Runtime.Replay`, que encolaba
+todo de golpe, se quito al quedarse sin llamadores, en vez de dejarla a mano para el
+siguiente.

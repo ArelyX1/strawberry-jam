@@ -444,19 +444,34 @@ func (r *Runtime) Rebuild(work []BlockWork) error {
 	return nil
 }
 
-// FinishRebuild ends a rebuild. The work the node queues from here on is work it
-// was asked to do, and the numbers this node keeps for itself are read back out
-// of the state the blocks left behind, because those numbers are part of that
-// state and a node that restarted with the ones it had in memory would sign an
-// item the chain has already used a nonce for.
+// FinishRebuild ends a rebuild, so the work the node queues from here on is work
+// it was asked to do rather than work it is replaying.
+//
+// It deliberately does not forget the numbers this node has handed out. Those are
+// its own bookkeeping, carried in memory, and a node that is running and adopts
+// one block from a peer still has the right ones: they describe the chain it is
+// already on. Wiping them there is what made two nodes on the same block report
+// different state roots, because the nonce a following item gets is counted from
+// them, so the two nodes wrote different items onto a chain they both agreed on.
+// A node that has just started has nothing in memory worth keeping, and says so
+// with ForgetHandedOut.
 func (r *Runtime) FinishRebuild() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	r.replaying = false
-	// The state the rebuild came from is the floor every number starts from, so
-	// anything this node handed out before the restart is forgotten rather than
-	// carried into a chain that has moved on.
+}
+
+// ForgetHandedOut drops the numbers this node has handed out and the count of the
+// items still waiting for a block to settle them.
+//
+// This is for a node that has just started. Its state is read back out of the
+// blocks it replays, and those numbers are part of that state, so a node that
+// restarted keeping the ones it had in memory would hand out an item the chain
+// has already spent a nonce on. A node that is running must not do this: its
+// numbers describe the chain it is on.
+func (r *Runtime) ForgetHandedOut() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.issued = map[string]uint64{}
 	r.undecided = map[string]int{}
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/eigerco/strawberry/pkg/log"
 	p2pnode "github.com/eigerco/strawberry/pkg/network/node"
 	"github.com/eigerco/strawberry/pkg/network/peer"
+	"os"
 )
 
 // blockProducer builds one block per timeslot out of what the runtime did in it.
@@ -120,6 +121,11 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 		// something a node is entitled to remember on its own. Each one is checked
 		// against the block that names it, so a chain that does not replay is
 		// reported at the timeslot it went wrong rather than at its end.
+		// A node that has just started has no numbers worth keeping: its state
+		// comes out of the blocks it is about to replay, and those numbers are
+		// part of it.
+		bp.runtime.ForgetHandedOut()
+
 		replayed, err := bp.replay(genesisHeader.TimeSlotIndex+1, tipSlot, blocks)
 		if err != nil {
 			// Carrying on from here would produce blocks on top of a state that no
@@ -354,6 +360,13 @@ func (bp *blockProducer) replay(from, through jamtime.Timeslot, blocks map[jamti
 
 		if err := bp.runtime.Step(slot); err != nil {
 			return uint64(slot - from), err
+		}
+		// STRAWBERRY_TRACE_REPLAY=1 deja una linea por timeslot con la raiz que
+		// ha salido. Dos nodos que ejecutan la misma cadena tienen que dar las
+		// mismas lineas, y en el mismo numero de timeslots: donde se separen, o
+		// donde uno tiene mas lineas que el otro, es donde esta el fallo.
+		if os.Getenv("STRAWBERRY_TRACE_REPLAY") != "" {
+			fmt.Printf("REPLAY %d %s\n", uint64(slot), hashToHex(bp.runtime.Root()))
 		}
 	}
 	bp.runtime.FinishRebuild()

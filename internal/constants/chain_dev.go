@@ -3,7 +3,15 @@
 package constants
 
 const (
-	NumberOfValidators = 2
+	// NumberOfValidators is a parameter of the chain, like the length of a
+	// timeslot, and it is fixed when the chain is defined: two nodes that
+	// disagreed about it would be on different chains, so it cannot be something
+	// each process decides for itself. It is a ceiling for the dev chain, and the
+	// validator file says how many of them a given run actually uses. It is six
+	// rather than two so that a mesh of more than two nodes is possible at all,
+	// which it was not: the validator set is a fixed-size array, so a third
+	// validator was an index out of range.
+	NumberOfValidators = 6
 
 	TimeslotsPerEpoch = 12
 

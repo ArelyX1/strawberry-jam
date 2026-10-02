@@ -36,9 +36,14 @@ import (
 // Node manages peer connections, handles protocol messages, and coordinates network operations.
 // Each Node can act as both a client and server, maintaining connections with multiple peers simultaneously.
 type Node struct {
-	Context                       context.Context
-	Cancel                        context.CancelFunc
-	ValidatorManager              *validator.ValidatorManager
+	Context          context.Context
+	Cancel           context.CancelFunc
+	ValidatorManager *validator.ValidatorManager
+	// FullMesh connects to every configured validator instead of only the grid
+	// neighbours. The grid is the protocol's answer to who a neighbour is and it
+	// is deliberately not a mesh; this is for a local network where every node
+	// should be able to reach every other one directly.
+	FullMesh                      bool
 	BlockService                  *chain.BlockService
 	ProtocolManager               *protocol.Manager
 	PeersSet                      *peer.PeerSet
@@ -317,9 +322,20 @@ func (n *Node) ConnectToPeer(addr *net.UDPAddr) error {
 // ConnectToNeighbours connects to all neighbor validators according to the
 // grid structure defined in the JAMNP
 func (n *Node) ConnectToNeighbours() error {
+	// The grid decides who a neighbour is, and it is only a subset: a grid is
+	// square, so a validator count that is not a perfect square leaves somebody
+	// only reachable through a third. FullMesh asks for everybody instead, which
+	// is what a handful of nodes on one machine wants.
 	neighbors, err := n.ValidatorManager.GetNeighbors()
 	if err != nil {
 		return fmt.Errorf("failed to get neighbors: %w", err)
+	}
+	if n.FullMesh {
+		all, err := n.ValidatorManager.GetAllValidators()
+		if err != nil {
+			return fmt.Errorf("failed to get validators: %w", err)
+		}
+		neighbors = all
 	}
 	// A neighbour already connected is left alone. The check is by validator key
 	// and not by address, because the stored peer carries the ephemeral port the
@@ -329,6 +345,11 @@ func (n *Node) ConnectToNeighbours() error {
 	// announcement stream built on it. Two nodes starting together both dial each
 	// other, so this happened on the very first block and left every later
 	// announcement failing against a stream the other side had closed.
+	// reached counts the neighbours dialled, unreachable names the ones that were
+	// not, so that a partial mesh can be told apart from a whole one.
+	reached := 0
+	unreachable := make([]string, 0, len(neighbors))
+
 	for _, neighbor := range neighbors {
 		n.peersLock.RLock()
 		have := n.PeersSet.GetByEd25519Key(neighbor.Ed25519)
@@ -340,11 +361,27 @@ func (n *Node) ConnectToNeighbours() error {
 		// Extract IPv6/port from validator metadata as specified in the JAMNP
 		address, err := peer.NewPeerAddressFromMetadata(neighbor.Metadata[:])
 		if err != nil {
-			return err
+			// One neighbour this node cannot work out how to reach is not a
+			// reason to give up on the others. Returning here meant a single bad
+			// entry, and a grid wide enough to name a validator that is not
+			// configured, stopped the node before it had dialled anybody at all:
+			// it came up with no peers and the rest of the list was never tried.
+			// The entry that failed is remembered so it can be said out loud.
+			unreachable = append(unreachable, fmt.Sprintf("%x: %v", neighbor.Ed25519[:4], err))
+			continue
 		}
 		if err := n.ConnectToPeer(address); err != nil {
-			return fmt.Errorf("failed to connect to neighbor: %w", err)
+			// Same here: a neighbour that is not up yet is the normal state of a
+			// devnet where the nodes are started one after another, and the next
+			// pass will try again.
+			unreachable = append(unreachable, fmt.Sprintf("%s: %v", address, err))
+			continue
 		}
+		reached++
+	}
+	if len(unreachable) > 0 {
+		return fmt.Errorf("reached %d of %d neighbours; not reachable: %s",
+			reached, len(neighbors), strings.Join(unreachable, "; "))
 	}
 	return nil
 }
