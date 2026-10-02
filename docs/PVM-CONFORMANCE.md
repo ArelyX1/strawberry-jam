@@ -660,3 +660,79 @@ directorio es otra prueba, y esa la cubre `TestANodeResumesTheChainItWasRunning`
 
 Los pasos 2 y 4 dependen del faucet, asi que hoy fallan por lo de arriba y no por
 la cadena. Los pasos 1 y 3 son los que se pueden pasar, y el 1 ya se pasa.
+
+### Cuantos validadores caben, y donde estaba el limite de verdad
+
+Seis no era un limite de la maquina. Era un parametro de la cadena:
+`NumberOfValidators` es el tamano de los vectores fijos donde vive el conjunto de
+validadores, y ademas entra en la codificacion de la *epoch marker* que viaja en la
+cabecera del primer timeslot de cada epoca. Dos nodos que no coincidan en ese numero
+estan en cadenas distintas y no pueden entenderse ni por accidente. No puede ser una
+opcion de linea de comandos: es parte de como se codifica una cabecera.
+
+De ahi que subirlo de 6 a 32 anada 64 bytes por validador en esa una cabecera por
+epoca, y nada mas en ninguna parte. Las pruebas de estado, Safrole y bloque siguen
+en verde con 32, y 8 nodos sin tocar convergen.
+
+El generador tenia ademas un segundo limite mas tonto: ocho, porque solo hay ocho
+nombres para repartir. A partir de 32 los demas se llaman `validator-N`, y ahora
+acepta `-addrs`, una direccion por validador, que es lo que hace falta para escribir
+donde esta cada maquina. Con `-addrs` se pueden corregir las direcciones de
+validadores que ya estan en el fichero sin tocar las claves: un validador lo
+identifica su clave, y moverlo no lo convierte en otro.
+
+### La libreria de Rust se desempaquetaba una vez por proceso
+
+Cada arranque sacaba la libreria a un directorio temporal nuevo y no lo borraba
+nunca. Son un par de megabytes, asi que un nodo arrancado y parado unas cuantas
+veces dejaba esos mismos megabytes en `/tmp`. En una maquina donde `/tmp` es un
+tmpfs de 4 GB, asi se llena la red y todos los nodos mueren en medio de un bloque:
+
+```
+pebble: fatal commit error: write .../000008.log: no space left on device
+```
+
+Ocurrio con 8 nodos tras 1661 de esos directorios, 3.2 GB de un `/tmp` de 3.6 GB.
+Ahora se escribe una vez por maquina bajo un nombre que lleva el hash de sus
+bytes, de modo que una red comparte una sola copia, que un binario nuevo nunca carga
+una libreria vieja, y que dos nodos arrancando a la vez no encuentran una a medio
+escribir: se renombra al entrar. 8 nodos, un directorio, y eran 1661.
+
+### Un extremo de cada par marca, y solo uno
+
+Cuando los dos extremos de un par se llaman mutuamente a la vez hay dos conexiones
+por par, y el par tiene que ponerse de acuerdo en cual se queda. Se pusieran de
+acuerdo comparando puertos, lo cual en una sola maquina funciona por casualidad:
+todas las maquinas escuchan en 30333, luego los puertos de escucha son iguales y lo
+que queda son los efimeros, que cada extremo ve en orden distinto. Cada uno se
+queda entonces con una conexion distinta. Las dos siguen vivas, la lista de pares
+dice dos vecinos, y no se anuncia nada, porque los anuncios bajan por una conexion
+mientras el otro extremo escucha en la otra.
+
+Ahora marca un solo extremo de cada par, decidido comparando las dos claves, que
+ambos extremos calculan igual. Cinco nodos en loopback no cambian: 99 de 100
+muestras, sin deriva al final.
+
+### Lo que falta para varias maquinas: el anunciador
+
+Con cada nodo en una direccion distinta (`127.0.0.1`, `.2`, `.3`, mismo puerto), la
+malla se pobla pero un nodo puede quedarse con sus pares y **sin anunciador**: la
+lista muestra las conexiones y ninguna tiene `announcing`, y ese nodo deja de
+autorar bloques y se queda esperando la base del timeslot.
+
+```
+mesh-0 pares={"127.0.0.2:30333"}{"127.0.0.3:30333"}   <- ninguno anunciando
+mesh-1 pares={"127.0.0.1:47314","announcing":true}{...}
+```
+
+Es decir: los extremos no coinciden en que conexion anuncio. Esto ya pasaba antes
+del cambio de marcado (entonces `mesh-0` producia 14 bloques y los otros dos 0), no
+lo introdujo el marcado unidireccional, que es neutro en loopback. Queda abierto:
+la metadata si hace round-trip correcto con IPv4 (`To16` y `AddrPort.UnmarshalBinary`
+se entienden bien), asi que la pista esta en que extremo crea el anunciador y cual
+lo recibe, no en como se codifica la direccion.
+
+Mientras tanto, para varias maquinas: `scripts/devnet-prepare.sh` escribe los
+validadores y el genesis **una vez** y da una linea de arranque por maquina. Importa
+que el genesis sea el mismo fichero byte a byte en todas, porque generarlo en cada
+maquina con su propio reloj produce cadenas distintas.
