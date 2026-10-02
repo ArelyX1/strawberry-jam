@@ -436,23 +436,48 @@ Tres bugs que solo aparecen con mas de dos nodos:
 Comprobado con 3 nodos: los tres comparten bloque, la cadena avanza, y cada nodo
 ve a los otros dos.
 
+### Lo que faltaba para que los nodos se pusieran de acuerdo
+
+Cuatro cosas, y la ultima todavia no esta.
+
+**Un hueco no puede saltarse la peticion del bloque.** Al arreglar que una
+cabecera que llega antes que sus ancestres no es un error, el retorno temprano se
+quedo antes de pedir el bloque de esa cabecera. Toda cabecera que llegaba sobre un
+hueco—no pedia nunca su bloque, asi que el nodo se enteraba de una punta que no
+podria alcanzar nunca. La cabecera se guarda y el bloque se pide igual.
+
+**Un nodo que acaba de llegar no puede ejecutar hasta tener la cadena entera.**
+`adoptSlot` pedia la cadena completa hasta genesis y un solo hueco hacia fallar
+el recorrido entero, asi que un nodo recien llegado no ejecutaba nada hasta que el
+relleno habia llenado todo: su estado se quedaba quieto mientras la cadena crecia
+por delante, y el tip que publica nombraba un bloque al que su estado nunca habia
+llegado. Ahora toma la parte continua que hay (`AvailableChain`, que para donde se
+acaban los bloques en vez de fallar) y ejecuta esa, cada timeslot, que es lo que le
+deja alcanzar mientras llega el resto.
+
+**La finalizacion por profundidad de generaciones es una suposicion, y hacia
+dañar la cadena.** `checkFinalization` fijaba como finalizado un bloque de seis
+generaciones atras sin comprobar nada. En una cadena bifurcada eso elige una rama,
+y la rama puede perder: el punto final queda en una rama que nadie sigue, toda
+cabecera posterior llega por la que gano, baja hasta el timeslot finalizado,
+encuentra alli otro bloque, y se rechaza por no descender de el. El nodo deja de
+aceptar bloques, la cadena se para, y lo unico que se ve son cabeceras descartadas
+en silencio. Ahora la finalizacion se puede apagar, y el devnet la apaga: no hay
+consenso detras, asi que no hay en que basarse para decidir que rama es la real.
+Sigue encendida por defecto para todo lo demas, que es el comportamiento contra el
+que esta escrito el resto. El quorum es donde vuelve.
+
+**Y las cabeceras descartadas se decian.** `RetryPending` soltaba en silencio las
+que no eran de esta cadena, y asi el contador de cabeceras colocadas se quedaba en
+cero mientras la cadena se paraba en silencio, sin decir por que. Ahora se dice.
+
 ### Lo que sigue sin estar
 
-La raiz de estado. Los nodos comparten el bloque y la cadena avanza, pero la raiz
-que tiene cada uno no es la misma. No es la eleccion de tip ni la coneccion: con
-`STRAWBERRY_TRACE_REPLAY=1` cada nodo deja una linea por timeslot reproducido, y
-las lineas coinciden hasta que uno reproduce un timeslot mas que el otro. Es decir,
-las dos cadenas no tienen el mismo numero de bloques, aunque acaben nombrando el
-mismo bloque. Eso apunta a la cadena que cada uno guarda y a como se recoge al
-reiniciar, no a la ejecucion: ejecutar una cadena y reconstruirla dan la misma raiz
-timeslot a timeslot, y eso esta fijado con tests.
-
-
-En el camino se corrigio tambien que `followCanonical` pasaba al runtime toda la
-cadena de golpe, de modo que la cola de trabajo era compartida y un timeslot podia
-liquidar trabajo del bloque siguiente. Ahora adopta por el mismo camino que usa un
-nodo al reiniciar: un timeslot cada vez, el trabajo de ese timeslot antes de su
-paso, y la raiz comprobada contra el bloque que se va a reconstruir. Una cadena que
-no se reconstruye se rechaza en vez de adoptarse. `Runtime.Replay`, que encolaba
-todo de golpe, se quito al quedarse sin llamadores, en vez de dejarla a mano para el
-siguiente.
+El estado. Los nodos de una malla comparten el bloque y la malla esta completa,
+pero la raiz de estado de cada uno no es la misma: el nodo que no ha ejecutado un
+bloque publishes su cabecera y su estado sigue en el anterior. Y no llega a
+ejecutarlo a tiempo: `adoptSlot` devuelve que el bloque todavia no esta, veces y
+veces, porque la peticion CE 128 que lo trae pide un bloque por anuncio y el
+timeslot es mas corto que lo que tarda en llegar. Ese es el punto a mirar: la
+latencia de traer un bloque, no la eleccion de cadena ni la ejecucion, que ya
+coinciden timeslot a timeslot con los tests.

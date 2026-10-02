@@ -456,12 +456,22 @@ func (ba *BlockAnnouncer) processAnnouncement(content []byte) error {
 	// Failing here would throw that away and, because the caller stops
 	// listening when this returns an error, would also cost the node the
 	// stream it learns on.
+	// A header whose ancestors are missing is the ordinary state of a node that has
+	// fallen behind, not a fault, and it is kept as the handle to go and fetch what
+	// is behind it. It is not a reason to stop here either: the block itself is
+	// still wanted, and going on to ask for it is the whole point of keeping the
+	// header. Returning early instead left every block that arrived before its
+	// ancestors unfetched, so the node learned of a head it could never walk to.
+	overAGap := false
 	if err = ba.HandleNewHeader(&header); err != nil {
-		if chain.IsMissingHeader(err) {
-			log.Printf("Announced block at slot %d is ahead of this node; its chain is being filled in", header.TimeSlotIndex)
-			return nil
+		if !chain.IsMissingHeader(err) {
+			return fmt.Errorf("process new block: %w", err)
 		}
-		return fmt.Errorf("process new block: %w", err)
+		overAGap = true
+	}
+
+	if overAGap {
+		log.Printf("Announced block at slot %d is ahead of this node; going to fetch it", header.TimeSlotIndex)
 	}
 
 	// Request the full block using the CE 128 protocol

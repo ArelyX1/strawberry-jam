@@ -236,49 +236,70 @@ func (bp *blockProducer) runForeignSlot(slot jamtime.Timeslot) {
 	}
 }
 
-// adoptSlot executes the chain this node holds for a timeslot another validator
-// authored, up to that timeslot. It reports whether it did.
+// adoptSlot executes as much of the chain as this node can actually walk, up to
+// and including the given timeslot. It reports whether the timeslot is now
+// executed.
+//
+// It takes the unbroken run of blocks that ends at the tip rather than the whole
+// chain. A node that has only just joined is missing something below almost every
+// tip, and asking it to hold every block back to genesis before it executes
+// anything means it executes nothing at all until the backfill has filled the lot:
+// its state stands still while the chain grows past it, and the tip it publishes
+// keeps naming a block its state has never reached. Executing the part that is
+// there, every timeslot, is what lets it catch up while the rest arrives.
 func (bp *blockProducer) adoptSlot(slot jamtime.Timeslot) bool {
 	_, leaf, ok := bp.bestKnownTip()
 	if !ok {
 		return false
 	}
-	header, err := bp.bs.Store.GetHeader(leaf)
-	if err != nil || header.TimeSlotIndex < slot {
+	tipHeader, err := bp.bs.Store.GetHeader(leaf)
+	if err != nil || tipHeader.TimeSlotIndex < slot {
 		return false
 	}
 
-	// The whole chain, not the last few blocks. The walk goes by parent hash from
-	// the tip, so asking for a suffix gives the last n blocks and nothing before
-	// them, and the replay below starts at the timeslot this node's state stands
-	// at rather than at the tip. Every timeslot between the two that was not in
-	// the suffix would then be stepped with no block and nothing to check it
-	// against, which is how a node ends up holding a block it adopted over a
-	// state that block was never built on, and refusing its own chain as
-	// unrebuildable.
-	chain, err := bp.bs.CanonicalChain(leaf, 0)
-	if err != nil || len(chain) == 0 || chain[len(chain)-1].Header.TimeSlotIndex != slot {
+	available := bp.bs.AvailableChain(leaf, 0)
+	if len(available) == 0 {
+		return false
+	}
+	last := available[len(available)-1].Header
+	if last.TimeSlotIndex < slot {
 		return false
 	}
 
-	// Already executed: the state stands at or past this slot and the tip is the
-	// one this node is building on, so there is nothing to do.
-	if bp.parentHash == leaf && bp.runtime.Timeslot() >= slot {
+	// Already executed: the state stands at or past this timeslot.
+	if bp.runtime.Timeslot() >= slot {
+		bp.parentHash = leaf
 		return true
 	}
 
-	bySlot := make(map[jamtime.Timeslot]block.Block, len(chain))
-	for _, b := range chain {
+	// Only the blocks this node has not run yet. The walk stops at the tip, which
+	// may be ahead of the timeslot being adopted; running past the timeslot would
+	// put the state somewhere the node was never asked to be.
+	bySlot := make(map[jamtime.Timeslot]block.Block, len(available))
+	through := bp.runtime.Timeslot()
+	for _, b := range available {
+		if b.Header.TimeSlotIndex <= bp.runtime.Timeslot() {
+			continue
+		}
+		if b.Header.TimeSlotIndex > slot {
+			break
+		}
 		bySlot[b.Header.TimeSlotIndex] = b
+		if b.Header.TimeSlotIndex > through {
+			through = b.Header.TimeSlotIndex
+		}
 	}
-	from := bp.runtime.Timeslot() + 1
-	if _, err := bp.replay(from, slot, bySlot); err != nil {
+	if len(bySlot) == 0 {
+		return false
+	}
+
+	if _, err := bp.replay(bp.runtime.Timeslot()+1, through, bySlot); err != nil {
 		log.Internal.Debug().Err(err).Uint64("slot", uint64(slot)).
 			Msg("could not execute the block this timeslot's author wrote")
 		return false
 	}
 	bp.parentHash = leaf
-	bp.blockNum = uint(slot)
+	bp.blockNum = uint(through)
 	return true
 }
 

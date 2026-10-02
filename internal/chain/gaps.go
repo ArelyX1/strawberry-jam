@@ -2,6 +2,7 @@ package chain
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/jamtime"
 	"github.com/eigerco/strawberry/internal/store"
+	"github.com/eigerco/strawberry/pkg/log"
 )
 
 // ErrMissingAncestors means the header may well be good but this node does not
@@ -190,6 +192,48 @@ func (bs *BlockService) walkDownFrom(hash crypto.Hash, held *block.Header, add f
 	return true
 }
 
+// AvailableChain is the longest unbroken run of blocks ending at tip, oldest
+// first, and it stops where the blocks run out instead of failing.
+//
+// CanonicalChain refuses to walk into a hole, which is right when the question is
+// whether the chain can be walked at all. It is the wrong answer to "how much of
+// this can be executed now", because a node that has just joined is missing
+// something below almost every tip, and asking it to have the whole chain before
+// it executes anything means it executes nothing until the backfill has finished
+// filling from genesis. Its state then stands still while the chain grows, and
+// every answer it gives is about a block far behind the one it is publishing.
+//
+// What comes back is only the part that is actually there, and the caller is
+// expected to execute that and come back for the rest later.
+func (bs *BlockService) AvailableChain(tip crypto.Hash, limit int) []block.Block {
+	if limit <= 0 {
+		limit = 4096
+	}
+
+	backwards := make([]block.Block, 0, limit)
+	seen := make(map[crypto.Hash]bool)
+	current := tip
+
+	for len(backwards) < limit {
+		if seen[current] {
+			break
+		}
+		seen[current] = true
+
+		b, err := bs.Store.GetBlock(current)
+		if err != nil {
+			break
+		}
+		backwards = append(backwards, b)
+		current = b.Header.ParentHash
+	}
+
+	for i, j := 0, len(backwards)-1; i < j; i, j = i+1, j-1 {
+		backwards[i], backwards[j] = backwards[j], backwards[i]
+	}
+	return backwards
+}
+
 // BackfillHashes is what the sync loop asks for: the blocks to go and get, so
 // that this node can walk its own chain again.
 func (bs *BlockService) BackfillHashes(limit int) []crypto.Hash {
@@ -210,9 +254,17 @@ func (bs *BlockService) RetryPending() int {
 			if herr == nil {
 				bs.trackPending(header, hash)
 			}
+		} else {
+			// Letting a header go is the right outcome, but saying so is what
+			// makes it possible to tell a header that was dropped because it does
+			// not belong on this chain from one that was dropped because nothing
+			// ever arrived. Without this the count of placed headers stays at
+			// zero while the chain quietly stops moving, and nothing says why.
+			hash, _ := header.Hash()
+			log.Internal.Debug().Err(err).Str("block", hex.EncodeToString(hash[:])).
+				Uint64("slot", uint64(header.TimeSlotIndex)).
+				Msg("a header waiting on a gap does not belong to this chain and was dropped")
 		}
-		// Any other failure means the header does not belong here at all, and
-		// letting it go is the correct outcome.
 	}
 	return placed
 }

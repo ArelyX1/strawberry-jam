@@ -122,6 +122,7 @@ func main() {
 		flagValidatorCount int
 		validatorsFile     string
 		fullMesh           bool
+		finalize           bool
 		chainSpec          string
 		isValidator        bool
 		nodeName           string
@@ -145,6 +146,8 @@ func main() {
 		"the validator file: who exists and where to reach them")
 	flag.BoolVar(&fullMesh, "full-mesh", false,
 		"connect to every configured validator, not only the grid neighbours")
+	flag.BoolVar(&finalize, "finalize", false,
+		"record blocks as finalized after a fixed depth; off by default because a devnet has nobody to agree with")
 	flag.StringVar(&chainSpec, "chain", "dev", "chain specification")
 	flag.BoolVar(&isValidator, "validator", false, "run as validator")
 	flag.StringVar(&nodeName, "name", "Strawberry-Node", "node name")
@@ -371,6 +374,12 @@ func main() {
 			}
 		}
 		n.FullMesh = fullMesh
+		// Un devnet no tiene consenso, asi que no fija bloques como finalizados: hacerlo
+		// por profundidad de generaciones es elegir una rama sin que nadie la haya
+		// respaldado, y cuando esa rama pierde el nodo rechaza para siempre todo lo que
+		// llega por la que gano. Con la finalizacion apagada la cadena crece y los nodos
+		// pueden ponerse de acuerdo en ella.
+		n.BlockService.SetFinalization(finalize)
 		backfillLoop(ctx, n, n.BlockService)
 	}()
 

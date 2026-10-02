@@ -30,6 +30,9 @@ type BlockService struct {
 	// are the way back out of a gap: the head is the handle to ask for
 	// everything that is missing behind it.
 	pending map[crypto.Hash]block.Header
+	// finalization says whether blocks may be recorded as finalized without
+	// anyone having agreed on them. See SetFinalization.
+	finalization bool
 }
 
 // LatestFinalized represents the latest finalized block in the chain.
@@ -57,6 +60,10 @@ func NewBlockService(kvStore *pebble.KVStore) (*BlockService, error) {
 	bs := &BlockService{
 		Store:       chain,
 		KnownLeaves: make(map[crypto.Hash]jamtime.Timeslot),
+		// On by default: it is the behaviour everything else is written against.
+		// The devnet turns it off, and only the devnet, because finalizing without
+		// anyone having agreed on the block is a decision it has no basis to make.
+		finalization: true,
 	}
 	// Initialize by finding leaves and finalized block
 	if err := bs.initializeState(); err != nil {
@@ -154,7 +161,30 @@ func (bs *BlockService) GenesisHeader() (block.Header, crypto.Hash, bool) {
 // Returns nil if finalization check succeeds, error if any operations fail.
 // Note: May return nil even if finalization isn't possible (e.g., missing ancestors).
 // This is due to genesis block handling and is not considered an error.
+// finalizationEnabled says whether a block this node has never seen anyone else
+// agree on may be recorded as finalized.
+//
+// It is off for the devnet on purpose. Finalizing is a decision about which chain
+// is real, and a fixed number of generations is not that decision, it is a guess
+// with no agreement behind it. On a chain that forked, the guess picks a branch,
+// and the branch can lose: the finalized point is then on a branch nobody is on,
+// every later header arrives on the branch that won, walks back to the finalized
+// timeslot, finds a different block there, and is rejected as not descending from
+// it. The node stops accepting blocks, the chain stops moving, and the only sign
+// is that headers are quietly dropped. Turning it off leaves the chain free to
+// grow and the nodes free to agree on it, which is the most a devnet with no
+// consensus can honestly claim. Quorum finalization is where it comes back.
+// SetFinalization turns finalization on or off.
+func (bs *BlockService) SetFinalization(on bool) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.finalization = on
+}
+
 func (bs *BlockService) checkFinalization(hash crypto.Hash) error {
+	if !bs.finalization {
+		return nil
+	}
 	// Start from current header and walk back 6 generations
 	currentHash := hash
 	var ancestorChain []block.Header
