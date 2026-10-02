@@ -1,7 +1,6 @@
 package node
 
 import (
-	"bytes"
 	"context"
 	"strings"
 
@@ -396,10 +395,6 @@ func (n *Node) ConnectToNeighbours() error {
 		// One connection per pair, opened by the end with the lower key, has no
 		// choice to get wrong. The end that does not dial keeps its connection
 		// through the same check it already does, by validator key.
-		if !n.dialsNeighbour(neighbor.Ed25519) {
-			continue
-		}
-
 		n.peersLock.RLock()
 		have := n.PeersSet.GetByEd25519Key(neighbor.Ed25519)
 		n.peersLock.RUnlock()
@@ -433,22 +428,6 @@ func (n *Node) ConnectToNeighbours() error {
 			reached, len(neighbors), strings.Join(unreachable, "; "))
 	}
 	return nil
-}
-
-// dialsNeighbour reports whether this node is the end of the pair that dials.
-//
-// Both ends reach the same answer from the same two keys, which is the whole
-// point: a rule each end applies to itself alone can disagree with the same rule
-// on the other end, and two connections per pair then have to be resolved by a
-// comparison that both ends see the same way round.
-func (n *Node) dialsNeighbour(theirKey ed25519.PublicKey) bool {
-	our := n.ValidatorManager.Keys.EdPub
-	if len(our) == 0 || len(theirKey) == 0 {
-		// Without a key to compare there is no way to take half the pairs, so
-		// dial rather than leave a pair with nobody dialling it.
-		return true
-	}
-	return bytes.Compare(our, theirKey) < 0
 }
 
 // RequestBlocks implements the CE 128 block request protocol from the JAM spec.

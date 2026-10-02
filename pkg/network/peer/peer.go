@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"sync"
 
 	"github.com/eigerco/strawberry/internal/crypto/ed25519"
 
@@ -24,7 +25,16 @@ type BlockAnnouncer interface {
 
 // PeerSet maintains mappings between peer identifiers
 // (Ed25519 keys, network addresses, validator indices) and Peer objects.
+//
+// It carries its own lock because it is written from more than one goroutine at
+// once: connections arrive from the network, connections this node dials come
+// back through the same door, and the loop that keeps trying to reach neighbours
+// is reading the whole time. That is not a theoretical hazard here, it is the
+// shape of the problem. Both ends of a pair dialling at the same moment is the
+// normal case when a net starts, and each of those connections went through this
+// code at the same moment as the other.
 type PeerSet struct {
+	mu sync.RWMutex
 	// Map from Ed25519 public key to peer
 	byEd25519Key map[string]*Peer
 	// Map from string representation of address to peer
@@ -45,6 +55,8 @@ func NewPeerSet() *PeerSet {
 // AddPeer adds a peer to all relevant lookup maps in the PeerSet.
 // If the peer is a validator index, it will also have a validator index.
 func (ps *PeerSet) AddPeer(peer *Peer) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	ps.byEd25519Key[string(peer.Ed25519Key)] = peer
 	ps.byAddress[peer.Address.String()] = peer
 
@@ -55,6 +67,8 @@ func (ps *PeerSet) AddPeer(peer *Peer) {
 
 // RemovePeer removes a peer from all lookup maps in the PeerSet.
 func (ps *PeerSet) RemovePeer(peer *Peer) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	delete(ps.byEd25519Key, string(peer.Ed25519Key))
 	delete(ps.byAddress, peer.Address.String())
 
@@ -66,23 +80,31 @@ func (ps *PeerSet) RemovePeer(peer *Peer) {
 // GetByEd25519Key looks up a peer by their Ed25519 public key.
 // Returns nil if no peer is found with the given key.
 func (ps *PeerSet) GetByEd25519Key(key ed25519.PublicKey) *Peer {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
 	return ps.byEd25519Key[string(key)]
 }
 
 // GetByAddress looks up a peer by their network address.
 // Returns nil if no peer is found with the given address.
 func (ps *PeerSet) GetByAddress(addr string) *Peer {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
 	return ps.byAddress[addr]
 }
 
 // GetByValidatorIndex looks up a peer by their validator index.
 // Returns nil if no peer is found with the given validator index.
 func (ps *PeerSet) GetByValidatorIndex(index uint16) *Peer {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
 	return ps.byValidatorIndex[index]
 }
 
 // GetAllPeers returns all peers currently in the peer set
 func (ps *PeerSet) GetAllPeers() []*Peer {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
 	peers := make([]*Peer, 0, len(ps.byEd25519Key))
 	for _, peer := range ps.byEd25519Key {
 		peers = append(peers, peer)

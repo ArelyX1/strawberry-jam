@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base32"
 	"fmt"
 	"math/big"
@@ -123,15 +122,23 @@ func (g *Generator) GenerateCertificate() (*tls.Certificate, error) {
 		return nil, fmt.Errorf("failed to generate serial number: %w", err)
 	}
 
+	// The public key goes in the subject alternative name and nowhere else. It
+	// used to go in the common name as well, which put the same 53 bytes in the
+	// certificate twice for nothing: the common name was deprecated years ago,
+	// no TLS stack has looked at it since, and nothing here reads it either, the
+	// identity check reads DNSNames[0].
+	//
+	// Bytes in a certificate are bytes in every packet that carries it, and
+	// QUIC carries certificates in packets that have to fit a path. A path whose
+	// usable size is anywhere near the minimum QUIC allows cannot afford to spend
+	// sixty of them saying the same thing twice, which is exactly the path a node
+	// behind a NAT on a virtual machine ends up on.
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			CommonName: dnsName,
-		},
-		DNSNames:  []string{dnsName},
-		NotBefore: time.Now(),
-		NotAfter:  time.Now().Add(g.config.CertValidityPeriod),
-		KeyUsage:  x509.KeyUsageDigitalSignature,
+		DNSNames:     []string{dnsName},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(g.config.CertValidityPeriod),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{
 			x509.ExtKeyUsageServerAuth,
 			x509.ExtKeyUsageClientAuth,
