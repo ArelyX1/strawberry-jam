@@ -98,8 +98,29 @@ func encodeToBytes(addr *net.UDPAddr) ([]byte, error) {
 	return result, nil
 }
 
+// overridePort puts a different port on an address and leaves the host alone.
+//
+// The host comes back from SplitHostPort without the brackets an IPv6 literal
+// needs in an address, and JoinHostPort puts them back, so the round trip is what
+// keeps `[::1]:30333` from turning into `[[::1]]:30333`, which no resolver will
+// accept and which reads as an address with no port at all.
+func overridePort(addr string, port int) (string, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
 func (f FullValidatorInfo) ToMetadata() ([]byte, error) {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(f.IP, strconv.Itoa(f.Port)))
+	return metadataFromAddr(net.JoinHostPort(f.IP, strconv.Itoa(f.Port)))
+}
+
+// metadataFromAddr builds a validator metadata key naming where a validator can be
+// reached. The address goes in the first eighteen bytes of the key and the rest is
+// left zeroed, which is the shape the transport expects to read back.
+func metadataFromAddr(hostPort string) ([]byte, error) {
+	addr, err := net.ResolveUDPAddr("udp", hostPort)
 	if err != nil {
 		return nil, err
 	}
@@ -230,11 +251,31 @@ func main() {
 		log.Internal.Fatal().Err(err).Msg("net conf listen address failed")
 	}
 	if portOverride > 0 {
-		_, p, err := net.SplitHostPort(listen)
+		listen, err = overridePort(listen, portOverride)
 		if err != nil {
-			log.Internal.Fatal().Err(err).Msg("listen address from the net conf has no port to override")
+			log.Internal.Fatal().Str("address", listen).Err(err).Msg("listen address port override failed")
 		}
-		listen = net.JoinHostPort(strings.TrimSuffix(listen[:len(listen)-len(p)-1], ":"), strconv.Itoa(portOverride))
+	}
+	// The address of every validator, not just this one's, has to go through the
+	// net conf before the validator state is built.
+	//
+	// The node dials its neighbours from the addresses in that state, so an
+	// override that is only handed to the runtime below never reaches the dialling:
+	// the node binds on the address the conf gave it and then tries to reach
+	// everybody at the address the validator file gave them, which is a node that
+	// listens where it was told and talks to nobody. Resolving the addresses here,
+	// before the state exists, is what makes the conf mean anything.
+	listenAddrs, err := netConf.ApplyAddrs(validatorListenAddrs(vs))
+	if err != nil {
+		log.Internal.Fatal().Err(err).Msg("net conf peer addresses failed")
+	}
+	if portOverride > 0 {
+		for i, addr := range listenAddrs {
+			listenAddrs[i], err = overridePort(addr, portOverride)
+			if err != nil {
+				log.Internal.Fatal().Str("address", addr).Err(err).Msg("peer address port override failed")
+			}
+		}
 	}
 	udpAddress, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
@@ -282,10 +323,11 @@ func main() {
 				Msg("validator public key decode failed")
 		}
 
-		meta, err := k.ToMetadata()
+		meta, err := metadataFromAddr(listenAddrs[i])
 		if err != nil {
 			log.Internal.Fatal().
 				Int("index", i).
+				Str("address", listenAddrs[i]).
 				Err(err).
 				Msg("validator metadata decode failed")
 		}
@@ -332,10 +374,6 @@ func main() {
 			Msg("more validators were asked for than the validator file has")
 	}
 
-	listenAddrs, err := netConf.ApplyAddrs(validatorListenAddrs(vs))
-	if err != nil {
-		log.Internal.Fatal().Err(err).Msg("net conf peer addresses failed")
-	}
 	devValidators, err := devnet.DevValidatorKeys(validatorCount, listenAddrs)
 	if err != nil {
 		log.Internal.Fatal().Err(err).Msg("validator state build failed")
