@@ -606,3 +606,57 @@ El caminho esta acotado y son tres cosas, en este orden:
 
 `scripts/devnet-deriva.sh N` deja la primera de estas medida, que es como se
 llego aqui, y es la forma de comprobar cada uno de los tres pasos por separado.
+
+### Lo que queda, ahora con lo que ya esta arreglado
+
+La deriva que medi esta arreglada: cinco nodos sin tocar ninguno pasan de 0 de 100
+muestras de acuerdo a 99 de 100. Lo que queda son dos cosas, y ninguna es de la
+cadena.
+
+**El faucet se queda colgado.** `papucoin_faucet` llega al nodo y no vuelve nunca:
+
+```
+DEBUG | message: "RPC call" | method: "papucoin_faucet"
+... y despues, nada. Ni el faucet, ni system_health, ni jam_getHeader.
+```
+
+La llamada se registra y el manejador no termina. Como el servidor atiende de uno en
+uno, el resto del RPC se queda sin respuesta con el nodoProduces bloques normal,
+que es la parte incomoda: el nodo esta bien y el RPC esta muerto.
+
+Se sabe de donde sale: sin clave puente contesta enseguida con
+
+```
+the node has no bridge key, so it cannot pay for a payout
+```
+
+o sea que la llamada entra, pide la clave, la encuentra, y ahi es donde se queda.
+`Runtime.Faucet` firma el pago y lo mete en la cola, y pedir el estado de la cola
+despues (`s.runtime.Pending()`) es lo que no termina. Es la parte de la
+transaccion, no la de la cadena.
+
+**Seis nodos no caben en esta maquina.** Con seis, la cadena arranca y hay muestras
+de acuerdo, pero el RPC no contesta: seis nodos con `GOMAXPROCS=1` saturan la
+maquina y el `curl` de cuatro segundos expira antes de que el nodo conteste. Es un
+limite de la caja de pruebas, no del protocolo, y se ve subiendo el margen del
+`curl` o dejando los nodos por tandas.
+
+### La matriz de pruebas
+
+`scripts/devnet-matrix.sh [nodos] [segundos]` recorre de uno a seis nodos y, en
+cada numero:
+
+1. que la cadena arranque sola y los N se pongan de acuerdo
+2. que una transaccion llegue a todos, con el mismo bloque, la misma raiz y el
+   mismo saldo
+3. que al tirar la mitad de los nodos y levantar otros tantos de cero, sin
+   reiniciar los que se tiraron, la red vuelva a ponerse de acuerdo
+4. que el saldo sea el mismo en todos despues de las caidas
+
+El punto 3 es el que pedia que un nodo que cae se apague y se cree otro nuevo para
+saltarse el fallo, y no se reinicie el mismo: `tira` mata el proceso y borra su
+directorio, y `levanta` arranca uno nuevo desde cero. Que un nodo vuelva con su
+directorio es otra prueba, y esa la cubre `TestANodeResumesTheChainItWasRunning`.
+
+Los pasos 2 y 4 dependen del faucet, asi que hoy fallan por lo de arriba y no por
+la cadena. Los pasos 1 y 3 son los que se pueden pasar, y el 1 ya se pasa.
