@@ -61,6 +61,12 @@ type blockProducer struct {
 const (
 	foreignSlotGrace = 3 * time.Second
 	foreignSlotPoll  = 200 * time.Millisecond
+
+	// Asking for the blocks that are missing is on the path of catching up, so it
+	// has to be quick: the node is waiting to take part in its own timeslot while
+	// this runs. A batch of a few, one block each, and no second peer.
+	recoverBatch   = 4
+	recoverTimeout = 2 * time.Second
 	// authorRetryWait is how long an author waits before looking again for the
 	// block its timeslot has to build on. Long enough that holding a timeslot is
 	// not a busy loop.
@@ -327,6 +333,12 @@ func (bp *blockProducer) catchUpBehind() bool {
 	if header.TimeSlotIndex <= bp.runtime.Timeslot() {
 		return false
 	}
+	// A block that never arrived cannot be executed, and waiting for it to arrive
+	// on its own is waiting for nothing: announcements carry the head and the
+	// stretch behind it, so a block missed early stops being inside the window long
+	// before the node asks. The gap is named in the store, so it is asked for by
+	// name, from whatever peer answers, before concluding there is nothing to run.
+	bp.recoverMissingBlocks()
 	// Only the part that is actually there, and only up to the tip.
 	if ok, _ := bp.executeUpTo(header.TimeSlotIndex); !ok {
 		return false
@@ -336,6 +348,54 @@ func (bp *blockProducer) catchUpBehind() bool {
 		Str("tip", hashToHex(leaf)).
 		Msg("caught up with the chain")
 	return true
+}
+
+// recoverMissingBlocks asks peers, by hash, for the blocks the store knows are
+// missing between this node's state and the tip.
+//
+// The announcement path brings the head and a stretch behind it, which is enough
+// for a node that is only a little behind and useless for one that lost a block
+// early: that block is out of the window, and the node waits for a block that
+// nothing is going to announce again. Asking by name is the difference between
+// falling behind once and staying behind for good, and it is what makes a node
+// that has been away or has just started converge on the chain it is on.
+//
+// It reports how many blocks it managed to get, which is zero most of the time.
+func (bp *blockProducer) recoverMissingBlocks() int {
+	hashes := bp.bs.BackfillHashes(recoverBatch)
+	if len(hashes) == 0 {
+		return 0
+	}
+	peers := bp.net.GetAllPeers()
+	if len(peers) == 0 {
+		return 0
+	}
+
+	gotten := 0
+	for _, p := range peers {
+		for _, h := range hashes {
+			ctx, cancel := context.WithTimeout(bp.ctx, recoverTimeout)
+			blocks, err := bp.net.RequestBlocks(ctx, h, false, 1, p.ProtoConn.TConn.PeerKey())
+			cancel()
+			if err != nil {
+				continue
+			}
+			for _, b := range blocks {
+				if err := bp.bs.Store.PutBlock(b); err != nil {
+					continue
+				}
+				gotten++
+			}
+		}
+		if gotten > 0 {
+			break
+		}
+	}
+	if gotten > 0 {
+		log.Internal.Info().Int("blocks", gotten).
+			Msg("asked for the blocks that were missing and got them")
+	}
+	return gotten
 }
 
 // catchUpTo executes the chain up to and including the given timeslot, waiting up

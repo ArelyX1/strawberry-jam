@@ -28,11 +28,45 @@ import (
 type connState int
 
 const (
-	headerSize                   = 297  // Size in bytes of a serialized block header
 	SendingHandshake   connState = iota // Initial state: sending handshake to peer
 	ReceivingHandshake                  // Awaiting handshake response from peer
 	Ready                               // Handshake completed, ready for announcements
 )
+
+// An announcement is: the length of the header, the header itself, then the latest
+// finalized block as hash and slot.
+//
+// The header cannot be read at a fixed offset. It carries an epoch marker holding
+// one key pair per validator, so it is as big as the validator set, and the marker
+// is only present on the first timeslot of an epoch, so the same field is not even
+// the same size from one block to the next. A fixed size written once by hand is a
+// number that is wrong twice: too small, and the header is written truncated into
+// the buffer and the marker that falls off the end is the one the receiver trips
+// over; too big, and the receiver reads the finalized block out of the middle of
+// the header.
+//
+// So the length goes in the message and the header is taken from what it says.
+// That is a departure from the fixed-width framing of the spec, and it has to be:
+// the spec's width assumes a header that does not grow, and this one does.
+//
+//	| len (4) | header (len) | finalized hash (32) | finalized slot (4) |
+const (
+	announceHeaderLenSize = 4
+	announceFinalSize     = 32 + 4
+)
+
+// serializeAnnouncement lays out an announcement around an already marshalled header.
+func serializeAnnouncement(header []byte, finalized chain.LatestFinalized) []byte {
+	content := make([]byte, announceHeaderLenSize+len(header)+announceFinalSize)
+	binary.LittleEndian.PutUint32(content, uint32(len(header)))
+	off := announceHeaderLenSize
+	copy(content[off:], header)
+	off += len(header)
+	copy(content[off:], finalized.Hash[:])
+	off += 32
+	binary.LittleEndian.PutUint32(content[off:], uint32(finalized.TimeSlotIndex))
+	return content
+}
 
 // BlockRequestor defines an interface for requesting blocks from peers.
 type BlockRequestor interface {
@@ -260,14 +294,12 @@ func (ba *BlockAnnouncer) SendAnnouncement(header *block.Header) error {
 		return nil
 	}
 	// Format: header + finalized(hash + slot)
-	content := make([]byte, 333) // 297 for header + finalHash 36 for finalized, + 4 for slot
 	hb, err := header.Bytes()
 	if err != nil {
 		return fmt.Errorf("failed to marshal header: %w", err)
 	}
-	copy(content[0:], hb)
-	copy(content[297:], ba.LatestFinalized.Hash[:])
-	binary.LittleEndian.PutUint32(content[329:], uint32(ba.LatestFinalized.TimeSlotIndex))
+
+	content := serializeAnnouncement(hb, ba.LatestFinalized)
 	// Send the message through the channel
 	select {
 	case ba.sendCh <- content:
@@ -428,21 +460,31 @@ func (ba *BlockAnnouncer) receiveLoop() {
 // It extracts the header and finalized block information, validates the announcement,
 // stores the new header, and requests the full block if needed.
 func (ba *BlockAnnouncer) processAnnouncement(content []byte) error {
-	if len(content) < 333 { // Minimum size: header(297) + finalized(36)
+	if len(content) < announceHeaderLenSize+announceFinalSize {
 		return fmt.Errorf("announcement message too short")
 	}
+
+	// The header is read from where the message says it is, not from a fixed
+	// offset, so a header that grew with the validator set is still read whole.
+	headerLen := int(binary.LittleEndian.Uint32(content))
+	if headerLen < 0 || len(content) < announceHeaderLenSize+headerLen+announceFinalSize {
+		return fmt.Errorf("announcement header length %d does not fit in a message of %d bytes",
+			headerLen, len(content))
+	}
+	headerBytes := content[announceHeaderLenSize : announceHeaderLenSize+headerLen]
 
 	// Extract header
 	var header block.Header
 	peerFinalized := chain.LatestFinalized{}
 
-	err := jam.Unmarshal(content[:headerSize], &header)
+	err := jam.Unmarshal(headerBytes, &header)
 	if err != nil {
 		return fmt.Errorf("unmarshal header: %w", err)
 	}
-	copy(peerFinalized.Hash[:], content[headerSize:headerSize+32])
+	finalAt := announceHeaderLenSize + headerLen
+	copy(peerFinalized.Hash[:], content[finalAt:finalAt+32])
 
-	peerFinalized.TimeSlotIndex = jamtime.Timeslot(binary.LittleEndian.Uint32(content[headerSize+32:]))
+	peerFinalized.TimeSlotIndex = jamtime.Timeslot(binary.LittleEndian.Uint32(content[finalAt+32:]))
 
 	// Validate the announcement: announced block must be after peer's finalized block
 	if header.TimeSlotIndex <= peerFinalized.TimeSlotIndex {
