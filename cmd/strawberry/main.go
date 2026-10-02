@@ -128,6 +128,7 @@ func main() {
 		nodeName           string
 		telemetryURL       string
 		portOverride       int
+		netConfPath        string
 		rpcPort            int
 		help               bool
 		genesisPath        string
@@ -153,6 +154,8 @@ func main() {
 	flag.StringVar(&nodeName, "name", "Strawberry-Node", "node name")
 	flag.StringVar(&telemetryURL, "telemetry-url", "", "telemetry WebSocket URL")
 	flag.IntVar(&portOverride, "port", 0, "override p2p listen port")
+	flag.StringVar(&netConfPath, "net-conf", "",
+		"where the machines are: this node's own listen address and, under [peers], the address of each validator by index")
 	flag.IntVar(&rpcPort, "rpc-port", 9944, "RPC WebSocket and HTTP port")
 	flag.StringVar(&genesisPath, "genesis", "genesis/chain-dev.json", "path to the genesis of the PAPU economy")
 	flag.StringVar(&dataDir, "data-dir", "", "directory to keep blocks and state in; empty keeps them in memory")
@@ -213,22 +216,41 @@ func main() {
 			Uint16("index", index).
 			Msg("validator configuration index out of bounds")
 	}
-	address := vs[index].IP
-	port := vs[index].Port
-	if portOverride > 0 {
-		port = portOverride
+	// Where this node listens comes from the net conf when there is one, and from
+	// the validator file when there is not. The file is the same bytes on every
+	// machine and the address a machine has today is not, which is why the two are
+	// separate: moving a machine is one line in one file, not a regenerated
+	// validator file shipped to everybody.
+	netConf, err := devnet.LoadNetConf(netConfPath)
+	if err != nil {
+		log.Internal.Fatal().Err(err).Msg("net conf load failed")
 	}
-	udpAddress, err := net.ResolveUDPAddr("udp", net.JoinHostPort(address, strconv.Itoa(port)))
+	listen, err := netConf.ListenAddr(index, vs[index].IP, vs[index].Port)
+	if err != nil {
+		log.Internal.Fatal().Err(err).Msg("net conf listen address failed")
+	}
+	if portOverride > 0 {
+		_, p, err := net.SplitHostPort(listen)
+		if err != nil {
+			log.Internal.Fatal().Err(err).Msg("listen address from the net conf has no port to override")
+		}
+		listen = net.JoinHostPort(strings.TrimSuffix(listen[:len(listen)-len(p)-1], ":"), strconv.Itoa(portOverride))
+	}
+	udpAddress, err := net.ResolveUDPAddr("udp", listen)
 	if err != nil {
 		log.Internal.Fatal().
-			Str("address", address).
-			Int("port", port).
+			Str("address", listen).
 			Err(err).
 			Msg("address resolve failed")
 	}
 
+	// With the port in it, because the first thing anyone asks when a node is not
+	// reachable is which port it is on, and "listening on: 127.0.0.1" does not
+	// answer that.
 	log.Internal.Info().
-		Msgf("listening on: %v", address)
+		Str("address", udpAddress.String()).
+		Uint16("validator", index).
+		Msg("listening on")
 
 	seed, err := decodeHex(vs[index].Ed25519Prv)
 	if err != nil {
@@ -310,7 +332,11 @@ func main() {
 			Msg("more validators were asked for than the validator file has")
 	}
 
-	devValidators, err := devnet.DevValidatorKeys(validatorCount, validatorListenAddrs(vs))
+	listenAddrs, err := netConf.ApplyAddrs(validatorListenAddrs(vs))
+	if err != nil {
+		log.Internal.Fatal().Err(err).Msg("net conf peer addresses failed")
+	}
+	devValidators, err := devnet.DevValidatorKeys(validatorCount, listenAddrs)
 	if err != nil {
 		log.Internal.Fatal().Err(err).Msg("validator state build failed")
 	}
