@@ -242,7 +242,15 @@ func (bp *blockProducer) adoptSlot(slot jamtime.Timeslot) bool {
 		return false
 	}
 
-	chain, err := bp.bs.CanonicalChain(leaf, int(slot)+1)
+	// The whole chain, not the last few blocks. The walk goes by parent hash from
+	// the tip, so asking for a suffix gives the last n blocks and nothing before
+	// them, and the replay below starts at the timeslot this node's state stands
+	// at rather than at the tip. Every timeslot between the two that was not in
+	// the suffix would then be stepped with no block and nothing to check it
+	// against, which is how a node ends up holding a block it adopted over a
+	// state that block was never built on, and refusing its own chain as
+	// unrebuildable.
+	chain, err := bp.bs.CanonicalChain(leaf, 0)
 	if err != nil || len(chain) == 0 || chain[len(chain)-1].Header.TimeSlotIndex != slot {
 		return false
 	}

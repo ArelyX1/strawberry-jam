@@ -240,13 +240,44 @@ func NewNodeWithStore(nodeCtx context.Context, listenAddr *net.UDPAddr, keys val
 func (n *Node) OnConnection(conn *transport.Conn) {
 	n.peersLock.Lock()
 	defer n.peersLock.Unlock()
-	// If peer already exists, close existing connection and replace with new one.
+	// Two nodes that start together both dial each other, so each ends up with
+	// two connections to the same peer and both have to throw one away. Which one
+	// they throw away has to come out the same on both sides, and neither "the
+	// newer wins" nor "the first wins" does that.
+	//
+	// Newest does not, because the two connections arrive in opposite order at
+	// the two nodes. First does not either: when both dial at once, the first one
+	// each node sees is the one it dialled itself, so A keeps the connection it
+	// dialled and B keeps the one it dialled, and each has just closed the one the
+	// other is holding. They end up crossed, and every announcement fails with the
+	// connection closed by the remote.
+	//
+	// What both nodes can compute the same way is the pair of ports a connection
+	// has, because each side knows its own and the peer's. The smaller pair wins,
+	// which both sides agree on without having to agree about anything else. The
+	// two connections are then dropped together, one on each node, and each is
+	// left holding a live connection the other is not closing.
 	if existingPeer := n.PeersSet.GetByEd25519Key(conn.PeerKey()); existingPeer != nil {
-		// Close existing connection
-		if err := existingPeer.ProtoConn.Close(); err != nil {
-			log.Printf("Failed to close existing peer connection: %v", err)
+		existing := existingPeer.ProtoConn.TConn
+		switch {
+		case existing.Context().Err() != nil:
+			// The one this node has is gone, which is the only case where there
+			// is nothing to choose between.
+			if err := existing.Close(); err != nil {
+				log.Printf("Failed to close existing peer connection: %v", err)
+			}
+			n.PeersSet.RemovePeer(existingPeer)
+		case preferConnection(conn, existing):
+			if err := existing.Close(); err != nil {
+				log.Printf("Failed to close existing peer connection: %v", err)
+			}
+			n.PeersSet.RemovePeer(existingPeer)
+		default:
+			if err := conn.Close(); err != nil {
+				log.Printf("Failed to close the duplicate connection: %v", err)
+			}
+			return
 		}
-		n.PeersSet.RemovePeer(existingPeer)
 	}
 
 	pConn := n.ProtocolManager.OnConnection(conn)
@@ -624,6 +655,60 @@ func (n *Node) AnnounceBlock(ctx context.Context, header *block.Header, peer *pe
 		return ctx.Err()
 	}
 	return peer.BAnnouncer.SendAnnouncement(header)
+}
+
+// preferConnection says whether incoming should be the one this node keeps when it
+// already has one connection to the same peer and both are alive.
+//
+// The comparison is on the two ports, smallest first, and both nodes hold the
+// same two numbers for the same two connections, so they reach the same answer
+// without exchanging anything. Arrival order cannot be used for this: the two
+// connections turn up in opposite order at the two ends, so whichever rule went
+// by order had each node keeping the connection the other had just closed.
+func preferConnection(incoming, existing *transport.Conn) bool {
+	il, ir := addrPorts(incoming)
+	el, er := addrPorts(existing)
+	return preferPorts(il, ir, el, er)
+}
+
+// preferPorts decides between two connections to the same peer.
+//
+// The two ports are sorted before they are compared, and that is the whole
+// point. A connection is seen with its own local port first at one end and at
+// the other end with the same two numbers the other way round, so a connection
+// B dialled to A is (30333, 51000) on A's side and (51000, 30333) on B's.
+// Comparing them as they come leaves the two nodes comparing different numbers
+// about the same two connections, which is the disagreement this is here to
+// avoid: each keeps the one it dialled and closes the one the other is holding.
+func preferPorts(inLocal, inRemote, exLocal, exRemote int) bool {
+	inLo, inHi := orderPorts(inLocal, inRemote)
+	exLo, exHi := orderPorts(exLocal, exRemote)
+	if inLo != exLo {
+		return inLo < exLo
+	}
+	return inHi < exHi
+}
+
+func orderPorts(a, b int) (int, int) {
+	if a > b {
+		return b, a
+	}
+	return a, b
+}
+
+func addrPorts(c *transport.Conn) (int, int) {
+	local, remote := 0, 0
+	if addr := c.QConn().LocalAddr(); addr != nil {
+		if udp, ok := addr.(*net.UDPAddr); ok {
+			local = udp.Port
+		}
+	}
+	if addr := c.QConn().RemoteAddr(); addr != nil {
+		if udp, ok := addr.(*net.UDPAddr); ok {
+			remote = udp.Port
+		}
+	}
+	return local, remote
 }
 
 // RequestState implements the client side of the CE 129 State Request protocol from the JAMNP.

@@ -90,3 +90,82 @@ func TestRebuildAfterRewindMatchesRunning(t *testing.T) {
 	assert.Equal(t, author.Root(), follower.Root(),
 		"rewinding and replaying a chain has to give the state that ran it")
 }
+
+// This is the shape a two-validator run actually has, and it is not the shape
+// the tests above cover. A node runs the timeslots it authors and rebuilds the
+// ones another validator wrote, and it alternates between the two for the whole
+// life of the chain. Each rebuild finishes by clearing the numbers the node had
+// handed out, on the grounds that a rebuild is where a node starts over. That is
+// true of a node resuming its own chain after a restart and false of a node that
+// is running and adopts one block from a peer, and the two cases are the same
+// function.
+func TestInterleavingRunAndRebuildAgreesWithRunning(t *testing.T) {
+	const slots = 6
+	start := jamtime.Timeslot(9195000)
+
+	// The author runs every timeslot and keeps what each one settled.
+	author := newTestRuntime(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	steps := make([]step, 0, slots)
+	for i := 0; i < slots; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	// The follower authors the even timeslots and has to rebuild the odd ones,
+	// which is what a two-validator chain does on both nodes in turn.
+	follower := newTestRuntime(t)
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		if i%2 == 0 {
+			_, err := follower.Run(slot)
+			require.NoError(t, err)
+		} else {
+			require.NoError(t, follower.Rebuild(s.work))
+			require.NoError(t, follower.Step(slot))
+			follower.FinishRebuild()
+		}
+		assert.Equal(t, s.root, follower.Root(),
+			"timeslot %d: alternating between running and rebuilding gives a different state", slot)
+	}
+}
+
+// And the same again on the node that has to adopt a chain it was not building,
+// which is the node that comes back after being away.
+func TestAdoptingOneBlockMidRunKeepsTheState(t *testing.T) {
+	const slots = 6
+	start := jamtime.Timeslot(9196000)
+
+	author := newTestRuntime(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	steps := make([]step, 0, slots)
+	for i := 0; i < slots; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	follower := newTestRuntime(t)
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		if i == 3 {
+			// This is the whole of a peer's block arriving in a chain this node
+			// is already running.
+			require.NoError(t, follower.Rebuild(s.work))
+			require.NoError(t, follower.Step(slot))
+			follower.FinishRebuild()
+		} else {
+			_, err := follower.Run(slot)
+			require.NoError(t, err)
+		}
+		assert.Equal(t, s.root, follower.Root(),
+			"timeslot %d: adopting one block in the middle changed the state", slot)
+	}
+}

@@ -269,46 +269,6 @@ Verificado con dos nodos: se ven, anuncian sin un solo fallo y se quedan en el
 mismo tip. El modo de un solo nodo sigue igual, con el smoke test y la
 conformidad en verde.
 
-### Lo que falta
-
-La raiz de estado, en la red viva. A y B terminan en el mismo bloque, pero la raiz
-que tiene A no es la que tiene B en ese bloque.
-
-Lo que ya se sabe: no es que el replay y la ejecucion sean distintas por si
-mismos. Hay tests queしたもの y lo otro sobre la misma cadena y las dos rutas
-coinciden, con y sin rebobinar antes. Asi que la divergencia es de algo que solo
-aparece con los dos nodos en marcha, y no esta aislada.
-
-Lo que se ha corregido en el camino, y si era la causa: `followCanonical` pasaba
-al runtime toda la cadena de golpe, de modo que la cola de trabajo era
-compartida y un timeslot podia liquidar trabajo del bloque siguiente. Ahora
-adopta por el mismo camino que usa un nodo al reiniciar: un timeslot cada vez, el
-trabajo de ese timeslot antes de su paso, y la raiz comprobada contra el bloque
-que se va a reconstruir. Una cadena que no se reconstruye se rechaza en vez de
-adoptarse. `Runtime.Replay`, que encolaba todo de golpe, no le quedaba ningun
-llamador y se ha quitado en vez de dejarla a mano para el siguiente.
-
-ba y hacia que fallara
-
-Tres cosas, y las tres hubo que encontrarlas mirando el error de verdad:
-
-1. **El bucle de reconexion destruia el anunciador.** `ConnectToPeer` rechaza
-   marcar un par que ya existe, pero compara por direccion, y el par se guarda
-   con el puerto efimero de la conexion, no con el que se marco. Asi que nunca
-   coincidia: el bucle reconectaba cada 30s y cada reconexion cerraba el par
-   anterior con su stream de anuncio puesto. Todos los bloques siguientes
-   fallaban con `context canceled`.
-
-2. **El contexto del anuncio no se podia cancelar.** Cancelar el contexto por
-   bloque dejaba muerto el stream del anunciador para siempre, porque el
-   anotador queda ligado al contexto que lo creo. El anuncio va ahora en su
-   propia goroutine con el contexto del nodo.
-
-3. **La deduplicacion era por direccion en vez de por clave de validador.** Dos
-   nodos que arrancan a la vez se marcan el uno al otro, se crean dos conexiones
-   y la segunda reemplaza a la primera, tirando el stream. Con la clave
-   Ed25519 del vecino, un vecino ya conectado se deja tranquilo.
-
 ### Hecho: rellenar los bloques que faltan (A2)
 
 Anunciar un bloque y tenerlo son cosas distintas. Al announced una cabecera que
@@ -390,16 +350,79 @@ Con `--author-count 1` un nodo solo escribe todos los slots, que es el modo de u
 solo nodo y lo que usan el smoke test y las pruebas de reinicio. El valor por
 defecto es la constante de la cadena.
 
+### La conexion: dos validadores, dos conexiones, y cada una cerrando la de la otra
+
+Con los dos nodos de verdad en marcha, ninguno se enteraba de nada: los dos
+fallaban al abrir el stream de anuncio con `Application error 0x0 (remote)`, o
+sea que la conexion que cada uno tenia la habia cerrado el otro. Sin anuncios no
+hay cadena compartida, y sin cadena compartida no hay nada que sincronizar.
+
+La causa es que dos nodos que arrancan juntos se llaman los dos, asi que cada uno
+acaba con dos conexiones al mismo par y tiene que tirar una. Como se tirara no
+importaba mientras los dos nodos fueran el mismo validador, porque entonces no
+habia dos conexiones que cruzar. Con dos validadores si importa, y las dos
+reglas que se probaron estaban mal:
+
+- **Gana la mas nueva.** Las dos conexiones llegan en orden opuesto a los dos
+  nodos, asi que A se queda con la segunda que vio y B con la segunda que vio, y
+  esas son conexiones distintas. Cada uno cerraba la que el otro tenia.
+- **Gana la primera.** Cuando ambos llaman a la vez, la primera que ve cada uno es
+  la que el mismo ha llamado, asi que pasa lo mismo: A se queda con la suya y B
+  con la suya, y cada uno acaba de cerrar la del otro.
+
+Lo que si es el mismo en los dos extremos son los dos puertos de la conexion, y
+no en el orden en que aparecen: una conexion que B llamo a A se ve en A como
+`(30333, 51000)` y en B como `(51000, 30333)`, con local y remoto cambiados de
+sitio. Compararlos como llegan deja a cada nodo comparando numeros distintos
+sobre las mismas dos conexiones, que es exactamente la discrepancia que se
+pretendia evitar. Ordenando el par antes de comparar, los dos eligen la misma y
+cada uno conserva una conexion viva que el otro no esta cerrando. El test que
+fija esto tiene que modelar el cambio de local y remoto, porque un test que usa
+el mismo par en los dos extremos pasa con el bug dentro.
+
+Con esto los dos nodos comparten cadena: 36 de 40 muestras con el mismo tip,
+antes 0 de 40.
+
+
 ### Lo que falta
 
-La raiz de estado. A y B coinciden en el bloque, pero A ejecuta la cadena que
-adopta y su raiz no sale igual a la de B. O `Replay` no reproduce lo mismo que
-`Run`, o el estado se rebobina a un punto que no es el del padre del bloque que
-se esta construyendo. Con un solo nodo el replay recorre el mismo camino y por eso
-las pruebas de reinicio pasan; lo que falla aqui es reconstruir un estado ajeno.
-
-Nota sobre la prueba de A7: comparar los dos tips en el mismo instante no puede
-dar exito en una cadena que sigue creciendo, porque en cuanto B escribe el bloque
-de un timeslot A todavia no lo tiene. La comprobacion correcta es si el tip de A
-esta en la cadena de B, que es lo que significa que le siga, y eso es lo que
-mira ahora.
+La raiz de estado, y aqui ya no hay ambiguedad posible. Reiniciando los dos nodos
+desde disco, cada uno reproduce su cadena entera desde genesis y los dos
+terminan con el mismo bloque, y las raices **no** coinciden. No es retardo: tras
+el reinicio los dos han ejecutado la misma cadena.
+Lo que si se ha descartado: ejecutar una cadena y reconstruirla desde el trabajo
+que nombran sus bloques dan la misma raiz, timeslot a timeslot, tanto desde
+genesis como rebobinando antes, y tambien intercalando las dos formas, que es lo
+que hace un nodo de dos validadores. O sea que los dos caminos son el mismo y la
+divergencia es de algo que solo aparece cuando los dos nodos estan en marcha. No
+esta aislada.
+La raiz de estado, en la red viva. A y B terminan en el mismo bloque, pero la raiz
+que tiene A no es la que tiene B en ese bloque.
+Lo que ya se sabe: no es que el replay y la ejecucion sean distintas por si
+mismos. Hay tests queしたもの y lo otro sobre la misma cadena y las dos rutas
+coinciden, con y sin rebobinar antes. Asi que la divergencia es de algo que solo
+aparece con los dos nodos en marcha, y no esta aislada.
+Lo que se ha corregido en el camino, y si era la causa: `followCanonical` pasaba
+al runtime toda la cadena de golpe, de modo que la cola de trabajo era
+compartida y un timeslot podia liquidar trabajo del bloque siguiente. Ahora
+adopta por el mismo camino que usa un nodo al reiniciar: un timeslot cada vez, el
+trabajo de ese timeslot antes de su paso, y la raiz comprobada contra el bloque
+que se va a reconstruir. Una cadena que no se reconstruye se rechaza en vez de
+adoptarse. `Runtime.Replay`, que encolaba todo de golpe, no le quedaba ningun
+llamador y se ha quitado en vez de dejarla a mano para el siguiente.
+ba y hacia que fallara
+Tres cosas, y las tres hubo que encontrarlas mirando el error de verdad:
+1. **El bucle de reconexion destruia el anunciador.** `ConnectToPeer` rechaza
+   marcar un par que ya existe, pero compara por direccion, y el par se guarda
+   con el puerto efimero de la conexion, no con el que se marco. Asi que nunca
+   coincidia: el bucle reconectaba cada 30s y cada reconexion cerraba el par
+   anterior con su stream de anuncio puesto. Todos los bloques siguientes
+   fallaban con `context canceled`.
+2. **El contexto del anuncio no se podia cancelar.** Cancelar el contexto por
+   bloque dejaba muerto el stream del anunciador para siempre, porque el
+   anotador queda ligado al contexto que lo creo. El anuncio va ahora en su
+   propia goroutine con el contexto del nodo.
+3. **La deduplicacion era por direccion en vez de por clave de validador.** Dos
+   nodos que arrancan a la vez se marcan el uno al otro, se crean dos conexiones
+   y la segunda reemplaza a la primera, tirando el stream. Con la clave
+   Ed25519 del vecino, un vecino ya conectado se deja tranquilo.
