@@ -545,25 +545,64 @@ timeslot, un tramo con huecos se detiene en el hueco dejando el estado que el au
 tenia en ese punto, y un tramo entero se ejecuta de punta a punta. Los tres casos
 tienen test.
 
-### Lo que queda
+### La deriva, medida con los nodos en paz
 
-Tras un nodo irse y volver, dos de los que llevaban mas tiempo corriendo aparecen
-con **el mismo bloque y dos raices de estado**. Y no es que uno haya rechazado la
-cadena: no hay ni una reconstruccion rechazada en ninguno de los dos, o sea que
-cada uno acepta todo lo que reconstruye.
+Nada de reinicios, nada de nodos caidos: cinco nodos en marcha y mirandolos durante
+150 segundos. La comprobacion de la malla pregunta si coinciden en algun momento, y
+eso no dice si se quedan de acuerdo. Preguntado al reves:
 
-Eso deja una sola explicacion que encaja con lo medido: **no estan en el mismo punto
-de ejecucion**. El nodo que autoro el bloque del tip ya lo ejecuto y los demas lo
-ejecutan en el timeslot siguiente, asi que hay una ventana, la mayor parte del
-tiempo, en la que estan un paso distintos de la misma cadena. Comparar las raices en
-un instante cualquiera mide esa ventana, no el estado.
+```
+muestra  0: altura 0x2; se separan: 3
+muestra 31: altura 0x8; se separan: 1 2 3 4
+muestra 47: altura 0xb; se separan: 4
+muestra 58: altura 0xc; se separan: 1
+```
 
-La comprobacion de la malla necesita entonces comparar el estado **en el mismo
-bloque**, no el estado vivo de cada nodo. El RPC solo expone la raiz del estado
-vivo, asi que hace falta una forma de preguntar por la raiz que un nodo tiene para
-un bloque concreto, y ahi es donde se ha quedado esto.
+Se separan desde el principio y se separan otra vez. No es del reinicio: es el
+regimen.
 
-Lo que si esta comprobado con tres nodos: la cadena arranca sola, los tres
-comparten bloque y raiz de estado, la malla esta completa, uno se cae, la cadena
-sigue sin el, y al volver se sincroniza. Lo unico que falla es la comprobacion
-final, y lo que falla es como se comprueba.
+Y con la traza de replay puesta, el dato que lo explica:
+
+```
+STRAWBERRY_TRACE_REPLAY=1   ->  cero lineas en los cinco nodos
+peticiones de bloque        ->  0
+backfill                    ->  0
+anuncios procesados         ->  0
+```
+
+`bp.replay` **no se llama ni una vez**. Los nodos ejecutan sus propios bloques y
+nunca los de los demas. Y a la vez los cinco nombran el mismo bloque, o sea que las
+**cabeceras si se propagan y los cuerpos no**.
+
+De ahi la forma exacta del fallo: mismo bloque, distintas raices. Cada nodo ha
+ejecutado lo suyo y ha adoptado la cabecera de los demas sin ejecutar el bloque que
+nombra. El estado que anuncia es el suyo, no el de la cadena que publica.
+
+Y el motivo por el que la cadena aun asi avanza y los tips concuerdan es que la
+comprobacion de la punta dice siempre "la punta va un timeslot por detras", que es
+lo que hace un nodo que solo ve su propia cadena: el siguiente bloque es suyo y
+nadie le ha traido el de al lado.
+
+### Lo que esto significa para lo que falta
+
+Lo que se pide es que todo converja y que haya pruebas con transacciones de uno a
+seis nodos, tirando nodos y levantando otros. Nada de eso puede pasar mientras los
+nodos no ejecuten los bloques ajenos: un nodo con la cadena correcta y el estado
+equivocado no esta sincronizado, y una transaccion comprobada sobre ese estado
+comprobaria el estado equivocado.
+
+El caminho esta acotado y son tres cosas, en este orden:
+
+1. **Que llegue el cuerpo del bloque.** Un anuncio trae una cabecera; el cuerpo se
+   pide aparte, y esas peticiones son cero. Es el CE 128 que ya existe y que la
+   malla no esta usando.
+2. **Que el nodo lo ejecute.** Con el cuerpo en el store, `executeUpTo` tiene lo
+   que necesita y `bp.replay` entraria en juego, que es justo lo que hoy no
+   ocurre nunca.
+3. **Que la comprobacion mida el bloque y no el instante.** Dos nodos con un autor
+   por timeslot estan un paso distintos casi siempre, asi que comparar sus raices
+   vivas mide la ventana y no el estado. Hace falta poder preguntar por la raiz que
+   un nodo tiene para un bloque concreto.
+
+`scripts/devnet-deriva.sh N` deja la primera de estas medida, que es como se
+llego aqui, y es la forma de comprobar cada uno de los tres pasos por separado.
