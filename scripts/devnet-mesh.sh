@@ -31,6 +31,11 @@ cd "$ROOT" || exit 1
 BIN="./strawberry"
 [ -x "$BIN" ] || { echo "falta $BIN; compílalo con: go build -tags dev -o strawberry ./cmd/strawberry/" >&2; exit 1; }
 
+# Los logs se cortan a 20 MB por nodo. Un bucle que reintenta sin parar escribia
+# cientos de megabytes en minutos y llenaba el disco, y el guiado por tubereria
+# lo corta en el punto en el que se pasaria de ahi en vez de despues.
+MAX_LOG_BYTES=20000000
+
 BASE_PORT=30333
 BASE_RPC=19944
 RUN="/tmp/strawberry-mesh"
@@ -113,7 +118,7 @@ arranca() { # arranca <indice>
     --validators-file "$VALFILE" --author-count "$N" --full-mesh \
     --genesis "$GENFILE" \
     --rpc-port "$rpc" --port "$net" --data-dir "$dir" \
-    > "$RUN/n$i.log" 2>&1 &
+    2>&1 | head -c 20000000 > "$RUN/n$i.log" &
   PIDS+=("$!")
   NODES+=("$i")
   echo "  levantado mesh-$i  validador $i  red $net  rpc $rpc"
@@ -180,6 +185,7 @@ comprueba_malla() { # comprueba_malla <etiqueta>
 
 echo "== malla de $N validadores =="
 fallos=0
+plazo=0
 i=0
 hasta=0
 i2=0
@@ -205,7 +211,12 @@ while [ "$i" -lt "$N" ]; do
     espera_rpc "$i" 25 || { echo "  FALLO: mesh-$i no abrio su RPC"; exit 1; }
     # Un nodo recien llegado tiene que alcanzar la cadena comun. Se le da margen
     # para que la complete, y luego se exige que los $((i+1)) coincidan.
-    convergen "nodo $i.sync" 75 || fallos=$((fallos + 1))
+    # El plazo escala con la malla. Un nodo que entra tiene que traer la cadena
+    # que se perdio, y en una malla mayor hay mas validadores y el turno de
+    # escribir tarda mas en volver a pasar: un plazo fijo media contra una malla
+    # grande, y lo que se mide es la espera y no el nodo.
+    plazo=$((45 + N * 20))
+    convergen "nodo $i.sync" "$plazo" || fallos=$((fallos + 1))
     comprueba_malla "nodo $i.malla" || fallos=$((fallos + 1))
   fi
   i=$((i + 1))
@@ -218,4 +229,8 @@ else
   echo "VEREDICTO: $fallos comprobaciones fallaron."
 fi
 para
+# Los datos de cada nodo son decenas de megabytes de write-ahead log y no hacen
+# falta para leer el resultado, que esta en los logs. Sin esto cada ejecucion deja
+# cientos de megabytes en /tmp.
+rm -rf "$RUN"/n*/ 2>/dev/null
 exit "$fallos"

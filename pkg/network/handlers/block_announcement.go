@@ -63,6 +63,17 @@ func NewBlockAnnouncementHandler(bs *chain.BlockService, requestor BlockRequesto
 
 type BlockReceiveHook func(ctx context.Context, block block.Block)
 
+// announceBlockBatch is how many blocks are asked for when a block is announced:
+// the announced one and the stretch behind it, so a node that is behind is not one
+// block behind for the rest of its life.
+//
+// One block per announcement is what made the chain stop. The author of a timeslot
+// writes its block at the start of that timeslot, and the node that has to build
+// on it wants it at the start of the next one, so a single block per announcement
+// leaves the follower behind every time and leaves the next author waiting for a
+// block nobody is going to produce.
+const announceBlockBatch = 32
+
 // BlockAnnouncer manages a single UP 0 block announcement stream with a peer.
 // It handles the initial handshake, tracking peer's chain state (finalized blocks and leaves),
 // and bidirectional exchange of block announcements according to the protocol rules.
@@ -485,7 +496,14 @@ func (ba *BlockAnnouncer) processAnnouncement(content []byte) error {
 	network.LogBlockEvent(time.Now(), "requesting", h, header.TimeSlotIndex.ToEpoch(), header.TimeSlotIndex)
 
 	// TODO: GRANDPA, how many blocks back we should even consider.
-	blocks, err := ba.requestor.RequestBlocks(ctx, h, false, 1, ba.peerKey)
+	// A batch, not one block. One block per announcement is what made the chain
+	// stop: the author of a timeslot writes its block at the start of it, and the
+	// node that has to build on it wants it at the start of the next one, so a
+	// single block per announcement leaves the follower a block behind every time
+	// and the author waiting for a block that never arrives. Asking for the stretch
+	// behind the announced block fills the gap in one request, which is what the
+	// protocol's range is for.
+	blocks, err := ba.requestor.RequestBlocks(ctx, h, false, announceBlockBatch, ba.peerKey)
 	if err != nil {
 		log.Printf("Warning: failed to request block %x: %v", h[:5], err)
 		return err

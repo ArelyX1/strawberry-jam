@@ -455,38 +455,45 @@ diga sigue fechando el suyo al arrancar, que es lo que le vale a uno solo.
 
 Con esto dos nodos comparten bloque **y raiz de estado**.
 
-### Lo que faltaba todavia
+### Un lote por anuncio, y alcanzar la cadena al ritmo del reloj
 
-**El estado se retrasa un bloque.** Cuando los dos nodos nombran el mismo bloque,
-el que no lo ha ejecutado tiene su estado en el anterior. Y hay un fallo mas
-grave: la cadena puede **pararse**. Un autor que no tiene el bloque del timeslot
-anterior no escribe, que es lo correcto porque escribir sobre un padre viejo
-bifurca la cadena; pero si el bloque anterior no llega, ese timeslot no lo escribe
-nadie, el siguiente autor espera el mismo bloque que no existe, y asi la cadena se
-queda quieta con los nodosrezagados的 muchos timeslots. Evitar la bifurcacion y no
-pararse son las dos cosas que hay que conseguir a la vez, y ahora solo esta la
-primera.
+Dos cosas mas, y con ellas una malla de tres nodos queda sincronizada: mismo bloque
+y misma raiz de estado en los tres, comprobado mas de una vez.
 
-El motivo por el que el bloque no llega es la latencia: la peticion CE 128 pide un
-bloque por anuncio, y el bloque lo escribe el autor **durante** su timeslot, asi que
-quien lo espera al principio del suyo todavia no lo tiene. Los anuncios ya se
-mandan en paralelo, que era necesario en cuanto habia mas de un par, pero el bloque
-sigue llegando tarde.
+**Un bloque por anuncio era poco.** El autor de un timeslot escribe su bloque al
+empezar ese timeslot, y quien tiene que construir encima lo quiere al empezar el
+siguiente. Pidiendo un solo bloque por anuncio, el seguidor iba un bloque atras
+siempre y el autor acababa esperando un bloque que no llegaba. Se pide el tramo
+detras del bloque anunciado, que es para lo que el rango del protocolo existe.
 
-### Lo que se ha arreglado por el camino
+**Alcanzar la cadena no puede esperar al turno de uno.** Un nodo solo ejecutaba en
+los timeslots que no le tocaba escribir, que en una malla de N es uno de cada N: un
+nodo que entraba en una malla de cinco solo podia ejecutar un bloque cada treinta
+segundos, y alcanzar una cadena diez bloques por delante le llevaba cinco minutos.
+Un nodo que va atrasado no esta participando en su propio timeslot de todas formas,
+asi que ejecuta lo que tiene y alcanza al ritmo del reloj. Cuando esta a la altura
+no hace nada.
 
-- **Los anuncios iban en serie.** Cada uno tiene cinco segundos para abrir su
-  stream y completar el handshake, y con dos pares eran diez segundos de un
-  timeslot de seis: el segundo par no se enteraba de nada. Se quedaba conectado
-  sin recibir announcements, sin poder alcanzar una cadena de la que nadie le
-  hablaba. Ahora van en paralelo, con el mapa de esperas protegido.
-- **El padre tras ejecutar.** Al ejecutar se ponia como padre la punta, que puede
-  estar por delante de lo ejecutado, con lo que el bloque siguiente nombraba un
-  padre del futuro. Dos nodos con el mismo estado acababan en bloques distintos.
-  Ahora es el ultimo bloque ejecutado.
-- **Las hojas no se rehacen al reiniciar.** El conjunto de hojas vive en memoria y
-  no se reconstruye, asi que un nodo que vuelve no tiene ninguna y la eleccion de
-  punta no encuentra nada que hacer. Anadir el genesis como hoja sin mas lo hacia
-  peor: el nodo creia que la cadena seguia en el genesis y construia encima.
-  Ahora una cadena nueva arranca con el genesis como cabeza y una reanudada, con su
-  tip.
+Y dos fallos propios de esta sesion, por si quedan:
+
+- Alcanzar la cadena estaba puesto como un caso del mismo `switch` que el turno, de
+  modo que un nodo que acababa de alcanzar se comia el resto del timeslot: si el
+  timeslot que le tocaba a el llegaba mientras iba atrasado, alcanzaba, daba por
+  hecho que su turno estaba hecho y no escribia el bloque. Nadie mas lo escribe
+  porque hay un autor por timeslot, y ahi se paraba la cadena.
+- Reintentar sin esperar, con una linea por intento, escribio cientos de megabytes
+  de log en un par de minutos y lleno el disco. El reintento espera ahora y lo dice
+  una vez por vez.
+
+### Lo que sigue sin estar
+
+Una malla de cinco nodos forma la malla entera, cada nodo ve a los otros cuatro, y
+los nodos que entran no convergen. Con tres va bien.
+
+La causa mas probable, y no la he confirmada: el turno de escribir rota sobre el
+numero final de validadores, asi que cuando solo hay dos nodos en marcha los
+timeslots del tercero no los escribe nadie y la cadena queda con huecos. Un nodo
+que entra despues necesita una cadena continua para poder ejecutarla, y con huecos
+no la tiene. La forma de resolverlo es que el turno dependa del conjunto de
+validadores que hay conectados, que es el mismo para todos porque la malla es
+completa, en vez de un numero fijado al lanzar la malla. No lo he hecho.

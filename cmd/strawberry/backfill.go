@@ -17,7 +17,7 @@ const backfillBatch = 32
 
 // Cada cuanto se mira si falta algo. Solo se hace trabajo cuando hay un hueco de
 // verdad, asi que la frecuencia no cuesta nada mientras no haya ninguno.
-const backfillEvery = 3 * time.Second
+const backfillEvery = time.Second
 
 // backfillLoop fills in the blocks this node is missing from its peers.
 //

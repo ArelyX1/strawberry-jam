@@ -61,6 +61,10 @@ type blockProducer struct {
 const (
 	foreignSlotGrace = 3 * time.Second
 	foreignSlotPoll  = 200 * time.Millisecond
+	// authorRetryWait is how long an author waits before looking again for the
+	// block its timeslot has to build on. Long enough that holding a timeslot is
+	// not a busy loop.
+	authorRetryWait = 2 * time.Second
 )
 
 // announceRetryWait is how long a peer is left alone after an announcement to it
@@ -214,21 +218,80 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 // splits, and no amount of syncing afterwards puts it back together. Not writing
 // is much better than writing on the wrong parent.
 func (bp *blockProducer) run(slot jamtime.Timeslot) {
+	// Whether to say out loud that this node is waiting. It is said once per
+	// spell of waiting, not once per attempt.
+	aviso := true
 	for {
 		bp.waitFor(slot)
+		// Catching up comes before the turn and does not replace it. It used to be
+		// a case of the same switch, which meant that a node that had caught up
+		// skipped the rest of the timeslot: when the timeslot it was responsible
+		// for arrived while it was behind, it caught up, took that as its turn
+		// being done, and never wrote the block. Nobody else writes it either,
+		// because there is one author per timeslot, so the chain stopped there.
+		bp.catchUpBehind()
 		switch {
 		case authorFor(slot, bp.authorIndex, bp.authorCount):
-			if bp.catchUpTo(slot-1, "the previous timeslot's block") {
-				bp.produceBlock(slot)
-			} else {
-				log.Internal.Warn().Uint64("slot", uint64(slot)).
-					Msg("not writing this timeslot: the block it has to build on has not arrived")
+			// Not writing and moving on is what stopped the chain. The next
+			// author needs the block this one did not write, waits for a block
+			// nobody is going to produce, and the chain stands still with every
+			// node falling further behind the clock. So an author that cannot
+			// build holds the timeslot it is responsible for and keeps trying: the
+			// block it is missing is on its way from a peer, and the moment it
+			// lands this node writes the timeslot that was always its own.
+			//
+			// Not writing at all is still better than writing on the wrong
+			// parent, which is a fork rather than a pause.
+			if !bp.catchUpTo(slot-1, "the previous timeslot's block") {
+				// Hold the timeslot and try again, but slowly and quietly. Retrying
+				// straight away with a line each time wrote hundreds of megabytes
+				// of log in a couple of minutes and filled the disk: the wait
+				// inside catchUpTo had already given up, so coming straight back
+				// here was a tight loop. The block being waited on is on its way
+				// from a peer and takes milliseconds, not microseconds.
+				if aviso {
+					aviso = false
+					log.Internal.Warn().Uint64("slot", uint64(slot)).
+						Msg("waiting for the block this timeslot has to build on; holding the timeslot")
+				}
+				time.Sleep(authorRetryWait)
+				continue
 			}
+			aviso = true
+			bp.produceBlock(slot)
 		default:
 			bp.runForeignSlot(slot)
 		}
 		slot++
 	}
+}
+
+// catchUpBehind runs the chain this node is behind on, and reports whether there
+// was anything to do.
+//
+// A node only executes during the timeslots it does not author, which with a mesh
+// of N is one timeslot in N: a node joining a mesh of five could only execute a
+// block every thirty seconds, so reaching a chain ten blocks ahead took five
+// minutes and the mesh never settled. A node that is behind is not taking part in
+// its own timeslot anyway, so it runs the chain it has and catches up at the speed
+// of the clock. When it is level with the tip this does nothing at all.
+func (bp *blockProducer) catchUpBehind() bool {
+	header, leaf, ok := bp.bestKnownTip()
+	if !ok {
+		return false
+	}
+	if header.TimeSlotIndex <= bp.runtime.Timeslot() {
+		return false
+	}
+	// Only the part that is actually there, and only up to the tip.
+	if ok, _ := bp.executeUpTo(header.TimeSlotIndex); !ok {
+		return false
+	}
+	log.Internal.Info().
+		Uint64("slot", uint64(bp.runtime.Timeslot())).
+		Str("tip", hashToHex(leaf)).
+		Msg("caught up with the chain")
+	return true
 }
 
 // catchUpTo executes the chain up to and including the given timeslot, waiting up
