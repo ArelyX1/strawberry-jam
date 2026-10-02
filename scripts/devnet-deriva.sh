@@ -22,7 +22,7 @@ NODES=(); PIDS=()
 
 mkdir -p "$RUN"
 
-q() { local p="${3:-[]}"; curl -s -m 4 -X POST -H 'content-type: application/json' \
+q() { local p="${3:-[]}"; curl -s -m "${RPC_TIMEOUT:-8}" -X POST -H 'content-type: application/json' \
   -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$p}" "http://localhost:$1" 2>/dev/null; }
 tip()  { q "$1" jam_getHeader | grep -o '"hash":"0x[0-9a-f]*"' | cut -d'"' -f4; }
 root() { q "$1" jam_getHeader | grep -o '"resultingStateRoot":"0x[0-9a-f]*"' | cut -d'"' -f4; }

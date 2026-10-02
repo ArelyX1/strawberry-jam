@@ -17,7 +17,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 )
 
 type validator struct {
@@ -67,16 +70,47 @@ func main() {
 	out := flag.String("out", "test_validators.json", "where to write the validator file")
 	count := flag.Int("count", 6, "how many validators")
 	port := flag.Int("port", 30333, "port of the first validator; the rest follow it")
-	ip := flag.String("ip", "0000:0000:0000:0000:0000:0000:0000:0001", "address every validator listens on")
+	ip := flag.String("ip", "0000:0000:0000:0000:0000:0000:0000:0001", "address every validator listens on, when they all listen on one machine")
+	addrs := flag.String("addrs", "", "one address per validator, comma separated, as ip:port or ip. This is the flag for a net spread over several machines, where each node listens on its own address; it overrides -ip and -port for the validators it names")
 	flag.Parse()
 
 	if *count < 1 {
 		fmt.Fprintln(os.Stderr, "gen-validators: count must be at least 1")
 		os.Exit(1)
 	}
-	if *count > len(names) {
-		fmt.Fprintf(os.Stderr, "gen-validators: only %d names are known, asked for %d\n", len(names), *count)
-		os.Exit(1)
+
+	// The addresses each validator is to listen on, keyed by validator index.
+	//
+	// One address for all of them is a net on one machine, and that is what -ip
+	// has always meant. It cannot express a net spread over several, where every
+	// node is somewhere else and has to be told where the others are: they all
+	// end up on the same address and no node ever reaches another.
+	type hostport struct {
+		host string
+		port int
+	}
+	wanted := map[int]hostport{}
+	if *addrs != "" {
+		for i, a := range strings.Split(*addrs, ",") {
+			a = strings.TrimSpace(a)
+			if a == "" {
+				continue
+			}
+			h, p := a, *port+i
+			if strings.Contains(a, ":") {
+				if host, portStr, err := net.SplitHostPort(a); err == nil {
+					h = host
+					if n, err := strconv.Atoi(portStr); err == nil {
+						p = n
+					}
+				}
+			}
+			wanted[i] = hostport{h, p}
+		}
+		if len(wanted) > 0 && len(wanted) < *count {
+			fmt.Fprintf(os.Stderr, "gen-validators: %d addresses for %d validators; the rest would be left with the address of all of them, which is one machine again\n", len(wanted), *count)
+			os.Exit(1)
+		}
 	}
 
 	// Whatever is already there comes first and is left alone.
@@ -97,6 +131,10 @@ func main() {
 		if i < len(names) {
 			name = names[i]
 		}
+		direccion := hostport{*ip, *port + i}
+		if w, ok := wanted[i]; ok {
+			direccion = w
+		}
 		vs = append(vs, validator{
 			Name: name,
 			Seed: "0x" + hex.EncodeToString(seed),
@@ -106,9 +144,22 @@ func main() {
 			// fall out of step with the public key beside it.
 			Ed25519Private: "0x" + hex.EncodeToString(seed),
 			Ed25519Pub:     "0x" + hex.EncodeToString(pub),
-			IP:             *ip,
-			Port:           *port + i,
+			IP:             direccion.host,
+			Port:           direccion.port,
 		})
+	}
+
+	// A run that says where each validator is has to be able to correct the ones
+	// already written, or the addresses of a net spread over several machines can
+	// only be right on the first try. The keys stay as they are: a validator is
+	// identified by its key, and moving a node does not make it a different one.
+	for i := range vs {
+		w, ok := wanted[i]
+		if !ok {
+			continue
+		}
+		vs[i].IP = w.host
+		vs[i].Port = w.port
 	}
 
 	data, err := json.MarshalIndent(vs, "", "    ")

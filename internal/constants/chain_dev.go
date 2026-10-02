@@ -11,7 +11,7 @@ const (
 	// rather than two so that a mesh of more than two nodes is possible at all,
 	// which it was not: the validator set is a fixed-size array, so a third
 	// validator was an index out of range.
-	NumberOfValidators = 6
+	NumberOfValidators = 32
 
 	TimeslotsPerEpoch = 12
 

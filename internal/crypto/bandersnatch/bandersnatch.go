@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
 
 	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/crypto"
+	"github.com/eigerco/strawberry/internal/rustlib"
 )
 
 var (
@@ -108,19 +108,7 @@ func init() {
 }
 
 func getBandersnatchLibraryPath() (string, error) {
-	tmpDir, err := os.MkdirTemp("", "strawberry-bandersnatch-lib-")
-	if err != nil {
-		return "", err
-	}
-
-	libPath := filepath.Join(tmpDir, rustLibraryName)
-	err = os.WriteFile(libPath, rustLibraryBytes, 0755)
-	if err != nil {
-		os.RemoveAll(tmpDir) //nolint:errcheck // TODO: handle error
-		return "", err
-	}
-
-	return libPath, nil
+	return rustlib.WriteOnce("strawberry-bandersnatch-lib", rustLibraryName, rustLibraryBytes)
 }
 
 // Initializes the ring size for ring related functions. The ring size

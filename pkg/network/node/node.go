@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"strings"
 
@@ -376,6 +377,29 @@ func (n *Node) ConnectToNeighbours() error {
 	unreachable := make([]string, 0, len(neighbors))
 
 	for _, neighbor := range neighbors {
+		// Only one of the two ends of a pair dials, and which one is decided by
+		// comparing the two keys, which both ends can do without knowing anything
+		// else about each other.
+		//
+		// When both ends dial each other at the same time there are two connections
+		// per pair, and the pair has to agree on which of the two to keep. It used
+		// to agree by comparing ports, and that works on one machine only by luck:
+		// every machine listens on 30333, so the listening ports are equal and
+		// what is left to compare are the ephemeral ports, which both ends see in
+		// a different order. Each end then keeps a different connection. Both stay
+		// connected, the peer list says two neighbours, and nothing is ever
+		// announced, because the announcements go down one connection and the other
+		// end is listening on the other one. On one machine the ephemeral ports
+		// happened to fall the right way; across machines with the same port
+		// everywhere, nothing does.
+		//
+		// One connection per pair, opened by the end with the lower key, has no
+		// choice to get wrong. The end that does not dial keeps its connection
+		// through the same check it already does, by validator key.
+		if !n.dialsNeighbour(neighbor.Ed25519) {
+			continue
+		}
+
 		n.peersLock.RLock()
 		have := n.PeersSet.GetByEd25519Key(neighbor.Ed25519)
 		n.peersLock.RUnlock()
@@ -409,6 +433,22 @@ func (n *Node) ConnectToNeighbours() error {
 			reached, len(neighbors), strings.Join(unreachable, "; "))
 	}
 	return nil
+}
+
+// dialsNeighbour reports whether this node is the end of the pair that dials.
+//
+// Both ends reach the same answer from the same two keys, which is the whole
+// point: a rule each end applies to itself alone can disagree with the same rule
+// on the other end, and two connections per pair then have to be resolved by a
+// comparison that both ends see the same way round.
+func (n *Node) dialsNeighbour(theirKey ed25519.PublicKey) bool {
+	our := n.ValidatorManager.Keys.EdPub
+	if len(our) == 0 || len(theirKey) == 0 {
+		// Without a key to compare there is no way to take half the pairs, so
+		// dial rather than leave a pair with nobody dialling it.
+		return true
+	}
+	return bytes.Compare(our, theirKey) < 0
 }
 
 // RequestBlocks implements the CE 128 block request protocol from the JAM spec.

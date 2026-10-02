@@ -51,7 +51,7 @@ mkdir -p "$RUN"
 
 q() { # q <rpcPort> <method> [params]
   local params="${3:-[]}"
-  curl -s -m 4 -X POST -H 'content-type: application/json' \
+  curl -s -m "${RPC_TIMEOUT:-8}" -X POST -H 'content-type: application/json' \
     -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$2\",\"params\":$params}" \
     "http://localhost:$1" 2>/dev/null
 }

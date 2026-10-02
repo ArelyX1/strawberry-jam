@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
 	"runtime"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
 	"github.com/eigerco/strawberry/internal/constants"
+	"github.com/eigerco/strawberry/internal/rustlib"
 )
 
 const (
@@ -310,17 +310,5 @@ func init() {
 }
 
 func getErasurecodingLibaryPath() (string, error) {
-	tmpDir, err := os.MkdirTemp("", "strawberry-erasurecoding-lib-")
-	if err != nil {
-		return "", err
-	}
-
-	libPath := filepath.Join(tmpDir, rustLibraryName)
-	err = os.WriteFile(libPath, rustLibraryBytes, 0755)
-	if err != nil {
-		os.RemoveAll(tmpDir) //nolint:errcheck // TODO: handle error
-		return "", err
-	}
-
-	return libPath, nil
+	return rustlib.WriteOnce("strawberry-erasurecoding-lib", rustLibraryName, rustLibraryBytes)
 }
