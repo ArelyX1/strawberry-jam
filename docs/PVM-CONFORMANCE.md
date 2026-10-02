@@ -317,51 +317,70 @@ Dos cosas salieron por el camino y estan corregidas:
   de modo que una cadena entera se reportaba con un bloque todavia ausente.
   Eso era tambien el `stillMissing: 1` que aparecia en el log.
 
-### A3: elegir tip. Escrito, sin verificar de extremo a extremo
+### A3: elegir tip. A medias
 
-El codigo esta todo y las pruebas unitarias pasan, pero **no se ha podido
-comprobar que dos nodos acaben de acuerdo**, y conviene no darlo por bueno.
+La eleccion de tip y la adopcion de cadena estan escritas, con pruebas, y los dos
+nodos terminan en el mismo bloque. Lo que no esta es el estado: A adopta el tip de
+B y su raiz de estado no coincide con la que B tiene en ese bloque. Adopta la
+cadena sin reconstruir el estado que esa cadena describe.
 
-Lo que hay:
+**Lo mas importante que habia en este camino: los dos nodos eran el mismo
+validador.** `appconfig.json` lleva `validatorIndex`, los dos procesos lo leian y
+los dos salian como Bob, de modo que cada uno se marcaba a si mismo. Todo lo
+anterior parecia funcionar: conectaban, se anunciaban y coincidian en el tip,
+porque producian la misma cadena por separado. A1, dado por verificado, no
+verificaba nada de la red. Ahora hay `--validator-index` y `--author-count`, y el
+nodo dice quien es al arrancar, para que esto no vuelva a pasar en silencio.
 
-- `CanonicalChain` recorre la cadena por hash de padre y no por timeslot. En una
-  cadena bifurcada dos bloques pueden compartir timeslot, y una coleccion ordenada
-  por timeslot se queda con el que llego el ultimo: asi se acaba reproduciendo una
-  mezcla de dos ramas y con un estado que ninguna describio.
-- `Runtime.Rewind` devuelve el runtime al estado de génesis, y `Replay` ejecuta
-  encima la cadena adoptada. Cambiar de rama no tiene vuelta atras: el trabajo
-  que produjo el estado que se abandona no se puede deshacer, asi que se vuelve
-  al principio y se reproduce, que es justo lo que hace un nodo al arrancar.
-- El productor consulta la mejor punta conocida antes de escribir y adopta la de
-  un par si esta mas adelante, con desempate por hash para que todos los nodos
-  elijan la misma rama.
-- Los anuncios llevan un tiempo de espera tras fallar. Sin eso, un par al que no
-  se le puede abrir el stream se reintenta cada timeslot, y cada intento abre y
-  abandona otro stream, que es bastante para que el otro lado tire la conexion.
+Lo demas, por cuanto dolia:
 
-Lo que **no** funciona: un nodo que vuelve despues de estar parado **no consigue
-abrir el stream de anuncio hacia el par que ya esta en marcha**. El error es
-`open stream: failed to open QUIC stream: Application error 0x0 (remote)`, o sea
-que lo rechaza el otro lado. Consecuencia: el que vuelve no se entera de la
-cadena del otro, no hay nada que seguir, y los dos siguen en ramas distintas
-asiendo falta lo unico que sabrian hacer. El anuncio al recien conectado se
-intenta (`announceTipToNewPeers`) pero falla por lo mismo.
+- **Un hueco no es un error de protocolo.** `receiveLoop` cerraba el stream ante
+  cualquier fallo al procesar un mensaje, y `processAnnouncement` propagaba el
+  error de "faltan ancestros" como si fuera grave. Para un nodo que va atrasado
+  ese es su estado normal, no un fallo: es justo lo que el relleno de huecos
+  existe para arreglar. A consequence: A recibia un anuncio y luego silencio
+  para siempre. Ahora sigue escuchando.
+- **El relleno se paraba en la cabecera que ya tenia.** `gapHashes` buscaba el
+  primer padre cuya cabecera conociera y ahi cortaba. Un nodo atrasado suele
+  tener las cabeceras de un tramo entero y ninguno de los bloques, porque las
+  cabeceras viajan en los anuncios y los bloques hay que pedirlos por separado.
+  Pedia entonces exactamente los dos bloques que ya estaba esperando, una y otra
+  vez. Ahora baja mientras falte el bloque, no la cabecera.
+- **Anunciar a un stream muertoReported exito.** `sendLoop` salia al fallar una
+  escritura y dejaba el announcer en pie, con la conexion viva.
+  `SendAnnouncement` seguia encolando en un canal que nadie leia y devolvia
+  error nil, asi que el nodo creia que habia avisado a todo el mundo de cada
+  bloque que escribia. Ahora el bucle que muere se lleva el announcer consigo.
+- **El announcer sobrevivia a la conexion.** El handler de anuncios vive todo el
+  proceso y se reparte entre todas las conexiones, asi que guardaba el announcer
+  de una conexion ya cerrada. La regla de "gana el stream de id mayor" solo tiene
+  sentido dentro de una conexion; entre dos conexiones los ids no significan
+  nada, y el par que volvia era cerrado con codigo 0. Ahora se compara la
+  conexion y no su salud, porque un peer que reinicia se reconnecta antes de que
+  se note la caida.
+- **No habia regla de autoria.** Todos los validadores escribian en todos los
+  slots, y dos bloques para un mismo slot son una bifurcacion, no una fusion.
+  Ahora el turno rota entre los validadores y el que no es autor ejecuta el
+  bloque del otro. Y tiene que esperar hasta que el timeslot acaba: esperar tres
+  segundos era esperar menos de lo que el autor tarda en escribir, asi que el
+  retraso era fijo.
+- `appConfig.ValidatorIndex < 0 && > maxuint16` deberia ser `||`. Con `&&` un
+  indice negativo pasaba el chequeo y salia como 65535 al castearlo a uint16.
 
-Es un problema de la capa de red, no de la eleccion de tip: abrir un stream de
-anuncio contra un par ya establecido. A1 (conectarse y verse) y A2 (rellenar
-huecos) estan comprobados; A3 se queda ahi hasta que eso se arregle.
+Con `--author-count 1` un nodo solo escribe todos los slots, que es el modo de un
+solo nodo y lo que usan el smoke test y las pruebas de reinicio. El valor por
+defecto es la constante de la cadena.
 
-Lo siguiente seria mirar por que el lado remoto rechaza el stream: si es que
-rechaza un segundo stream de anuncio al mismo par, o si hay una condicion de
-carrera al abrir los dos nodos a la vez.
+### Lo que falta
 
-Sigue en pie lo de la autoria: los dos nodos se atribuyen los mismos bloques,
-porque cada uno produce los suyos sin coordinarse y la cadena sale identica. La
-verificacion por indice existe, pero no hay regla que decida quien firma cada
-timeslot.
+La raiz de estado. A y B coinciden en el bloque, pero A ejecuta la cadena que
+adopta y su raiz no sale igual a la de B. O `Replay` no reproduce lo mismo que
+`Run`, o el estado se rebobina a un punto que no es el del padre del bloque que
+se esta construyendo. Con un solo nodo el replay recorre el mismo camino y por eso
+las pruebas de reinicio pasan; lo que falla aqui es reconstruir un estado ajeno.
 
-Nota sobre `blockAuthorIndex`: hoy los dos nodos se atribuyen los mismos
-bloques, porque cada uno produce los suyos sin coordinarse y la cadena resulta
-identica. La autorizacion por indice existe y se verifica contra el conjunto de
-validadores, pero no hay ninguna regla que decida quien debe firmar cada
-timeslot.
+Nota sobre la prueba de A7: comparar los dos tips en el mismo instante no puede
+dar exito en una cadena que sigue creciendo, porque en cuanto B escribe el bloque
+de un timeslot A todavia no lo tiene. La comprobacion correcta es si el tip de A
+esta en la cadena de B, que es lo que significa que le siga, y eso es lo que
+mira ahora.

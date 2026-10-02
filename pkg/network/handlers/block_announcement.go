@@ -74,6 +74,7 @@ type BlockAnnouncer struct {
 	announced           map[crypto.Hash]*block.Header    // Blocks we've announced to this peer TODO: Cleanup mehcanism
 	stream              *quic.Stream                     // The QUIC stream for this connection
 	ctx                 context.Context                  // Context for cancellation
+	connCtx             context.Context                  // Context of the connection this announcer belongs to
 	cancel              context.CancelFunc               // Function to cancel the context
 	stateLock           sync.Mutex                       // Protects the connection state
 	state               connState                        // Current state of the connection
@@ -98,6 +99,7 @@ func (bh *BlockAnnouncementHandler) NewBlockAnnouncer(bs *chain.BlockService, ct
 		BlockService:        bs,
 		stream:              stream,
 		ctx:                 announcerCtx,
+		connCtx:             ctx,
 		cancel:              cancel,
 		state:               SendingHandshake,
 		handshakeCh:         make(chan struct{}),
@@ -119,7 +121,57 @@ func (bh *BlockAnnouncementHandler) NewBlockAnnouncer(bs *chain.BlockService, ct
 // already exists for the peer by keeping only the stream with the higher stream ID.
 // This implements the spec rule: "If exists: Close old connection, cleanup peer state."
 func (bh *BlockAnnouncementHandler) HandleStream(ctx context.Context, stream *quic.Stream, peerKey ed25519.PublicKey) error {
+	bh.mu.RLock()
 	existingAnnouncer, exists := bh.Announcers[string(peerKey)]
+	bh.mu.RUnlock()
+
+	// An announcer whose connection is gone is not an announcer, and this map
+	// outlives every connection: the handler is created once for the process and
+	// handed to each connection as it arrives. So a peer that disconnects and
+	// comes back leaves its old entry here, still holding the stream ids of a
+	// connection that no longer exists.
+	//
+	// Comparing stream ids against that stale entry is what breaks a returning
+	// peer. Ids are only ordered within one connection, and the new stream starts
+	// counting from zero again, so the dead entry looks like the winner and the
+	// arriving peer gets reset with code 0, which is exactly the
+	// "Application error 0x0 (remote)" that a node coming back from being away
+	// used to hit. The context is the connection's own, cancelled when the
+	// connection closes, so it tells the two apart.
+	// Which connection is the existing announcer on? The same one, or a
+	// connection that has since gone. This matters more than whether it still
+	// looks alive: when a peer restarts, it reconnects immediately, and the
+	// connection it left behind can still be up on this side for the length of
+	// the idle timeout. Checking whether the old announcer's context is cancelled
+	// is therefore no good here, because the reconnect usually beats the
+	// teardown, and the arriving peer gets refused exactly as before.
+	//
+	// So: same connection, then the stream id rule decides, which is what it is
+	// for. Different connection, then there is nothing to compare. The ids of the
+	// old connection say nothing about the new one, whose streams count from zero
+	// again, and comparing them makes the dead announcer look like the winner and
+	// resets the newcomer with code 0.
+	if exists && existingAnnouncer.connCtx != ctx {
+		bh.mu.Lock()
+		if bh.Announcers[string(peerKey)] == existingAnnouncer {
+			delete(bh.Announcers, string(peerKey))
+		}
+		bh.mu.Unlock()
+		existingAnnouncer.cancel()
+		exists = false
+	}
+
+	// And one on this same connection that is already finished with is not a
+	// candidate to win an id comparison either.
+	if exists && existingAnnouncer.ctx.Err() != nil {
+		bh.mu.Lock()
+		if bh.Announcers[string(peerKey)] == existingAnnouncer {
+			delete(bh.Announcers, string(peerKey))
+		}
+		bh.mu.Unlock()
+		existingAnnouncer.cancel()
+		exists = false
+	}
 
 	if exists {
 		// Compare stream IDs - keep the one with greater ID as specified in the JAM protocol
@@ -149,6 +201,14 @@ func (bh *BlockAnnouncementHandler) HandleStream(ctx context.Context, stream *qu
 // AddOnBlockReceiveHook add on block received hook, required to kick off other processes like assurance and auditing
 func (bh *BlockAnnouncementHandler) AddOnBlockReceiveHook(hook BlockReceiveHook) {
 	bh.onBlockReceiveHooks = append(bh.onBlockReceiveHooks, hook)
+}
+
+// Done reports whether the connection this announcer lives on is gone, which
+// means the stream under it is dead and the announcer has to be replaced rather
+// than reused. Reusing one of these is how a node that stayed up while its peer
+// restarted would keep announcing into a closed stream forever.
+func (ba *BlockAnnouncer) Done() bool {
+	return ba.ctx.Err() != nil
 }
 
 // Start initiates the block announcement protocol by triggering the handshake process.
@@ -301,6 +361,15 @@ func (ba *BlockAnnouncer) sendHandshake() error {
 // sendLoop continuously monitors the send channel for outgoing messages
 // and writes them to the stream. It terminates when the context is canceled.
 func (ba *BlockAnnouncer) sendLoop() {
+	// A loop that stops has to take the announcer down with it. The stream can
+	// die while the connection lives on, and an announcer that is still there
+	// after its stream is gone is worse than no announcer: SendAnnouncement keeps
+	// handing messages to a channel nobody is reading and reports success, so
+	// the node believes it has told everyone about every block it wrote and
+	// nobody downstream ever hears. Marking it done is what lets the next
+	// announcement open a stream that works.
+	defer ba.cancel()
+
 	for {
 		select {
 		case <-ba.ctx.Done():
@@ -324,6 +393,8 @@ func (ba *BlockAnnouncer) sendLoop() {
 // them as block announcements. It terminates when an error occurs or
 // the context is canceled.
 func (ba *BlockAnnouncer) receiveLoop() {
+	defer ba.cancel()
+
 	for {
 		select {
 		case <-ba.ctx.Done():
@@ -335,8 +406,8 @@ func (ba *BlockAnnouncer) receiveLoop() {
 				return
 			}
 			if err := ba.processAnnouncement(msg.Content); err != nil {
-				log.Println("(ba *BlockAnnouncer) receiveLoop() - process announcement:", err)
-				return
+				log.Println("(ba *BlockAnnouncer) receiveLoop() - could not process announcement:", err)
+				continue
 			}
 		}
 	}
@@ -379,7 +450,17 @@ func (ba *BlockAnnouncer) processAnnouncement(content []byte) error {
 	}
 
 	// Process the new header according to our chain rules
+	// A header whose ancestors are missing is the ordinary state of a node that
+	// has fallen behind, not a fault: the header is kept as a handle and the
+	// blocks behind it are asked for, so the chain can be walked again.
+	// Failing here would throw that away and, because the caller stops
+	// listening when this returns an error, would also cost the node the
+	// stream it learns on.
 	if err = ba.HandleNewHeader(&header); err != nil {
+		if chain.IsMissingHeader(err) {
+			log.Printf("Announced block at slot %d is ahead of this node; its chain is being filled in", header.TimeSlotIndex)
+			return nil
+		}
 		return fmt.Errorf("process new block: %w", err)
 	}
 

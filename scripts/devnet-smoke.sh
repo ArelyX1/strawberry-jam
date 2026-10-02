@@ -62,7 +62,10 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> arrancando nodo en el puerto $RPC_PORT (log: $LOG_FILE)"
-./strawberry --name SmokeTest --rpc-port "$RPC_PORT" "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
+# author-count 1: this is one node on its own, so it writes every timeslot.
+# Left at the chain's validator count it would write one timeslot in a thousand
+# and the chain would look stalled.
+./strawberry --name SmokeTest --author-count 1 --rpc-port "$RPC_PORT" "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
 NODE_PID=$!
 
 if ! wait_for_rpc; then

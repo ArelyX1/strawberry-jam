@@ -572,9 +572,14 @@ func (n *Node) AnnounceBlockToAll(ctx context.Context, header *block.Header) err
 // It announces a new block to a peer by sending the block header. The announcement
 // also includes the latest finalized block information as required by the protocol.
 func (n *Node) AnnounceBlock(ctx context.Context, header *block.Header, peer *peer.Peer) error {
-	// If we already have an announcer for this peer, use it
+	// If we already have an announcer for this peer, use it. Unless its connection
+	// is gone, in which case the stream under it is dead and announcing into it
+	// would fail forever without ever reopening anything.
 	if peer.BAnnouncer != nil {
-		return peer.BAnnouncer.SendAnnouncement(header)
+		if !peer.BAnnouncer.Done() {
+			return peer.BAnnouncer.SendAnnouncement(header)
+		}
+		peer.BAnnouncer = nil
 	}
 
 	handler, err := peer.ProtoConn.Registry.GetHandler(protocol.StreamKindBlockAnnouncement)
@@ -588,36 +593,37 @@ func (n *Node) AnnounceBlock(ctx context.Context, header *block.Header, peer *pe
 		return fmt.Errorf("invalid handler type for block announcements")
 	}
 	// Check if we already have an announcer for this peer in BlockAnnouncementHandler. This should never happen.
-	announcer, ok := bah.Announcers[string(peer.ProtoConn.TConn.PeerKey())]
-	if ok {
+	announcer, found := bah.Announcers[string(peer.ProtoConn.TConn.PeerKey())]
+	if found && !announcer.Done() {
 		peer.BAnnouncer = announcer
 		return announcer.SendAnnouncement(header)
-	} else { //For sure we dont have an announcer for this peer
-		stream, err := peer.ProtoConn.OpenStream(ctx, protocol.StreamKindBlockAnnouncement)
-		if err != nil {
-			return fmt.Errorf("open stream: %w", err)
-		}
-
-		peer.BAnnouncer = bah.NewBlockAnnouncer(n.BlockService, peer.ProtoConn.TConn.Context(), stream, peer.ProtoConn.TConn.PeerKey())
-		// this will handle handshake
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- peer.BAnnouncer.Start()
-		}()
-
-		// Wait for either handshake completion or error
-		select {
-		case err := <-errCh:
-			if err != nil {
-				stream.Close() //nolint:errcheck // TODO: handle error
-				return fmt.Errorf("failed to start announcement handler: %w", err)
-			}
-		case <-ctx.Done():
-			stream.Close() //nolint:errcheck // TODO: handle error
-			return ctx.Err()
-		}
-		return peer.BAnnouncer.SendAnnouncement(header)
 	}
+
+	// No live announcer for this peer, so open one and wait for its handshake.
+	stream, err := peer.ProtoConn.OpenStream(ctx, protocol.StreamKindBlockAnnouncement)
+	if err != nil {
+		return fmt.Errorf("open stream: %w", err)
+	}
+
+	peer.BAnnouncer = bah.NewBlockAnnouncer(n.BlockService, peer.ProtoConn.TConn.Context(), stream, peer.ProtoConn.TConn.PeerKey())
+	// this will handle handshake
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- peer.BAnnouncer.Start()
+	}()
+
+	// Wait for either handshake completion or error
+	select {
+	case err := <-errCh:
+		if err != nil {
+			stream.Close() //nolint:errcheck // TODO: handle error
+			return fmt.Errorf("failed to start announcement handler: %w", err)
+		}
+	case <-ctx.Done():
+		stream.Close() //nolint:errcheck // TODO: handle error
+		return ctx.Err()
+	}
+	return peer.BAnnouncer.SendAnnouncement(header)
 }
 
 // RequestState implements the client side of the CE 129 State Request protocol from the JAMNP.

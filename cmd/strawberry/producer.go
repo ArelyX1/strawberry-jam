@@ -9,6 +9,7 @@ import (
 
 	"github.com/eigerco/strawberry/internal/block"
 	"github.com/eigerco/strawberry/internal/chain"
+	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/jamtime"
 	"github.com/eigerco/strawberry/pkg/devnet"
@@ -26,6 +27,11 @@ type blockProducer struct {
 	bs          *chain.BlockService
 	runtime     *devnet.Runtime
 	authorIndex uint16
+	// How many validators the authorship turn rotates over. Not the chain's
+	// validator count, because the number of nodes actually running a devnet is
+	// a handful and the constant is not: rotating over the constant means a
+	// lone node writes one timeslot in five hundred and the chain crawls.
+	authorCount uint16
 	parentHash  crypto.Hash
 	blockNum    uint
 	onBlock     func(crypto.Hash, uint, block.Header)
@@ -45,10 +51,17 @@ type blockProducer struct {
 	announceBackoff map[string]time.Time
 }
 
+// How long past the end of a timeslot a node keeps waiting for the block the
+// author of that timeslot writes, and how often it looks.
+const (
+	foreignSlotGrace = 3 * time.Second
+	foreignSlotPoll  = 200 * time.Millisecond
+)
+
 // announceRetryWait is how long a peer is left alone after an announcement to it
 // failed. Long enough that the retries are not a stream flood, short enough that
 // a peer that comes back is picked up while the chain is still moving.
-const announceRetryWait = 45 * time.Second
+const announceRetryWait = 10 * time.Second
 
 // startBlockProducer starts producing a block per timeslot.
 //
@@ -60,7 +73,7 @@ const announceRetryWait = 45 * time.Second
 // before it starts producing. A node that cannot rebuild its own state is not a
 // node that is a little late: it is a node that would write a second chain over the
 // first, so it stops instead.
-func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorIndex uint16, onBlock func(crypto.Hash, uint, block.Header), onReady func(), net *p2pnode.Node, ctx context.Context) *blockProducer {
+func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorIndex uint16, authorCount uint16, onBlock func(crypto.Hash, uint, block.Header), onReady func(), net *p2pnode.Node, ctx context.Context) *blockProducer {
 	bp := &blockProducer{
 		net:             net,
 		ctx:             ctx,
@@ -68,6 +81,7 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 		bs:              bs,
 		runtime:         runtime,
 		authorIndex:     authorIndex,
+		authorCount:     authorCount,
 		onBlock:         onBlock,
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -155,13 +169,103 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 	return bp
 }
 
-// run produces a block per timeslot from here on, following the clock.
+// run produces a block in the timeslots this validator authors, and executes the
+// ones another validator authored, following the clock.
+//
+// A timeslot has exactly one author, this node's index modulo the number of
+// validators. Without that rule every validator wrote a block in every timeslot,
+// and since two blocks for one slot are a fork and not a merge, the nodes spent
+// the whole run disagreeing while each of them was behaving perfectly. The
+// height still matched, which is what made it look like a network that worked:
+// the nodes agreed on how far the chain went and on nothing else.
 func (bp *blockProducer) run(slot jamtime.Timeslot) {
 	for {
 		bp.waitFor(slot)
-		bp.produceBlock(slot)
+		if authorFor(slot, bp.authorIndex, bp.authorCount) {
+			bp.produceBlock(slot)
+		} else {
+			bp.runForeignSlot(slot)
+		}
 		slot++
 	}
+}
+
+// authorFor is the validator whose turn it is to write a given timeslot.
+//
+// A count of one means this node writes every timeslot, which is what a node on
+// its own has to do: nobody else is going to. That holds whichever index the
+// node happens to be, because modulo one is zero and comparing it against a
+// non-zero index left the node writing nothing at all.
+func authorFor(slot jamtime.Timeslot, validatorIndex, authorCount uint16) bool {
+	switch authorCount {
+	case 1:
+		return true
+	case 0:
+		authorCount = constants.NumberOfValidators
+	}
+	return uint64(slot)%uint64(authorCount) == uint64(validatorIndex)
+}
+
+// runForeignSlot executes the block another validator wrote for this timeslot.
+//
+// The wait has to reach the end of the timeslot. The author writes its block
+// while the slot is running, so a node that gave up part way through the slot it
+// was waiting in always timed out, and then sat one block behind for as long as
+// it ran: it was waiting for something that had not been written yet, on a
+// schedule that guaranteed it would stop looking before it appeared.
+func (bp *blockProducer) runForeignSlot(slot jamtime.Timeslot) {
+	// The block should be there once the timeslot is over. The grace covers the
+	// author writing it at the very end, plus the announcement landing.
+	deadline := jamtime.FromTimeslot(slot + 1).ToTime().Add(foreignSlotGrace)
+	for {
+		if bp.adoptSlot(slot) {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			log.Internal.Debug().Uint64("slot", uint64(slot)).
+				Msg("the block for this timeslot never arrived; staying where this node is")
+			return
+		}
+		time.Sleep(foreignSlotPoll)
+	}
+}
+
+// adoptSlot executes the chain this node holds for a timeslot another validator
+// authored, up to that timeslot. It reports whether it did.
+func (bp *blockProducer) adoptSlot(slot jamtime.Timeslot) bool {
+	_, leaf, ok := bp.bestKnownTip()
+	if !ok {
+		return false
+	}
+	header, err := bp.bs.Store.GetHeader(leaf)
+	if err != nil || header.TimeSlotIndex < slot {
+		return false
+	}
+
+	chain, err := bp.bs.CanonicalChain(leaf, int(slot)+1)
+	if err != nil || len(chain) == 0 || chain[len(chain)-1].Header.TimeSlotIndex != slot {
+		return false
+	}
+
+	// Already executed: the state stands at or past this slot and the tip is the
+	// one this node is building on, so there is nothing to do.
+	if bp.parentHash == leaf && bp.runtime.Timeslot() >= slot {
+		return true
+	}
+
+	bySlot := make(map[jamtime.Timeslot]block.Block, len(chain))
+	for _, b := range chain {
+		bySlot[b.Header.TimeSlotIndex] = b
+	}
+	from := bp.runtime.Timeslot() + 1
+	if _, err := bp.replay(from, slot, bySlot); err != nil {
+		log.Internal.Debug().Err(err).Uint64("slot", uint64(slot)).
+			Msg("could not execute the block this timeslot's author wrote")
+		return false
+	}
+	bp.parentHash = leaf
+	bp.blockNum = uint(slot)
+	return true
 }
 
 // waitFor sleeps until the timeslot begins.
@@ -470,8 +574,14 @@ func (bp *blockProducer) announceTipToNewPeers() {
 	now := time.Now()
 	var fresh []*peer.Peer
 	for _, p := range bp.net.GetAllPeers() {
+		// A cached announcer whose connection died is not worth anything, and
+		// leaving it set would make this peer look already-told forever.
 		if p.BAnnouncer != nil {
-			continue
+			if p.BAnnouncer.Done() {
+				p.BAnnouncer = nil
+			} else {
+				continue
+			}
 		}
 		// Mismo-compensacion: un par al que no se le puede abrir el stream se
 		// reintenta cada timeslot, y cada intento abre y abandona otro stream.

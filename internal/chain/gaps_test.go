@@ -152,3 +152,77 @@ func TestIsMissingHeaderIsAboutAncestorsOnly(t *testing.T) {
 	assert.False(t, IsMissingHeader(nil))
 	assert.False(t, IsMissingHeader(errors.New("something else")))
 }
+
+// A node that fell behind has the headers for a stretch of chain and not the
+// blocks, because announcements carry headers and blocks have to be asked for
+// separately. It used to look for the first parent it had a header for, find one
+// straight away, and stop: it had every header in a row and none of the blocks
+// under them, so it asked for nothing and filled nothing while reporting the same
+// two blocks missing forever.
+func TestBackfillAsksForBlocksUnderKnownHeaders(t *testing.T) {
+	db, err := pebble.NewKVStore()
+	require.NoError(t, err)
+	bs, err := NewBlockService(db)
+	require.NoError(t, err)
+
+	fin := bs.GetLatestFinalized()
+	cur := fin.Hash
+	hashes := make([]crypto.Hash, 0, 5)
+	// Five blocks: every header is stored, not one block. This is exactly the
+	// state of a node that heard the announcements and never got the blocks.
+	for i := 1; i <= 5; i++ {
+		h := testChain(cur, fin.TimeSlotIndex+jamtime.Timeslot(i), 0)
+		hash, herr := h.Hash()
+		require.NoError(t, herr)
+		require.NoError(t, bs.Store.PutHeader(h))
+		hashes = append(hashes, hash)
+		cur = hash
+	}
+
+	bs.AddLeaf(cur, fin.TimeSlotIndex+5)
+
+	wanted := bs.BackfillHashes(32)
+	require.NotEmpty(t, wanted, "blocks under known headers are still missing blocks")
+
+	// Every one of the five has to be asked for, and the walk has to reach the
+	// bottom of the stretch rather than stopping under the leaf.
+	for _, h := range hashes {
+		assert.Contains(t, wanted, h, "the walk must go past the first known header")
+	}
+	assert.Len(t, wanted, 5, "nothing below the leaf is present, so all five are wanted")
+}
+
+// The walk stops where the blocks start, and does not go on asking for history
+// the node already has.
+func TestBackfillStopsAtTheFirstBlockItHas(t *testing.T) {
+	db, err := pebble.NewKVStore()
+	require.NoError(t, err)
+	bs, err := NewBlockService(db)
+	require.NoError(t, err)
+
+	fin := bs.GetLatestFinalized()
+	// Two blocks with the blocks present, the third header only.
+	prev := fin.Hash
+	present := make([]crypto.Hash, 0, 2)
+	for i := 1; i <= 2; i++ {
+		h := testChain(prev, fin.TimeSlotIndex+jamtime.Timeslot(i), 0)
+		hash, herr := h.Hash()
+		require.NoError(t, herr)
+		require.NoError(t, bs.Store.PutHeader(h))
+		require.NoError(t, bs.Store.PutBlock(block.Block{Header: h}))
+		present = append(present, hash)
+		prev = hash
+	}
+	tip := testChain(prev, fin.TimeSlotIndex+3, 0)
+	tipHash, err := tip.Hash()
+	require.NoError(t, err)
+	require.NoError(t, bs.Store.PutHeader(tip))
+	bs.AddLeaf(tipHash, fin.TimeSlotIndex+3)
+
+	wanted := bs.BackfillHashes(32)
+	assert.Equal(t, []crypto.Hash{tipHash}, wanted,
+		"only the missing block is wanted, not the two that are already here")
+	for _, h := range present {
+		assert.NotContains(t, wanted, h)
+	}
+}

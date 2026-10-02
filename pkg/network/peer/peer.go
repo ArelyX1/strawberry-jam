@@ -17,6 +17,9 @@ type BlockAnnouncer interface {
 	// Add the rest of the functions when needed
 	SendAnnouncement(header *block.Header) error
 	Start() error
+	// Done reports whether the connection under this announcer is gone, so the
+	// caller knows to replace it instead of announcing into a dead stream again.
+	Done() bool
 }
 
 // PeerSet maintains mappings between peer identifiers

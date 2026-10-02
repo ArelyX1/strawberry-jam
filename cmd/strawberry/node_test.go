@@ -566,6 +566,10 @@ func startNode(t *testing.T, binary, dir string, rpcPort int) *nodeProcess {
 		"-data-dir", filepath.Join(dir, "chain"),
 		"-genesis", filepath.Join(moduleRoot(t), "genesis", "chain-dev.json"),
 		"-bridge-wallet", hex.EncodeToString(seed),
+		// One node on its own, so it writes every timeslot. Left to rotate over
+		// the chain's validator count it would write one timeslot in a thousand
+		// and the chain it is asked to resume would have holes in it.
+		"-author-count", "1",
 	)
 	// The node is started in the module, because that is where the genesis it is
 	// given and the validator file it reads live.

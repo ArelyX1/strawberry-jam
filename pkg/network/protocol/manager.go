@@ -55,7 +55,7 @@ func (m *Manager) OnConnection(conn *transport.Conn) *ProtocolConn {
 // handleStreams manages the lifecycle of streams for a protocol connection.
 // It continuously accepts new streams and handles connection closure and timeouts.
 func (m *Manager) handleStreams(protoConn *ProtocolConn) {
-	defer protoConn.Close() //nolint:errcheck // TODO: handle error
+	defer protoConn.Close()
 
 	for {
 		// Attempt to accept an incoming stream

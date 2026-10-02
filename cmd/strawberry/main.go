@@ -117,20 +117,26 @@ func (f FullValidatorInfo) ToMetadata() ([]byte, error) {
 
 func main() {
 	var (
-		configFile   string
-		chainSpec    string
-		isValidator  bool
-		nodeName     string
-		telemetryURL string
-		portOverride int
-		rpcPort      int
-		help         bool
-		genesisPath  string
-		dataDir      string
-		bridgeWallet string
+		configFile     string
+		validatorIndex int
+		authorCount    int
+		chainSpec      string
+		isValidator    bool
+		nodeName       string
+		telemetryURL   string
+		portOverride   int
+		rpcPort        int
+		help           bool
+		genesisPath    string
+		dataDir        string
+		bridgeWallet   string
 	)
 
 	flag.StringVar(&configFile, "config", "appconfig.json", "path to config file")
+	flag.IntVar(&validatorIndex, "validator-index", -1,
+		"which validator from test_validators.json this process is, overriding the config file")
+	flag.IntVar(&authorCount, "author-count", 0,
+		"how many validators the authorship turn rotates over; 1 makes a lone node write every timeslot, 0 uses the chain's validator count")
 	flag.StringVar(&chainSpec, "chain", "dev", "chain specification")
 	flag.BoolVar(&isValidator, "validator", false, "run as validator")
 	flag.StringVar(&nodeName, "name", "Strawberry-Node", "node name")
@@ -163,8 +169,21 @@ func main() {
 	opts := log.Options{LogLevel: loglevel}
 	log.Init(opts)
 
+	// Which validator this process is. The config file carries one, but a file
+	// per node is a nuisance to keep in step with the command line, so the flag
+	// wins when it is given. Without this every node started without it came up
+	// as the same validator, and two processes ended up talking to each other
+	// instead of to a peer: same key, same chain, and a test that agreed with
+	// itself for the wrong reason.
+	if validatorIndex >= 0 {
+		appConfig.ValidatorIndex = validatorIndex
+	}
+
 	maxuint16 := int(^uint16(0))
-	if appConfig.ValidatorIndex < 0 && appConfig.ValidatorIndex > maxuint16 {
+	// Out of range is either end, so this is || and not &&: with && a negative
+	// index was accepted and then became 65535 when it was cast, which is a
+	// validator that does not exist rather than a clear refusal.
+	if appConfig.ValidatorIndex < 0 || appConfig.ValidatorIndex > maxuint16 {
 		log.Internal.Fatal().
 			Msgf("validator index %d out of bounds 0-%d", appConfig.ValidatorIndex, maxuint16)
 	}
@@ -323,6 +342,17 @@ func main() {
 
 	chainName := fmt.Sprintf("Strawberry %s", chainSpec)
 
+	// Say who this node is, out loud. Two nodes that both came up as the same
+	// validator look perfectly healthy from the outside: they connect, they
+	// announce, and they agree on the tip, because they are the same node
+	// talking to itself. Nothing in the log said otherwise, which is how a whole
+	// two-validator test went on passing for that reason.
+	log.Internal.Info().
+		Uint16("validatorIndex", index).
+		Str("key", fmt.Sprintf("%x", seed[len(seed)-32:])).
+		Str("listening", udpAddress.String()).
+		Msg("this node is")
+
 	// Start RPC server (before block producer so it's ready for subscriptions)
 	rpcAddr := fmt.Sprintf(":%d", rpcPort)
 	rpcSrv := startRPCServer(rpcAddr, nodeName, chainName, version,
@@ -330,7 +360,7 @@ func main() {
 	rpcSrv.papucoin = newPapucoinHandlers(runtime, rpcSrv)
 
 	// Start block producer
-	startBlockProducer(n.BlockService, runtime, index,
+	startBlockProducer(n.BlockService, runtime, index, uint16(authorCount),
 		func(hash crypto.Hash, num uint, h block.Header) {
 			rpcSrv.updateBlock(hash, num, h)
 		}, rpcSrv.markRebuilt, n, ctx)

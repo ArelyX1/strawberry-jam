@@ -116,10 +116,10 @@ func (bs *BlockService) gapHashes(limit int) []crypto.Hash {
 		if err != nil {
 			continue
 		}
-		if !add(hash) {
-			return missing
-		}
-		if !add(h.ParentHash) {
+		// The whole stretch below this header can be missing, not just the
+		// header itself, so the walk goes all the way down to a block that is
+		// there rather than stopping one level down.
+		if !bs.walkDownPending(hash, h, add, limit*4) {
 			return missing
 		}
 	}
@@ -131,29 +131,63 @@ func (bs *BlockService) gapHashes(limit int) []crypto.Hash {
 	})
 
 	for _, leaf := range leafHashes {
-		header, err := bs.Store.GetHeader(leaf)
-		if err != nil {
-			continue
-		}
-		// The leaf is only wanted when its block is missing. A leaf this node
-		// wrote itself is complete, and asking for it again was how a whole
-		// chain came back reporting one block still missing.
-		if _, err := bs.Store.GetBlock(leaf); err != nil {
-			if !add(leaf) {
-				return missing
-			}
-		}
-		// The walk stops at the first header this node has: from there on the
-		// chain is unbroken and there is nothing to go and get.
-		if _, err := bs.Store.GetHeader(header.ParentHash); err == nil {
-			continue
-		}
-		if !add(header.ParentHash) {
+		if !bs.walkDown(leaf, add, limit*4) {
 			return missing
 		}
 	}
 
 	return missing
+}
+
+// walkDown follows the parent chain from a hash and offers every block it does
+// not have to add, stopping at the first block that is there. It reports whether
+// there is still room in the list.
+//
+// The thing that decides where to stop is the block, not the header. A node that
+// fell behind usually has the headers for a stretch of chain and not the blocks,
+// because headers are what announcements carry and blocks are what has to be
+// asked for separately. Stopping at the first known parent header therefore hid
+// exactly the gap that mattered: the node knew a hundred headers in a row, had
+// none of the blocks under them, and so asked for nothing and filled nothing
+// while reporting that it was still waiting on the same two blocks forever.
+//
+// The walk is bounded so that a peer far ahead costs a number rather than a hang,
+// and add refuses to grow the list past the limit.
+func (bs *BlockService) walkDown(hash crypto.Hash, add func(crypto.Hash) bool, maxSteps int) bool {
+	return bs.walkDownFrom(hash, nil, add, maxSteps)
+}
+
+// walkDownPending is walkDown for a header that arrived over a gap: its own
+// header is already in hand, so the first step along does not need the store.
+func (bs *BlockService) walkDownPending(hash crypto.Hash, header block.Header, add func(crypto.Hash) bool, maxSteps int) bool {
+	return bs.walkDownFrom(hash, &header, add, maxSteps)
+}
+
+func (bs *BlockService) walkDownFrom(hash crypto.Hash, held *block.Header, add func(crypto.Hash) bool, maxSteps int) bool {
+	cur := hash
+	for step := 0; step < maxSteps; step++ {
+		if _, err := bs.Store.GetBlock(cur); err == nil {
+			// From here down the chain is unbroken, so there is nothing to go
+			// and get and no reason to keep walking.
+			return true
+		}
+		if !add(cur) {
+			return false
+		}
+		if held != nil {
+			cur = held.ParentHash
+			held = nil
+			continue
+		}
+		header, err := bs.Store.GetHeader(cur)
+		if err != nil {
+			// Without the header there is no way to know what came before, so
+			// this one block is all that can be asked for.
+			return true
+		}
+		cur = header.ParentHash
+	}
+	return true
 }
 
 // BackfillHashes is what the sync loop asks for: the blocks to go and get, so
