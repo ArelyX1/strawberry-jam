@@ -541,15 +541,30 @@ func (bp *blockProducer) followCanonical() (bool, error) {
 		return false, fmt.Errorf("rewind to the start of the chain: %w", err)
 	}
 
-	work := make([]devnet.BlockWork, 0, len(chain))
-	for _, b := range chain {
-		work = append(work, blockWork(b)...)
+	// Execute it through the same path this node uses to resume its own chain
+	// after a restart: one timeslot at a time, that timeslot's work before its
+	// step, and the state root checked against the block it is about to rebuild.
+	//
+	// Handing the runtime the whole chain's work at once is what made this land
+	// on the wrong state. The queue is shared, so with every timeslot's work
+	// waiting before the first step, a slot could settle work that belonged to
+	// the block after it. The node then held the tip of the chain it had adopted
+	// and a state that chain did not describe, and every answer it gave about
+	// that chain was wrong. The per-timeslot root check is what stops that going
+	// unnoticed: a chain that does not rebuild is refused rather than adopted.
+	genesis, _, ok := bp.bs.GenesisHeader()
+	if !ok {
+		return false, fmt.Errorf("the genesis header is not there, so the chain cannot be rebuilt from the start")
 	}
-	if err := bp.runtime.Replay(work, chain[len(chain)-1].Header.TimeSlotIndex); err != nil {
+	bySlot := make(map[jamtime.Timeslot]block.Block, len(chain))
+	for _, b := range chain {
+		bySlot[b.Header.TimeSlotIndex] = b
+	}
+	last := chain[len(chain)-1].Header
+	if _, err := bp.replay(genesis.TimeSlotIndex+1, last.TimeSlotIndex, bySlot); err != nil {
 		return false, fmt.Errorf("replay the chain a peer wrote: %w", err)
 	}
 
-	last := chain[len(chain)-1].Header
 	bp.parentHash = tipHash
 	bp.blockNum = uint(last.TimeSlotIndex) + 1
 	return true, nil

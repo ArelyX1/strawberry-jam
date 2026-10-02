@@ -269,7 +269,26 @@ Verificado con dos nodos: se ven, anuncian sin un solo fallo y se quedan en el
 mismo tip. El modo de un solo nodo sigue igual, con el smoke test y la
 conformidad en verde.
 
-### Lo que faltaba y hacia que fallara
+### Lo que falta
+
+La raiz de estado, en la red viva. A y B terminan en el mismo bloque, pero la raiz
+que tiene A no es la que tiene B en ese bloque.
+
+Lo que ya se sabe: no es que el replay y la ejecucion sean distintas por si
+mismos. Hay tests queしたもの y lo otro sobre la misma cadena y las dos rutas
+coinciden, con y sin rebobinar antes. Asi que la divergencia es de algo que solo
+aparece con los dos nodos en marcha, y no esta aislada.
+
+Lo que se ha corregido en el camino, y si era la causa: `followCanonical` pasaba
+al runtime toda la cadena de golpe, de modo que la cola de trabajo era
+compartida y un timeslot podia liquidar trabajo del bloque siguiente. Ahora
+adopta por el mismo camino que usa un nodo al reiniciar: un timeslot cada vez, el
+trabajo de ese timeslot antes de su paso, y la raiz comprobada contra el bloque
+que se va a reconstruir. Una cadena que no se reconstruye se rechaza en vez de
+adoptarse. `Runtime.Replay`, que encolaba todo de golpe, no le quedaba ningun
+llamador y se ha quitado en vez de dejarla a mano para el siguiente.
+
+ba y hacia que fallara
 
 Tres cosas, y las tres hubo que encontrarlas mirando el error de verdad:
 

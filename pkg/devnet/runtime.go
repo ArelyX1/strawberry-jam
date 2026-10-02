@@ -1057,36 +1057,3 @@ func (r *Runtime) Rewind() error {
 	r.updateRoot()
 	return nil
 }
-
-// Replay executes a chain written by somebody else over the current state.
-//
-// It is the other half of [Runtime.Rewind]: the node goes back to genesis and
-// then this walks the chain it is adopting, so the state it ends up carrying is
-// the state that chain describes and not one of its own.
-//
-// Each block is asked for the work its timeslot carried and that work is queued
-// before the timeslot runs, because a timeslot that settles no work lands on
-// the state alone and would otherwise be skipped. The state root of the last
-// block is compared with the one that block claims, which is what makes this a
-// check rather than a replay: a chain that does not describe the state it
-// produced is refused instead of being followed.
-func (r *Runtime) Replay(work []BlockWork, through jamtime.Timeslot) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.replaying = true
-	for _, w := range work {
-		if _, err := r.scheduler.Submit(w.ServiceID, svc.WorkItem{Payload: w.Payload, Origin: "replay"}); err != nil {
-			r.replaying = false
-			return fmt.Errorf("the queue is full: %w", err)
-		}
-	}
-	r.replaying = false
-
-	for slot := r.state.TimeslotIndex; slot <= through; slot++ {
-		if _, err := r.runLocked(slot); err != nil {
-			return fmt.Errorf("replay timeslot %d: %w", slot, err)
-		}
-	}
-	return nil
-}
