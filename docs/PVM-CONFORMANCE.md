@@ -523,20 +523,47 @@ Comprobado con 3 nodos: la cadena arranca sola, los tres comparten bloque y raiz
 estado, la malla esta completa, uno se cae, la cadena sigue sin el y al volver se
 sincroniza.
 
+### Un timeslot sin bloque no se puede inventar
+
+El replay recorria **todos** los timeslots hasta la punta, y los que no tenian
+bloque los ejecutaba como si no hubieran liquidado nada. Eso no es una forma lenta
+de alcanzar la cadena: es un estado distinto.
+
+Un nodo que va atrasado ejecuta de una vez todo lo que le ha llegado, con lo que un
+timeslot sin bloque lo ejecutaba vacío mientras otro nodo que si tenia los bloques
+lo ejecutaba de verdad. Los dos llegaban a estados distintos y publicaban el mismo
+bloque encima de cada uno: mismo bloque, dos raices.
+
+Ahora el replay **para en el hueco**. Lo que paso en un timeslot que nadie ha
+descrito no se puede suponer, asi que el nodo ejecuta lo que puede demostrar y
+espera a lo demas, que llega despues y se recoge en la pasada siguiente. Parar
+tampoco es una forma de no alcanzar nunca: un tramo sin huecos se recorre entero, y
+eso tambien esta fijado por un test.
+
+Con eso, dos validadores que se van turnando la autoria dan la misma raiz en cada
+timeslot, un tramo con huecos se detiene en el hueco dejando el estado que el autor
+tenia en ese punto, y un tramo entero se ejecuta de punta a punta. Los tres casos
+tienen test.
+
 ### Lo que queda
 
-Un caso, y es concreto. Despues de que uno se va y vuelve, dos de los que llevan
-mas tiempo corriendo acabam nombrando **el mismo bloque con dos raices de estado
-distintas**. Mismo bloque, dos estados: los dos aceptan la cadena, ejecutan cosas
-distintas y luego la publican igual.
+Tras un nodo irse y volver, dos de los que llevaban mas tiempo corriendo aparecen
+con **el mismo bloque y dos raices de estado**. Y no es que uno haya rechazado la
+cadena: no hay ni una reconstruccion rechazada en ninguno de los dos, o sea que
+cada uno acepta todo lo que reconstruye.
 
-Lo que ya se ha descartado: dos validadores que se van turnando la autoria y se
-reconstruyen mutuamente los bloques dan la misma raiz, timeslot a timeslot. Hay un
-test que lo comprueba y pasa. O sea que reconstruir el bloque de otro reproduce el
-estado del autor cuando se va de uno en uno.
+Eso deja una sola explicacion que encaja con lo medido: **no estan en el mismo punto
+de ejecucion**. El nodo que autoro el bloque del tip ya lo ejecuto y los demas lo
+ejecutan en el timeslot siguiente, asi que hay una ventana, la mayor parte del
+tiempo, en la que estan un paso distintos de la misma cadena. Comparar las raices en
+un instante cualquiera mide esa ventana, no el estado.
 
-Lo que ese test no cubre, y es lo que queda: **el replay de un tramo con huecos**.
-Un nodo que va atrasado ejecuta de una vez todo lo que le ha llegado, y `bp.replay`
-recorre timeslot a timeslot incluyendo los que no tienen bloque. Ese camino no esta
-fijado por ningun test, y es por donde un nodo puede quedarse con un estado que no
-es el del autor.
+La comprobacion de la malla necesita entonces comparar el estado **en el mismo
+bloque**, no el estado vivo de cada nodo. El RPC solo expone la raiz del estado
+vivo, asi que hace falta una forma de preguntar por la raiz que un nodo tiene para
+un bloque concreto, y ahi es donde se ha quedado esto.
+
+Lo que si esta comprobado con tres nodos: la cadena arranca sola, los tres
+comparten bloque y raiz de estado, la malla esta completa, uno se cae, la cadena
+sigue sin el, y al volver se sincroniza. Lo unico que falla es la comprobacion
+final, y lo que falla es como se comprueba.

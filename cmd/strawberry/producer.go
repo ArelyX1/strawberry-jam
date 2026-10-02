@@ -449,8 +449,16 @@ func (bp *blockProducer) executeUpTo(slot jamtime.Timeslot) (bool, string) {
 			available[0].Header.TimeSlotIndex, bp.runtime.Timeslot())
 	}
 
-	if _, err := bp.replay(bp.runtime.Timeslot()+1, through, bySlot); err != nil {
+	hechos, err := bp.replay(bp.runtime.Timeslot()+1, through, bySlot)
+	if err != nil {
 		return false, "replaying it did not rebuild the state: " + err.Error()
+	}
+	// The replay stops at a timeslot it has no block for, so it may not have got
+	// as far as the timeslot asked for. Building on the block it never ran would
+	// name a parent whose state is not the one this node is holding.
+	if uint64(through-bp.runtime.Timeslot()) != hechos {
+		bp.parentHash = leaf
+		return true, ""
 	}
 
 	// The parent is the last block that was run, not the tip. The tip can be
@@ -532,14 +540,37 @@ func (bp *blockProducer) replay(from, through jamtime.Timeslot, blocks map[jamti
 		return 0, nil
 	}
 	for slot := from; slot <= through; slot++ {
+		b, ok := blocks[slot]
+		if !ok {
+			// A timeslot with no block here is a timeslot nobody has described.
+			//
+			// Running it anyway is what put two nodes on the same block with two
+			// different states. A node that is behind executes everything that has
+			// arrived in one go, and this loop used to walk every timeslot up to the
+			// tip, stepping the ones with no block as if they had settled no work at
+			// all. A node that had all the blocks ran those timeslots for real, so
+			// the two arrived at different states and then published the same block
+			// over each of them: same block, two roots, and nothing in the log to
+			// say why.
+			//
+			// What happened in a timeslot with no block cannot be guessed, so the
+			// replay stops at the hole and the node executes what it can actually
+			// prove. The rest arrives later, and the next pass picks it up from
+			// here. Stopping is also what lets it be at the right state at all:
+			// inventing a timeslot is not a slower way of catching up, it is a
+			// different state.
+			bp.runtime.FinishRebuild()
+			return uint64(slot - from), nil
+		}
+
 		parentRoot := bp.runtime.Root()
-		if b, ok := blocks[slot]; ok && b.Header.PriorStateRoot != parentRoot {
+		if b.Header.PriorStateRoot != parentRoot {
 			return uint64(slot - from), fmt.Errorf(
 				"the state rebuilt for timeslot %d is %x, but the block for that timeslot was built on %x",
 				slot, parentRoot, b.Header.PriorStateRoot)
 		}
 
-		work := blockWork(blocks[slot])
+		work := blockWork(b)
 		if err := bp.runtime.Rebuild(work); err != nil {
 			return uint64(slot - from), fmt.Errorf("timeslot %d: %w", slot, err)
 		}
