@@ -485,15 +485,48 @@ Y dos fallos propios de esta sesion, por si quedan:
   de log en un par de minutos y lleno el disco. El reintento espera ahora y lo dice
   una vez por vez.
 
-### Lo que sigue sin estar
+### Donde se queda, con medidas
 
-Una malla de cinco nodos forma la malla entera, cada nodo ve a los otros cuatro, y
-los nodos que entran no convergen. Con tres va bien.
+Medido en una malla de tres, en la etapa en la que se une el tercero:
 
-La causa mas probable, y no la he confirmada: el turno de escribir rota sobre el
-numero final de validadores, asi que cuando solo hay dos nodos en marcha los
-timeslots del tercero no los escribe nadie y la cadena queda con huecos. Un nodo
-que entra despues necesita una cadena continua para poder ejecutarla, y con huecos
-no la tiene. La forma de resolverlo es que el turno dependa del conjunto de
-validadores que hay conectados, que es el mismo para todos porque la malla es
-completa, en vez de un numero fijado al lanzar la malla. No lo he hecho.
+| nodo | anuncios recibidos | peticiones de bloque | ejecuciones | backfill |
+|------|------------------:|---------------------:|------------:|---------:|
+| 0    | 2                 | 3                    | 1           | 0        |
+| 1    | 0                 | 2                    | 1           | 0        |
+| 2    | 0                 | 0                    | 0           | 0        |
+
+Tres cosas de ahi:
+
+- **El ultimo nodo no recibe ni un anuncio.** Tiene sus dos conexiones, la malla
+  esta completa, y no le llega nada: ni anuncios, ni peticiones, ni ejecuciones.
+  Con dos nodos el anuncio funciona; al tercero no. El aviso de que un bloque
+  anunciado va por delante de este nodo es lo unico que delata el camino, y sale
+  cero veces.
+- **El backfill no pide nada en ningun nodo.** Cada uno cree que su cadena esta
+  completa, y `BackfillHashes` no ve ningun hueco. O no encuentra por donde entrar,
+  o lo que le falta son cabeceras y no bloques, que es justo lo que `gapHashes` no
+  distingue.
+- **Los dos primeros reciben poco tambien.** Dos anuncios y una ejecucion en un
+  nodo que lleva mas de un minuto en marcha.
+
+O sea que el bloqueo no es de ejecucion ni de eleccion de tip: es que **el camino
+de anuncio no llega al nodo nuevo**. Todo lo de catching up, de la raiz de estado y
+del reparto de autoria que se ha estado tocando son sintoma de esto.
+
+### La decision que falta
+
+Es un modelo, no un arreglo. En JAM cada timeslot tiene exactamente un autor, y si
+ese autor no esta en marcha ese timeslot no lo escribe nadie. Levantar una red de
+uno en uno choca de frente con esa regla, y las dos salidas tienen un precio:
+
+- **Turno fijo sobre N y levantar los N a la vez.** La malla se monta de una
+  sentada, sin escenario intermedio, y lo que se prueba de verdad es apagar y
+  encender un nodo. El levantamiento escalonado deja de tener sentido.
+- **Turno sobre quien este de verdad conectado.** Es lo que hace que un nodo solo
+  pueda arrancar la cadena, y funciona mientras el conjunto no cambia; durante el
+  levantamiento cambia, y los nodos cuentan distinto mientras dura el cambio. Se
+  salva con la comprobacion de no escribir un timeslot que ya tiene bloque, que
+  convierte el desacuerdo en nada, pero el desacuerdo sigue existiendo.
+
+Lo que no se ha probado es la combinacion completa de las dos con el problema de
+anadido resuelto, y es lo que haria falta para cerrar esto.
