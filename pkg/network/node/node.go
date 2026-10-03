@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"strings"
 
@@ -297,7 +298,7 @@ func (n *Node) OnConnection(conn *transport.Conn) {
 				log.Printf("Failed to close existing peer connection: %v", err)
 			}
 			n.PeersSet.RemovePeer(existingPeer)
-		case preferConnection(conn, existing):
+		case n.preferConnection(conn):
 			if err := existing.Close(); err != nil {
 				log.Printf("Failed to close existing peer connection: %v", err)
 			}
@@ -741,55 +742,32 @@ func (n *Node) AnnounceBlock(ctx context.Context, header *block.Header, peer *pe
 // preferConnection says whether incoming should be the one this node keeps when it
 // already has one connection to the same peer and both are alive.
 //
-// The comparison is on the two ports, smallest first, and both nodes hold the
-// same two numbers for the same two connections, so they reach the same answer
-// without exchanging anything. Arrival order cannot be used for this: the two
-// connections turn up in opposite order at the two ends, so whichever rule went
-// by order had each node keeping the connection the other had just closed.
-func preferConnection(incoming, existing *transport.Conn) bool {
-	il, ir := addrPorts(incoming)
-	el, er := addrPorts(existing)
-	return preferPorts(il, ir, el, er)
-}
-
-// preferPorts decides between two connections to the same peer.
+// Which of the two connections each node keeps has to come out the same on both
+// sides, because a node that keeps the one the other closed ends up holding a
+// connection that is dead: every announcement on it fails with the remote
+// refusing to open a stream, and the chain stops at whatever slot was last
+// announced.
 //
-// The two ports are sorted before they are compared, and that is the whole
-// point. A connection is seen with its own local port first at one end and at
-// the other end with the same two numbers the other way round, so a connection
-// B dialled to A is (30333, 51000) on A's side and (51000, 30333) on B's.
-// Comparing them as they come leaves the two nodes comparing different numbers
-// about the same two connections, which is the disagreement this is here to
-// avoid: each keeps the one it dialled and closes the one the other is holding.
-func preferPorts(inLocal, inRemote, exLocal, exRemote int) bool {
-	inLo, inHi := orderPorts(inLocal, inRemote)
-	exLo, exHi := orderPorts(exLocal, exRemote)
-	if inLo != exLo {
-		return inLo < exLo
-	}
-	return inHi < exHi
-}
-
-func orderPorts(a, b int) (int, int) {
-	if a > b {
-		return b, a
-	}
-	return a, b
-}
-
-func addrPorts(c *transport.Conn) (int, int) {
-	local, remote := 0, 0
-	if addr := c.QConn().LocalAddr(); addr != nil {
-		if udp, ok := addr.(*net.UDPAddr); ok {
-			local = udp.Port
-		}
-	}
-	if addr := c.QConn().RemoteAddr(); addr != nil {
-		if udp, ok := addr.(*net.UDPAddr); ok {
-			remote = udp.Port
-		}
-	}
-	return local, remote
+// Arrival order cannot decide it. When two nodes start together both dial each
+// other, the two connections arrive in opposite order at the two ends, and "the
+// first one wins" has each node keeping the connection it dialled, which is the
+// one the other node just closed.
+//
+// The addresses cannot decide it either. Comparing the two ports of each
+// connection only agrees if both nodes see the same pair, and they do not: a
+// dialed connection carries the dialer's ephemeral port, which is a different
+// number at the two ends, and anything that rewrites addresses on the way (a
+// NAT, for one) makes the two numbers differ in ways neither end can correct.
+// Comparing IP addresses has the same problem one step further out.
+//
+// What both nodes hold identically is the pair of public keys, so the choice is
+// made on those. The node whose own key sorts first keeps the connection it
+// dialled and the other keeps the one it accepted, and since each end knows both
+// keys and which connection it opened itself, both arrive at the same answer and
+// are left holding the same live connection.
+func (n *Node) preferConnection(incoming *transport.Conn) bool {
+	keepDialed := bytes.Compare(n.ValidatorManager.Keys.EdPub, incoming.PeerKey()) < 0
+	return incoming.Dialed() == keepDialed
 }
 
 // RequestState implements the client side of the CE 129 State Request protocol from the JAMNP.

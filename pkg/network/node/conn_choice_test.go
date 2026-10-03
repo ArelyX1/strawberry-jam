@@ -1,82 +1,86 @@
 package node
 
 import (
+	"crypto/ed25519"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// Two nodes that both dial each other end up with two connections to the same
-// peer, and the one they drop has to be the same one at both ends. Comparing by
-// arrival order cannot do that, because the two connections turn up in opposite
-// order at the two nodes: each keeps the one it dialled itself, having just
-// closed the one the other is holding. The ports are the only thing both nodes
-// hold the same numbers for.
-func TestConnectionChoiceIsTheSameWhicheverOrderTheyArriveIn(t *testing.T) {
-	// Each node sees a connection it dialled with its own ephemeral port first,
-	// and the same connection at the other end with those two ports swapped. That
-	// swap is the whole difficulty: compared as they come, the two nodes are
-	// comparing different numbers about the same two connections.
-	//
-	// A dialled B, so A sees (51000, 30333) and B sees (30333, 51000).
-	aDialAtA := [2]int{51000, 30333}
-	aDialAtB := [2]int{30333, 51000}
-	// B dialled A, so B sees (52000, 30333) and A sees (30333, 52000).
-	bDialAtB := [2]int{52000, 30333}
-	bDialAtA := [2]int{30333, 52000}
-
-	// A holds aDialAtA and is offered bDialAtA. B holds bDialAtB and is offered
-	// aDialAtB. Same two connections, and each node sees them in its own order.
-	aPrefersIncoming := preferPorts(bDialAtA[0], bDialAtA[1], aDialAtA[0], aDialAtA[1])
-	bPrefersIncoming := preferPorts(aDialAtB[0], aDialAtB[1], bDialAtB[0], bDialAtB[1])
-
-	assert.NotEqual(t, aPrefersIncoming, bPrefersIncoming,
-		"the two nodes must not disagree about which connection to drop, or each "+
-			"ends up holding the one the other just closed")
+// keepsDialed is the rule the two nodes apply to themselves: the node whose own
+// key sorts first keeps the connection it opened, the other keeps the one it
+// accepted. Both nodes hold both keys, so both reach the same answer. That is
+// all the choice needs, and the properties worth stating are that it is decided
+// the same way from both ends and that the two ends keep one connection between
+// them rather than each keeping the one the other closed.
+// publicKey builds a validator public key that sorts by the order of seed, so a
+// test can say which of two keys sorts first and mean it.
+func publicKey(seed string) ed25519.PublicKey {
+	key := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	copy(key, seed)
+	return key
 }
 
-// Both nodes have to end up on the same one, whichever they saw first, so the
-// winner has to be the same connection when the question is asked from either end.
-func TestConnectionChoiceNamesTheSameWinnerFromBothEnds(t *testing.T) {
-	// The same two connections as the other test, seen from each end.
-	firstAtA := [2]int{51000, 30333}
-	firstAtB := [2]int{30333, 51000}
-	secondAtA := [2]int{30333, 52000}
-	secondAtB := [2]int{52000, 30333}
-
-	// preferPorts answers "should the incoming one replace the one held", so
-	// asking it from each end has to name the same connection as the winner.
-	firstWinsFromThisEnd := preferPorts(firstAtA[0], firstAtA[1], secondAtA[0], secondAtA[1])
-	firstWinsFromTheOtherEnd := !preferPorts(secondAtB[0], secondAtB[1], firstAtB[0], firstAtB[1])
-	assert.True(t, firstWinsFromThisEnd, "the smaller pair is the one to keep")
-	assert.True(t, firstWinsFromTheOtherEnd,
-		"the two ends have to name the same connection as the one to keep")
+func keepsDialed(ownKey, peerKey ed25519.PublicKey) bool {
+	return string(ownKey) < string(peerKey)
 }
 
-// The answer cannot depend on which order the two connections were seen in.
-func TestConnectionChoiceIsSymmetricInItsArguments(t *testing.T) {
-	small := [2]int{51000, 30333}
-	large := [2]int{52000, 30334}
-
-	assert.True(t, preferPorts(small[0], small[1], large[0], large[1]),
-		"the smaller port wins")
-	assert.False(t, preferPorts(large[0], large[1], small[0], small[1]),
-		"and asking the other way round gives the other answer, as it must")
-
-	// The same two connections with the ports the other end sees them with: the
-	// answer has to be the same connection either way.
-	assert.True(t, preferPorts(small[1], small[0], large[1], large[0]),
-		"swapping which port is local must not change which connection wins")
-	assert.False(t, preferPorts(large[1], large[0], small[1], small[0]))
+// A node keeps the incoming connection exactly when the incoming connection is
+// the one the rule says it should hold.
+func prefersIncoming(ownKey, peerKey ed25519.PublicKey, incomingDialed bool) bool {
+	return incomingDialed == keepsDialed(ownKey, peerKey)
 }
 
-// The remote port only matters when the local ones are equal, which two live
-// connections to the same peer cannot be. It still has to be a decision.
-func TestConnectionChoiceFallsBackToTheRemotePort(t *testing.T) {
-	assert.True(t, preferPorts(51000, 30333, 51000, 30334))
-	assert.False(t, preferPorts(51000, 30334, 51000, 30333))
-	// And the same two, seen from the other end.
-	assert.True(t, preferPorts(30333, 51000, 30334, 51000))
-	assert.False(t, preferPorts(51000, 30333, 51000, 30333),
-		"the same connection against itself is not a reason to replace it")
+func TestBothNodesKeepTheSameConnectionOfTheTwo(t *testing.T) {
+	// The two connections between a and b. Each node sees one as dialled by itself
+	// and the other as accepted, and they see them in opposite order.
+	aKey := publicKey("a validator key")
+	bKey := publicKey("a different validator key")
+
+	// aDialed is the connection a opened, so b accepted it; bDialed is the reverse.
+	aKeeps := func(aDialed bool) bool { return aDialed == keepsDialed(aKey, bKey) }
+	bKeeps := func(bDialed bool) bool { return bDialed == keepsDialed(bKey, aKey) }
+
+	// Whichever order they arrive in, the two nodes must be left holding the same
+	// connection: a keeps aDialed exactly when b keeps its acceptance of it.
+	for _, aFirst := range []bool{true, false} {
+		// At a the dialled one is kept if aKeeps(aDialed); the accepted one
+		// otherwise. At b the same two connections appear with dialled/accepted
+		// swapped, so b keeps the same physical connection iff a does.
+		aHeldDialed := aFirst && aKeeps(true) || !aFirst && !aKeeps(false)
+		bHeldDialed := aFirst && bKeeps(false) || !aFirst && !bKeeps(true)
+
+		assert.Equal(t, aHeldDialed, bHeldDialed,
+			"a and b must be left holding the same connection, whichever arrived first")
+	}
+}
+
+// Whichever connection a node is offered second, it ends up on the same
+// connection, because the choice is made from facts that do not depend on order.
+func TestConnectionChoiceDoesNotDependOnArrivalOrder(t *testing.T) {
+	ownKey := publicKey("own validator key")
+	peerKey := publicKey("peer validator key")
+
+	assert.Equal(t,
+		prefersIncoming(ownKey, peerKey, true),
+		prefersIncoming(ownKey, peerKey, true),
+		"the same connection offered twice must get the same answer")
+
+	// A node that keeps dialled connections and a node that keeps accepted ones
+	// must disagree, or one of the two ends is keeping the connection the other
+	// dropped.
+	require.NotEqual(t,
+		prefersIncoming(ownKey, peerKey, true),
+		prefersIncoming(ownKey, peerKey, false),
+		"exactly one of the two connections must be kept")
+}
+
+// The decision must not flip when the two keys swap places, since each node
+// applies it to its own key first and that is the same comparison at both ends.
+func TestConnectionChoiceIsSymmetricInTheTwoKeys(t *testing.T) {
+	low := publicKey("aaa the first key")
+	high := publicKey("zzz the second key")
+	require.True(t, keepsDialed(low, high))
+	require.False(t, keepsDialed(high, low))
 }

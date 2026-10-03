@@ -20,19 +20,30 @@ type Conn struct {
 	quicConn  *quic.Conn
 	transport *Transport
 	peerKey   ed25519.PublicKey
-	ctx       context.Context
-	cancel    context.CancelFunc
+	// dialed records whether this node opened the connection or the peer did.
+	// Both ends see the same connection from opposite sides, so this is the one
+	// fact about it that each end can answer for itself and the other cannot.
+	dialed bool
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// Dialed reports whether this node opened this connection. It is false when the
+// peer opened it and this node accepted it.
+func (c *Conn) Dialed() bool {
+	return c.dialed
 }
 
 // newConn creates a new connection wrapper around a QUIC connection.
 // It sets up context cancellation and cleanup handling.
 // The connection will be automatically cleaned up when the context is cancelled.
-func newConn(qConn *quic.Conn, transport *Transport) *Conn {
+func newConn(qConn *quic.Conn, transport *Transport, dialed bool) *Conn {
 	ctx, cancel := context.WithCancel(transport.ctx)
 
 	conn := &Conn{
 		quicConn:  qConn,
 		transport: transport,
+		dialed:    dialed,
 		ctx:       ctx,
 		cancel:    cancel,
 	}

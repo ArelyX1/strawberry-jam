@@ -178,7 +178,7 @@ func (t *Transport) Connect(addr *net.UDPAddr) error {
 		return fmt.Errorf("%w: %v", ErrDialFailed, err)
 	}
 
-	t.handleConnection(quicConn)
+	t.handleConnection(quicConn, true)
 	return nil
 }
 
@@ -221,17 +221,19 @@ func (t *Transport) acceptLoop() {
 				continue
 			}
 
-			go t.handleConnection(conn)
+			go t.handleConnection(conn, false)
 		}
 	}
 }
 
 // handleConnection processes a new QUIC connection after acceptance/dialing.
+// dialed says whether this node opened it, which the duplicate-connection
+// choice needs to know.
 // It:
 // 1. Extracts the peer's Ed25519 key from their certificate
 // 2. Creates a Conn wrapper around the QUIC connection
 // 3. Passes the connection to the protocol handler
-func (t *Transport) handleConnection(qConn *quic.Conn) {
+func (t *Transport) handleConnection(qConn *quic.Conn, dialed bool) {
 	peerKey, err := t.config.CertValidator.ExtractPublicKey(qConn.ConnectionState().TLS.PeerCertificates[0])
 	if err != nil {
 		fmt.Printf("Failed to extract peer key: %v\n", err)
@@ -241,7 +243,7 @@ func (t *Transport) handleConnection(qConn *quic.Conn) {
 		return // issue with the peer's key
 	}
 
-	conn := newConn(qConn, t)
+	conn := newConn(qConn, t, dialed)
 	conn.SetPeerKey(peerKey)
 	t.config.Handler.OnConnection(conn)
 }
