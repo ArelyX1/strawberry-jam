@@ -619,7 +619,7 @@ func (ba *BlockAnnouncer) processAnnouncement(content []byte) error {
 	} else {
 		// Process the received blocks
 		for _, b := range blocks {
-			if err := ba.Store.PutBlock(b); err != nil {
+			if err := ba.StoreImportedBlock(b); err != nil {
 				log.Printf("Warning: failed to store requested block %x: %v", h[:5], err)
 				network.LogBlockEvent(time.Now(), "imported", h, b.Header.TimeSlotIndex.ToEpoch(), b.Header.TimeSlotIndex)
 			}

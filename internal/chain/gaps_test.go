@@ -192,8 +192,148 @@ func TestBackfillAsksForBlocksUnderKnownHeaders(t *testing.T) {
 	assert.Len(t, wanted, 5, "nothing below the leaf is present, so all five are wanted")
 }
 
-// The walk stops where the blocks start, and does not go on asking for history
-// the node already has.
+// Blocks do not arrive in order. The stretch behind an announced head comes back
+// newest first, so every block of it finds its parent not yet stored.
+//
+// Each one used to leave a tip behind, and the set of tips is what the node calls
+// its chain: after a few hundred blocks a node was choosing between hundreds of
+// tips, and it called a timeslot already written because one of them named it,
+// so the author stood down and the chain stopped on a timeslot no node had a
+// block for.
+func TestOutOfOrderImportLeavesOneTip(t *testing.T) {
+	bs := newTestService(t)
+
+	genesisHash := genesisIn(t, bs)
+
+	// The chain, built in order and then handed over backwards.
+	const n = 30
+	headers := make([]block.Header, 0, n)
+	parent := genesisHash
+	for i := 1; i <= n; i++ {
+		h := testChain(parent, futureSlot(t, bs, jamtime.Timeslot(i)), 0)
+		headers = append(headers, h)
+		hash, err := h.Hash()
+		require.NoError(t, err)
+		parent = hash
+	}
+
+	for i := n - 1; i >= 0; i-- {
+		require.NoError(t, bs.StoreImportedBlock(block.Block{Header: headers[i]}))
+	}
+
+	// Newest first means every block becomes a tip before its parent turns up and
+	// can take the tip back, so the set is allowed to hold more than one. What it
+	// is not allowed to do is grow without bound, because the sync loop walks it
+	// on every pass and every block sorts it.
+	leaves := bs.Leaves()
+	require.LessOrEqual(t, len(leaves), 64,
+		"the set of tips is walked on every pass of the sync loop, so it is bounded")
+
+	// And the tip it follows is the end of the chain, not the block that happened
+	// to arrive first, which is the one the node would otherwise be stuck behind.
+	newest := jamtime.Timeslot(0)
+	for _, leaf := range leaves {
+		if leaf.Slot > newest {
+			newest = leaf.Slot
+		}
+	}
+	assert.Equal(t, futureSlot(t, bs, n), newest,
+		"and it follows the end of it, not the block that arrived first")
+}
+
+// The timeslot an author is responsible for must only count as written when the
+// block is really there. A header is not a block, and one that arrived without
+// its block used to stop the author of that timeslot from writing it, which is a
+// chain that stops with every node convinced the timeslot was dealt with.
+func TestATimeslotWithOnlyAHeaderIsNotTakenForWritten(t *testing.T) {
+	bs := newTestService(t)
+
+	genesisHash := genesisIn(t, bs)
+
+	// The header for the next timeslot is known. Its block has not arrived.
+	announced := testChain(genesisHash, futureSlot(t, bs, 1), 0)
+	announcedHash, err := announced.Hash()
+	require.NoError(t, err)
+	require.NoError(t, bs.Store.PutHeader(announced))
+	bs.AddLeaf(announcedHash, announced.TimeSlotIndex)
+
+	// It shows up as a leaf, so anything that reads the leaf set alone will call
+	// that timeslot written.
+	require.NotEmpty(t, bs.Leaves())
+
+	// And the block store, which is what has to decide, has nothing for it.
+	_, err = bs.Store.GetBlock(announcedHash)
+	require.Error(t, err, "a header on its own is not a block, and the difference is the whole point")
+}
+//
+// It used to be written into the store and nothing else, with only a header
+// arriving by announcement ever touching the leaf set. A block whose header came
+// separately, or never came, was therefore in the store and unknown to the tip:
+// the author waiting on that very block held its timeslot for ever, and the walk
+// for gaps started from the older tip and found nothing, because the chain below
+// it was whole. The mesh stops with every node healthy and nothing logged as an
+// error.
+func TestImportedBlockBecomesTheTip(t *testing.T) {
+	bs := newTestService(t)
+
+	genesisHash := genesisIn(t, bs)
+
+	// A block that arrives without its header ever having been announced.
+	imported := testChain(genesisHash, futureSlot(t, bs, 1), 0)
+	importedHash, err := imported.Hash()
+	require.NoError(t, err)
+
+	require.NoError(t, bs.StoreImportedBlock(block.Block{Header: imported}))
+
+	leaves := bs.Leaves()
+	require.Len(t, leaves, 1, "the imported block has to be the tip, not left out of it")
+	assert.Equal(t, importedHash, func() crypto.Hash {
+		h, herr := leaves[0].Header.Hash()
+		require.NoError(t, herr)
+		return h
+	}(), "the tip is the block that arrived")
+
+	// A block with a parent already there replaces it, rather than both sitting
+	// in the leaf set as two tips.
+	child := testChain(importedHash, futureSlot(t, bs, 2), 0)
+	require.NoError(t, bs.StoreImportedBlock(block.Block{Header: child}))
+
+	leaves = bs.Leaves()
+	require.Len(t, leaves, 1, "a chain of imported blocks is one tip, not one per block")
+	assert.Equal(t, futureSlot(t, bs, 2), leaves[0].Slot, "the tip is the newest of them")
+}
+
+// A chain that arrived block by block has to look whole: the tip is the block
+// that is really there, and there is nothing left to ask for.
+//
+// Registering the leaf on import is only correct if it does not then report the
+// blocks it registered as missing, and the author waiting on a parent has to be
+// released by exactly this: a block arriving is what tells it the parent it was
+// holding a timeslot for is here.
+func TestImportedChainIsWholeAndFreesTheAuthorWaitingOnIt(t *testing.T) {
+	bs := newTestService(t)
+
+	genesisHash := genesisIn(t, bs)
+
+	parent := genesisHash
+	for i := 1; i <= 4; i++ {
+		h := testChain(parent, futureSlot(t, bs, jamtime.Timeslot(i)), 0)
+		require.NoError(t, bs.StoreImportedBlock(block.Block{Header: h}))
+		hash, err := h.Hash()
+		require.NoError(t, err)
+		parent = hash
+	}
+
+	assert.Empty(t, bs.BackfillHashes(10),
+		"blocks that arrived are not gaps, so the author is not sent looking for them")
+
+	// And the tip is the last of them, which is what lets the author of the
+	// timeslot after it write.
+	leaves := bs.Leaves()
+	require.Len(t, leaves, 1)
+	assert.Equal(t, futureSlot(t, bs, 4), leaves[0].Slot,
+		"the author of the next timeslot builds on the block that arrived last")
+}
 func TestBackfillStopsAtTheFirstBlockItHas(t *testing.T) {
 	db, err := pebble.NewKVStore()
 	require.NoError(t, err)

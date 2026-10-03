@@ -100,6 +100,88 @@ func TestAuthorWaitsForTheParentTimeslotItDidNotWrite(t *testing.T) {
 		"and it no longer has to wait for it")
 }
 
+// This is the case that stopped a mesh for good, and it is not the one above.
+//
+// Above, the clock had not reached the timeslot either, so the check failed on
+// the clock and the chain looked right. Here the clock is well past: this node
+// missed its turn, it slept through it, and it woke up to find the block it had
+// to build on gone. Asking only the clock said yes, the author wrote on the one
+// block it still had, which was the one before the missing one, and every other
+// node had already moved past that. The block it wrote was not a descendant of
+// anything the mesh had, so the timeslot after it waited for a block nobody was
+// going to write and the chain stood still with every node healthy and every
+// peer connected.
+func TestAuthorDoesNotBuildOnAStaleParentWhenTheClockHasMovedOn(t *testing.T) {
+	const genesis = jamtime.Timeslot(9199500)
+	const mine = genesis + 4 // an even timeslot, this node's turn with two authors
+
+	genesisCfg, err := devnet.LoadGenesis(filepath.Join(moduleRoot(t), "genesis", "chain-dev.json"))
+	require.NoError(t, err)
+	genesisCfg.GenesisTimeslot = genesis
+
+	rt, err := devnet.New(devnet.Options{Genesis: genesisCfg})
+	require.NoError(t, err)
+
+	// The clock runs on well past this node's turn while its chain stays where it
+	// was, which is what being asleep over a timeslot looks like from in here.
+	for slot := genesis; slot <= mine+6; slot++ {
+		_, err := rt.Run(slot)
+		require.NoError(t, err, "timeslot %d", slot)
+	}
+	require.GreaterOrEqual(t, uint64(rt.Timeslot()), uint64(mine-1),
+		"the clock has to be past the parent timeslot for this to be the interesting case")
+
+	bs := chainServiceFor(t)
+	putTip(t, bs, crypto.Hash{0x01}, mine-2, 0)
+
+	bp := &blockProducer{bs: bs, runtime: rt, authorIndex: 0, authorCount: 2}
+
+	assert.False(t, bp.atTipFor(mine),
+		"a clock past the parent timeslot says nothing about having the block for it, "+
+			"and writing on the one before it forks the chain away from the mesh")
+
+	// And it holds the timeslot rather than writing something nobody can build on.
+	assert.False(t, bp.waitUntilAtTip(mine),
+		"the wait has to end while the block is still missing, so the timeslot can be held")
+
+	// The block turns up and is executed, and now the author can write.
+	putTip(t, bs, crypto.Hash{0x02}, mine-1, 1)
+	assert.True(t, bp.atTipFor(mine),
+		"with the parent block here the author is on the chain and may write")
+}
+
+// Asking for what is missing cannot sit behind the test for being ahead of the
+// clock. A node holding a timeslot is behind the clock by definition, so that
+// ordering meant the hold was the one situation in which the node would not go
+// and get the block it was holding the timeslot for.
+func TestCatchUpAsksForMissingBlocksWhileBehindTheClock(t *testing.T) {
+	const genesis = jamtime.Timeslot(9199500)
+
+	genesisCfg, err := devnet.LoadGenesis(filepath.Join(moduleRoot(t), "genesis", "chain-dev.json"))
+	require.NoError(t, err)
+	genesisCfg.GenesisTimeslot = genesis
+
+	rt, err := devnet.New(devnet.Options{Genesis: genesisCfg})
+	require.NoError(t, err)
+
+	for slot := genesis; slot <= genesis+10; slot++ {
+		_, err := rt.Run(slot)
+		require.NoError(t, err, "timeslot %d", slot)
+	}
+
+	bs := chainServiceFor(t)
+	putTip(t, bs, crypto.Hash{0x01}, genesis, 0)
+
+	// No network: there is nobody to ask, and reaching this has to be harmless
+	// rather than a nil dereference, because it now runs on every pass.
+	bp := &blockProducer{bs: bs, runtime: rt, authorIndex: 0, authorCount: 2}
+
+	assert.NotPanics(t, func() {
+		assert.False(t, bp.catchUpBehind(),
+			"a node behind the clock with no network has nothing to catch up on")
+	}, "reaching for the missing blocks must not depend on having peers")
+}
+
 // The genesis has no timeslot before it, and a block that arrived from a peer
 // before this node got its turn is already the tip. Demanding a parent timeslot in
 // either case asks for something that cannot exist and the chain never starts.

@@ -3,6 +3,7 @@ package chain
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -246,6 +247,62 @@ func (bs *BlockService) checkFinalization(hash crypto.Hash) error {
 //
 // This implements the core block processing logic required by UP 0 protocol,
 // maintaining the node's view of chain tips and finalization status.
+// StoreImportedBlock stores a block that arrived over the network and keeps the
+// leaf set in step with it.
+//
+// A block used to be written straight into the store and nothing else. The leaf
+// set, though, is what the node's tip is read from, and only a header arriving
+// over the announcement was ever added to it. So a block whose header arrived
+// separately, or whose header was never announced at all, sat in the store with
+// the node none the wiser: the tip stayed where it was, the author waiting on
+// that exact block concluded it had not arrived and held its timeslot, and the
+// walk for gaps started from the old tip and found nothing missing because the
+// chain below it was whole.
+//
+// That is a mesh that stops with every node healthy, every peer connected and
+// nothing logged as an error, and it lasts until somebody restarts. Storing the
+// block and forgetting to say so is what let it happen.
+func (bs *BlockService) StoreImportedBlock(b block.Block) error {
+	hash, err := b.Header.Hash()
+	if err != nil {
+		return fmt.Errorf("hash imported block: %w", err)
+	}
+	if err := bs.Store.PutBlock(b); err != nil {
+		return err
+	}
+	// The same two steps HandleNewHeader takes, so that a block which arrives
+	// without its header still leaves exactly one tip behind it.
+	//
+	// The parent is removed whether or not its header is here. Checking first
+	// looks tidier and is wrong: blocks do not arrive in order, so a stretch of
+	// chain coming in newest first finds the parent's header missing every time,
+	// skips the removal, and leaves a tip behind on every block of the stretch.
+	// Fifty blocks later the node is choosing between fifty tips and calling a
+	// timeslot written because one of them names it.
+	bs.RemoveLeaf(b.Header.ParentHash)
+
+	// And then on up the chain, for as long as the tips are consecutive. Removing
+	// only the block that arrived leaves a tip behind on every block whose child
+	// came before it, which is the same pile up one step at a time, and the set of
+	// tips is walked on every pass of the sync loop and sorted on every block.
+	// The walk stops at the first hash that is not a tip, because past that point
+	// the chain belongs to somebody else's history.
+	cur := b.Header.ParentHash
+	for step := 0; step < leafCollapseSteps; step++ {
+		if !bs.RemoveLeafIfPresent(cur) {
+			break
+		}
+		header, err := bs.Store.GetHeader(cur)
+		if err != nil {
+			break
+		}
+		cur = header.ParentHash
+	}
+
+	bs.AddLeaf(hash, b.Header.TimeSlotIndex)
+	return nil
+}
+
 func (bs *BlockService) HandleNewHeader(header *block.Header) error {
 	// Get the header hash
 	hash, err := header.Hash()
@@ -312,6 +369,38 @@ func (bs *BlockService) AddLeaf(hash crypto.Hash, slot jamtime.Timeslot) {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	bs.KnownLeaves[hash] = slot
+	bs.pruneLocked()
+}
+
+// leafCap is how many tips the node is willing to keep.
+//
+// Blocks come back from a peer newest first, so the walk that removes a
+// superseded tip finds nothing to remove: the child arrived before the parent and
+// became a tip first, and the parent arriving afterwards cannot know it has a
+// child. One tip is left behind per block of every stretch imported out of order,
+// and the set is walked on every pass of the sync loop and sorted on every
+// block, so it has to be bounded rather than merely correct at the end.
+//
+// What is kept is the newest, because that is the tip the node follows, and the
+// old ones are of no use to it: a timeslot is only ever asked for by the tip it
+// sits under, and asking about one that is this far back is asking for history.
+const leafCap = 64
+
+// pruneLocked drops the oldest tips until the set is back within its bound.
+func (bs *BlockService) pruneLocked() {
+	if len(bs.KnownLeaves) <= leafCap {
+		return
+	}
+	ordered := make([]crypto.Hash, 0, len(bs.KnownLeaves))
+	for hash := range bs.KnownLeaves {
+		ordered = append(ordered, hash)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		return bs.KnownLeaves[ordered[i]] < bs.KnownLeaves[ordered[j]]
+	})
+	for _, hash := range ordered[:len(bs.KnownLeaves)-leafCap] {
+		delete(bs.KnownLeaves, hash)
+	}
 }
 
 // GetLatestFinalized safely returns the latest finalized block info.
@@ -326,6 +415,21 @@ func (bs *BlockService) RemoveLeaf(hash crypto.Hash) {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	delete(bs.KnownLeaves, hash)
+}
+
+// RemoveLeafIfPresent removes a tip and reports whether it was one.
+//
+// Reporting it is what lets a chain arriving out of order be collapsed onto its
+// own end: the walk up from a new block stops at the first hash that is not a
+// tip, and that hash is the boundary it has no business crossing.
+func (bs *BlockService) RemoveLeafIfPresent(hash crypto.Hash) bool {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if _, ok := bs.KnownLeaves[hash]; !ok {
+		return false
+	}
+	delete(bs.KnownLeaves, hash)
+	return true
 }
 
 // HasLeaf checks if a block hash exists in the set of known leaves.
@@ -370,3 +474,9 @@ func (bs *BlockService) IsDescendantOfFinalized(header *block.Header) (bool, err
 	}
 	return false, nil
 }
+
+// leafCollapseSteps bounds the walk up the chain that removes superseded tips.
+// The tips of a chain that is being followed are consecutive, so the walk is a
+// handful of steps long; the bound is there so that a cycle or a badly formed
+// parent link costs a number instead of a hang.
+const leafCollapseSteps = 64

@@ -115,7 +115,7 @@ func fetchMissing(
 		// was missing.
 		stored := 0
 		for i := len(blocks) - 1; i >= 0; i-- {
-			if err := bs.Store.PutBlock(blocks[i]); err != nil {
+			if err := bs.StoreImportedBlock(blocks[i]); err != nil {
 				return stored, err
 			}
 			stored++

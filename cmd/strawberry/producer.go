@@ -350,6 +350,26 @@ func (bp *blockProducer) atTipFor(slot jamtime.Timeslot) bool {
 		// peer before we got here.
 		return true
 	}
+	// The clock answers half of this question and no more. Reaching the
+	// timeslot before this node's own says nothing about whether the block it
+	// has to build on ever arrived: a node that lost that block is looking at
+	// exactly the same clock as one that has it, and both said yes.
+	//
+	// Asking only the clock is what let an author write its timeslot on whatever
+	// block it happened to be holding, which is the one before the missing one,
+	// so the block it wrote named a parent the rest of the mesh had already
+	// moved past. Two nodes then hold blocks for the same stretch of chain on
+	// different parents, neither is a descendant of the other, and the timeslot
+	// after that waits for a block that neither of them ever writes. The chain
+	// stops with every node healthy and every peer connected.
+	//
+	// So the chain has to have got there as well. The tip is the furthest block
+	// this node knows about, and the block a timeslot has to build on is the one
+	// just before it, so a tip that is still further back than that is a node
+	// that has not got it however long it waits.
+	if tip.TimeSlotIndex < slot-1 {
+		return false
+	}
 	return bp.runtime.Timeslot() >= slot-1
 }
 
@@ -385,7 +405,23 @@ func (bp *blockProducer) waitUntilAtTip(slot jamtime.Timeslot) bool {
 // nothing at all.
 func (bp *blockProducer) timeslotHasABlock(slot jamtime.Timeslot) bool {
 	for _, leaf := range bp.bs.Leaves() {
-		if leaf.Slot == slot {
+		if leaf.Slot != slot {
+			continue
+		}
+		// A header is not a block, and a leaf whose block never arrived is a
+		// timeslot that looks written and is not.
+		//
+		// This used to answer from the leaf alone. Leaves are added for every
+		// header that arrives, so a timeslot whose header was announced before
+		// its block was ever delivered counted as written, and the author of
+		// that timeslot stood down. Nobody else writes it either, since there is
+		// one author per timeslot, so the chain stopped on a timeslot that no
+		// node had a block for and every node believed was dealt with.
+		hash, err := leaf.Header.Hash()
+		if err != nil {
+			continue
+		}
+		if _, err := bp.bs.Store.GetBlock(hash); err == nil {
 			return true
 		}
 	}
@@ -406,15 +442,26 @@ func (bp *blockProducer) catchUpBehind() bool {
 	if !ok {
 		return false
 	}
+	// Asking for what is missing comes before the question of whether there is
+	// anything to run, and not after it.
+	//
+	// This used to sit below the test that follows, which is to say it only ran
+	// when the node was ahead of the clock. A node holding a timeslot is behind
+	// the clock by definition: the block it is waiting for is the one the clock
+	// has already gone past. So the hold was precisely the case in which the
+	// node would not go and fetch the block it was holding the timeslot for,
+	// and the gap it already knew the hash of sat there until something else
+	// moved.
+	bp.recoverMissingBlocks()
 	if header.TimeSlotIndex <= bp.runtime.Timeslot() {
 		return false
 	}
 	// A block that never arrived cannot be executed, and waiting for it to arrive
 	// on its own is waiting for nothing: announcements carry the head and the
 	// stretch behind it, so a block missed early stops being inside the window long
-	// before the node asks. The gap is named in the store, so it is asked for by
-	// name, from whatever peer answers, before concluding there is nothing to run.
-	bp.recoverMissingBlocks()
+	// before the node asks. The gap is named in the store, so it was asked for by
+	// name above, from whatever peer answers, before concluding there is nothing to
+	// run.
 	// Only the part that is actually there, and only up to the tip.
 	if ok, _ := bp.executeUpTo(header.TimeSlotIndex); !ok {
 		return false
@@ -442,7 +489,19 @@ func (bp *blockProducer) recoverMissingBlocks() int {
 	if len(hashes) == 0 {
 		return 0
 	}
-	peers := bp.net.GetAllPeers()
+	// Nowhere to ask. This is now reached on every pass rather than only when the
+	// node is ahead of the clock, so a producer that has no network yet has to
+	// answer for itself instead of dereferencing nothing.
+	if bp.net == nil || bp.ctx == nil {
+		return 0
+	}
+	var peers []*peer.Peer
+	for _, p := range bp.net.GetAllPeers() {
+		if p == nil || p.ProtoConn == nil || p.ProtoConn.TConn == nil {
+			continue
+		}
+		peers = append(peers, p)
+	}
 	if len(peers) == 0 {
 		return 0
 	}
@@ -457,7 +516,7 @@ func (bp *blockProducer) recoverMissingBlocks() int {
 				continue
 			}
 			for _, b := range blocks {
-				if err := bp.bs.Store.PutBlock(b); err != nil {
+				if err := bp.bs.StoreImportedBlock(b); err != nil {
 					continue
 				}
 				gotten++
