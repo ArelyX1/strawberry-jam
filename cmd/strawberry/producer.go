@@ -188,7 +188,7 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 	}
 
 	slot := tipSlot + 1
-	if current := jamtime.Now().ToTimeslot(); slot < current {
+	if current := jamtime.Now().ToTimeslot(); slot < current && canCarryOnFromThePresent(tipSlot, current) {
 		// The node was asleep, or is joining a chain that has moved on. It does not
 		// write the timeslots that passed.
 		//
@@ -211,6 +211,30 @@ func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorI
 	go bp.run(slot)
 
 	return bp
+}
+
+// canCarryOnFromThePresent reports whether the timeslots between the chain's tip
+// and the current one are all written already, which is what makes skipping them
+// safe.
+//
+// Skipping assumes someone else wrote them. Every timeslot has one author, and on a
+// mesh that author is another node, so a node joining a chain that has moved on can
+// start at the present and never write a timeslot twice.
+//
+// A mesh that is starting has no such assumption to lean on. The chain is at the
+// genesis and the clock is already past it, so the timeslots between them have no
+// block and no author has written one. Skipping them leaves every node waiting for a
+// parent that the other was supposed to write and never will: the author of the
+// present holds its timeslot for a block from before the present, and the author
+// before it was skipped by the same rule. Nothing is ever written again and the
+// chain is still from the genesis, with both nodes holding a timeslot and neither
+// writing it.
+//
+// So the chain has to reach the present before the loop may start at the present.
+// Until it does, the missing timeslots are written, by whoever is their author,
+// which is what a mesh coming up is for.
+func canCarryOnFromThePresent(tip, current jamtime.Timeslot) bool {
+	return current <= tip+1
 }
 
 // run produces a block in the timeslots this validator authors, and executes the
@@ -253,7 +277,7 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 			//
 			// Not writing at all is still better than writing on the wrong
 			// parent, which is a fork rather than a pause.
-			if !bp.waitUntilAtTip() {
+			if !bp.waitUntilAtTip(slot) {
 				// Hold the timeslot and try again, but slowly and quietly. Retrying
 				// straight away with a line each time wrote hundreds of megabytes
 				// of log in a couple of minutes and filled the disk: the wait
@@ -265,6 +289,18 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 					log.Internal.Warn().Uint64("slot", uint64(slot)).
 						Msg("waiting for the block this timeslot has to build on; holding the timeslot")
 				}
+				// Telling the peers where this node's chain is, again, is what the
+				// hold is waiting for. The block this node is missing is on its way
+				// from a peer, and a peer sends it because it was told about a chain
+				// it does not have. A node that announced only when it wrote said
+				// nothing for as long as it held, which is exactly when its peers
+				// were waiting on it: the block they were missing was the one this
+				// node wrote just as they arrived, and the announcement of it went
+				// out into an empty peer list.
+				//
+				// So two nodes sat holding a timeslot each, both waiting for a block
+				// the other had, and neither of them telling the other so.
+				bp.announceTipToNewPeers()
 				time.Sleep(authorRetryWait)
 				continue
 			}
@@ -277,20 +313,60 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 	}
 }
 
-// waitUntilAtTip waits for this node's state to be at the chain it knows, and
-// reports whether it got there.
+// atTipFor reports whether this node has executed the block that the block for
+// this timeslot has to build on, which is the block of the timeslot before it.
 //
-// "The block of the timeslot before this one" is the wrong thing to wait for, and
-// waiting for it is how the chain failed to start. A block names as its parent the
-// last block of the chain, whichever timeslot that was, so what an author has to be
-// level with before it writes is the tip, not the timeslot immediately behind it.
-// The genesis is where a fresh chain begins and no block names the timeslot before
-// it, so demanding one is demanding something that cannot exist.
-func (bp *blockProducer) waitUntilAtTip() bool {
+// The comparison this used to make was between this node's own state and the best
+// block it knew of, and that could not fail. A node's own newest block is by
+// definition a block it knows and has executed, so the two were always equal and
+// every author thought it was level with the chain before writing.
+//
+// An author is one timeslot behind by the time its turn comes, which is the whole
+// shape of the schedule: the previous timeslot's block is written by another
+// validator while that timeslot runs. So the author has to wait for that one block,
+// and asking "am I at the tip I know of" never notices its absence. Two nodes then
+// take turns writing on top of their own last block, each skipping the other's
+// timeslots, and neither one ever builds on the other.
+//
+// The other half of the damage is only visible much later. The node that skipped
+// ahead is now many timeslots in front, and its neighbour, which waited honestly,
+// needs blocks that are already outside the window an announcement carries. There is
+// nothing left for it to ask for by name, because it never learned the hashes. The
+// two are then a hundred blocks apart with no way back, and the chain is still for
+// ever.
+//
+// Demanding the parent timeslot keeps the two within one block of each other, which
+// is the distance the announcement window covers.
+func (bp *blockProducer) atTipFor(slot jamtime.Timeslot) bool {
+	tip, _, ok := bp.bestKnownTip()
+	if !ok {
+		// Nothing has been produced yet. Whoever's turn it is writes the first
+		// block, and there is no parent timeslot to have executed.
+		return true
+	}
+	if tip.TimeSlotIndex >= slot {
+		// This timeslot's block is already the tip, so there is nothing to wait
+		// for. This is the genesis on the way up, and a block that arrived from a
+		// peer before we got here.
+		return true
+	}
+	return bp.runtime.Timeslot() >= slot-1
+}
+
+// waitUntilAtTip waits until this node has executed the block that the block for
+// this timeslot builds on, and reports whether it got there.
+//
+// A block names as its parent the last block of the chain rather than the block of
+// the timeslot immediately before, which is why this waits for state and not for a
+// block by hash. What state has to be at is what the parent will be: the tip, once
+// the tip is the timeslot before this one.
+func (bp *blockProducer) waitUntilAtTip(slot jamtime.Timeslot) bool {
+	if bp.atTipFor(slot) {
+		return true
+	}
 	deadline := jamtime.Now().ToTime().Add(authorRetryWait * 4)
 	for {
-		header, _, ok := bp.bestKnownTip()
-		if !ok || bp.runtime.Timeslot() >= header.TimeSlotIndex {
+		if bp.atTipFor(slot) {
 			return true
 		}
 		if !time.Now().Before(deadline) {
@@ -879,6 +955,9 @@ func (bp *blockProducer) lastSlot() jamtime.Timeslot {
 // where the chain is, so a node that has been away or that just started finds
 // out what it missed instead of waiting for the other side to produce.
 func (bp *blockProducer) announceTipToNewPeers() {
+	if bp.net == nil {
+		return
+	}
 	header, hash, ok := bp.bestKnownTip()
 	if !ok {
 		return
