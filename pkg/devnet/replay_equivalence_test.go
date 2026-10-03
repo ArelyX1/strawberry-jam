@@ -443,3 +443,64 @@ func newRuntimeWithBridge(t *testing.T) *Runtime {
 	require.NoError(t, err)
 	return rt
 }
+
+// The same payout, but the second node is not rewound: it has been following the
+// chain and is asked for one more timeslot, which is what executing a peer's
+// blocks on top of where this node already is actually is.
+//
+// This is the ordinary way a node takes on work it did not produce, and it is the
+// one that does not go back to the start of the chain first, so whatever the node
+// had queued of its own is still queued when the block's work arrives. The node
+// was handed the same payout twice over: once by the caller that asked it for one,
+// and once by the block that already settled one. Two copies of a payout that is
+// once per address is one too many, and the state it settles is not the state the
+// block names.
+//
+// The chain stops on it in the way this always stops: the timeslot after it waits
+// for a block nobody writes, because the node that would write it cannot get its
+// state to agree with the blocks, and the node that agrees with the blocks is not
+// its author.
+func TestExecutingOnTopWithoutARewindDropsNothingAndDoublesNothing(t *testing.T) {
+	const slots = 6
+	start := jamtime.Timeslot(9166000)
+
+	author := newRuntimeWithBridge(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	steps := make([]step, 0, slots)
+
+	if _, err := author.Faucet(addressOf(t, 5)); err != nil {
+		t.Fatalf("queue the payout: %v", err)
+	}
+	for i := 0; i < slots; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err, "the author must be able to run timeslot %d", i)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	// The other node was asked for the same payout, and queued it in its own
+	// queue. It is now handed the chain that already settled one.
+	other := newRuntimeWithBridge(t)
+	if _, err := other.Faucet(addressOf(t, 5)); err != nil {
+		t.Fatalf("queue the payout on the other node: %v", err)
+	}
+	// And it follows the chain up to the timeslot before the last, which is where
+	// a node following the chain would be. No rewind: this is not a restart, it is
+	// a node that has been running and has been given one more timeslot.
+	for i := 0; i < slots-1; i++ {
+		slot := start + jamtime.Timeslot(i)
+		require.NoError(t, other.Rebuild(steps[i].work), "rebuild timeslot %d", slot)
+		require.NoError(t, other.Step(slot), "step timeslot %d", slot)
+		require.Equal(t, steps[i].root, other.Root(), "timeslot %d", slot)
+	}
+
+	// Now the timeslot that settles the payout, executed on top of where it is.
+	last := start + jamtime.Timeslot(slots-1)
+	require.NoError(t, other.Rebuild(steps[slots-1].work), "rebuild timeslot %d", last)
+	require.NoError(t, other.Step(last), "step timeslot %d", last)
+	assert.Equal(t, steps[slots-1].root, other.Root(),
+		"timeslot %d: the node settled the payout from the block on top of the copy it had queued itself",
+		last)
+}

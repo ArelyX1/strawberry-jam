@@ -295,25 +295,28 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 					// while holding a block it already has. Those are different
 					// faults with different fixes, and reading the wrong one off
 					// this line costs the whole diagnosis.
-					tip, _, hasTip := bp.bestKnownTip()
+tip, _, hasTip := bp.bestKnownTip()
+					tipSlot := jamtime.Timeslot(0)
+					if hasTip {
+						tipSlot = tip.TimeSlotIndex
+					}
+					ev := log.Internal.Warn().Uint64("slot", uint64(slot)).
+						Uint64("tipSlot", uint64(tipSlot)).
+						Uint64("stateSlot", uint64(bp.runtime.Timeslot())).
+						Bool("hasTip", hasTip)
 					switch {
-					case !hasTip || tip.TimeSlotIndex < slot-1:
-						log.Internal.Warn().Uint64("slot", uint64(slot)).
-							Msg("waiting for the block this timeslot has to build on; holding the timeslot")
+					case !hasTip || tipSlot < slot-1:
+						ev.Msg("waiting for the block this timeslot has to build on; holding the timeslot")
 					case bp.runtime.Timeslot() < slot-1:
 						// The block is here. What is behind is the state built from
 						// it, which is the other half of being at the tip and the
 						// half that goes wrong on its own: a node can hold the whole
 						// chain and still refuse to build on it, because replaying
 						// it did not arrive at the root the blocks were built on.
-						log.Internal.Warn().Uint64("slot", uint64(slot)).
-							Uint64("tipSlot", uint64(tip.TimeSlotIndex)).
-							Uint64("stateSlot", uint64(bp.runtime.Timeslot())).
-							Msg("holding the block this timeslot builds on, but the state has not reached it; " +
-									"the chain is not short of blocks here, it is short of a replay that agrees with them")
+						ev.Msg("holding the block this timeslot builds on, but the state has not reached it; " +
+							"the chain is not short of blocks here, it is short of a replay that agrees with them")
 					default:
-						log.Internal.Warn().Uint64("slot", uint64(slot)).
-							Msg("waiting for the block this timeslot has to build on; holding the timeslot")
+						ev.Msg("at the tip on both counts and still not writing; holding the timeslot")
 					}
 				}
 				// Telling the peers where this node's chain is, again, is what the
@@ -334,7 +337,27 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 			aviso = true
 			bp.produceBlock(slot)
 		default:
-			bp.runForeignSlot(slot)
+			// Not this node's timeslot, so it has to wait for the block the author
+			// of that timeslot writes. And if the chain is not there yet, this loop
+			// stays where it is.
+			//
+			// Walking forward anyway is what stopped the chain, and it is not a
+			// pause that heals. The timeslot on this loop only moves forward, and
+			// the only thing that lets this node write is the chain already being at
+			// the timeslot before the one it is on, so the timeslot it walks onto
+			// while the chain is behind it is a timeslot it can never write. Every
+			// author reaches that at once when the chain slips, because the slip is
+			// in the chain and not in any one node, and from then on every node is
+			// waiting for a block only another waiting node could have written.
+			if !bp.runForeignSlot(slot) {
+				// Saying where this node's chain is, again, is what the wait is
+				// for: the block is on its way from a peer, and a peer sends it
+				// because it was told about a chain it does not have. A node that
+				// announced only when it wrote said nothing for as long as it
+				// waited, which is exactly when its peers were waiting on it.
+				bp.announceTipToNewPeers()
+				continue
+			}
 		}
 		slot++
 	}
@@ -610,8 +633,25 @@ func authorFor(slot jamtime.Timeslot, validatorIndex, authorCount uint16) bool {
 }
 
 // runForeignSlot executes the block another validator wrote for this timeslot.
-func (bp *blockProducer) runForeignSlot(slot jamtime.Timeslot) {
-	bp.catchUpTo(slot, "the block this timeslot's author wrote")
+// It reports whether the chain got there. The answer is what the loop that calls
+// it runs on, and throwing it away is what stopped the chain.
+//
+// Advancing past a timeslot the chain has not reached is not something a node can
+// undo. The timeslot this loop is on only ever moves forward, and the one thing
+// that decides whether this node writes is whether the chain is already at the
+// timeslot before the one it is on. So a node that walked its timeslot forward
+// past a stretch the chain had not caught up to reached a timeslot it could never
+// write: its chain was behind it and getting further behind, every author was
+// waiting for a block that only the node ahead of it could write, and all of them
+// were waiting. Nothing recovers from that, because the thing that would recover
+// it is the one thing that cannot go back.
+//
+// Any work in the chain is enough to cause it. A timeslot that settles work takes
+// the author longer than a timeslot that settles none, so the chain falls a slot
+// or two behind, and the node whose timeslot it is walks forward into the gap it
+// just made and stands still there for good.
+func (bp *blockProducer) runForeignSlot(slot jamtime.Timeslot) bool {
+	return bp.catchUpTo(slot, "the block this timeslot's author wrote")
 }
 
 // executeUpTo runs as much of the chain as this node can actually walk, up to and
