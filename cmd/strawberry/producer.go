@@ -286,8 +286,35 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 				// from a peer and takes milliseconds, not microseconds.
 				if aviso {
 					aviso = false
-					log.Internal.Warn().Uint64("slot", uint64(slot)).
-						Msg("waiting for the block this timeslot has to build on; holding the timeslot")
+					// Which of the two things this node is short of decides what
+					// has to happen next, and the log has to say which.
+					//
+					// It said neither. It said it was waiting for the block this
+					// timeslot builds on, which is what a node short of a block
+					// says, and a node whose state will not replay says it too
+					// while holding a block it already has. Those are different
+					// faults with different fixes, and reading the wrong one off
+					// this line costs the whole diagnosis.
+					tip, _, hasTip := bp.bestKnownTip()
+					switch {
+					case !hasTip || tip.TimeSlotIndex < slot-1:
+						log.Internal.Warn().Uint64("slot", uint64(slot)).
+							Msg("waiting for the block this timeslot has to build on; holding the timeslot")
+					case bp.runtime.Timeslot() < slot-1:
+						// The block is here. What is behind is the state built from
+						// it, which is the other half of being at the tip and the
+						// half that goes wrong on its own: a node can hold the whole
+						// chain and still refuse to build on it, because replaying
+						// it did not arrive at the root the blocks were built on.
+						log.Internal.Warn().Uint64("slot", uint64(slot)).
+							Uint64("tipSlot", uint64(tip.TimeSlotIndex)).
+							Uint64("stateSlot", uint64(bp.runtime.Timeslot())).
+							Msg("holding the block this timeslot builds on, but the state has not reached it; " +
+									"the chain is not short of blocks here, it is short of a replay that agrees with them")
+					default:
+						log.Internal.Warn().Uint64("slot", uint64(slot)).
+							Msg("waiting for the block this timeslot has to build on; holding the timeslot")
+					}
 				}
 				// Telling the peers where this node's chain is, again, is what the
 				// hold is waiting for. The block this node is missing is on its way
