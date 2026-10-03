@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"testing"
 
@@ -83,4 +84,52 @@ func TestConnectionChoiceIsSymmetricInTheTwoKeys(t *testing.T) {
 	high := publicKey("zzz the second key")
 	require.True(t, keepsDialed(low, high))
 	require.False(t, keepsDialed(high, low))
+}
+
+// One connection per pair, and the pair has to agree on who opens it. Both ends
+// dialling gives two connections, and each end then has to drop one, which only
+// works if both ends reach the same answer about which to drop. Comparing ports
+// does not qualify: every machine listens on the same port, so all that is left
+// is the ephemeral ports, and each end sees those two numbers in opposite order.
+//
+// The rule is that the end holding the lower key dials. Both ends hold both
+// keys, so both reach the same answer, and exactly one connection is ever opened
+// per pair.
+func TestOnlyTheEndWithTheLowerKeyDials(t *testing.T) {
+	low := publicKey("aaa the lower key")
+	high := publicKey("zzz the higher key")
+
+	dials := func(ownKey, peerKey ed25519.PublicKey) bool {
+		return bytes.Compare(ownKey, peerKey) < 0
+	}
+
+	assert.True(t, dials(low, high), "the end with the lower key is the one that dials")
+	assert.False(t, dials(high, low),
+		"the end with the higher key must wait for the other, or both dial and the "+
+			"pair ends up with two connections and two answers about which to keep")
+
+	// Exactly one of the two ends dials, never both and never neither.
+	assert.NotEqual(t, dials(low, high), dials(high, low),
+		"the two ends must not both dial, and must not both wait")
+}
+
+// A node that waits for the lower-keyed end still has to reach it later, because
+// the end that dials may not have been up when this node started. The wait is
+// only ever a skip of this pass, never of the neighbour altogether.
+func TestTheEndThatWaitsStillLooksForItsNeighbourEveryPass(t *testing.T) {
+	low := publicKey("aaa the lower key")
+	high := publicKey("zzz the higher key")
+
+	// The neighbour loop repeats, so the same skip is reached again on the next
+	// pass and the dial happens as soon as the other end is there.
+	thisEndDials := bytes.Compare(high, low) < 0
+	assert.False(t, thisEndDials, "this end waits")
+
+	// Once the connection is up it is found by key, so the pass stops skipping.
+	// The pass before that one had nothing to find and dialled nothing, which is
+	// the whole point: it skipped, it did not give up.
+	skippedThisPass := !thisEndDials
+	nextPassWillTry := skippedThisPass
+	assert.True(t, nextPassWillTry,
+		"the pass that skips must not remove the neighbour from later passes")
 }

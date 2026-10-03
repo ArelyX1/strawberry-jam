@@ -327,18 +327,21 @@ func (n *Node) OnConnection(conn *transport.Conn) {
 }
 
 // ConnectToPeer initiates a connection to a peer at the specified address.
-// It prevents duplicate connections to the same peer.
+//
+// Whether this node is already connected to that peer is decided by the caller,
+// which has the peer's key from the neighbour it is dialling and so can ask by
+// the one thing that is the same however the connection was opened.
+//
+// It used to be decided here, by address, and that never matched. The address
+// dialled is the one in the neighbour's metadata, its listening port, while a
+// connection that the peer opened arrives carrying that peer's ephemeral port
+// for the connection, which is a different number every time. A peer that had
+// dialled this node was therefore never found under the address being dialled,
+// so the guard never fired and every pass dialled a peer it was already talking
+// to. The duplicate rule then dropped one of the two connections and the
+// announcement stream on it went with it, which is what left one node announcing
+// and the other unable to open a stream at all.
 func (n *Node) ConnectToPeer(addr *net.UDPAddr) error {
-	// Check if peer already exists before attempting connection.
-	n.peersLock.RLock()
-	existingPeer := n.PeersSet.GetByAddress(addr.String())
-	n.peersLock.RUnlock()
-
-	if existingPeer != nil {
-		return fmt.Errorf("peer already exists")
-	}
-
-	// Establish connection
 	if err := n.transport.Connect(addr); err != nil {
 		return fmt.Errorf("failed to connect to peer: %w", err)
 	}
@@ -396,6 +399,21 @@ func (n *Node) ConnectToNeighbours() error {
 		// One connection per pair, opened by the end with the lower key, has no
 		// choice to get wrong. The end that does not dial keeps its connection
 		// through the same check it already does, by validator key.
+		//
+		// The rule has to actually be applied, not only described. Both ends
+		// dialling produces two connections per pair, and the pair then has to
+		// agree on which of the two to keep, which it can only do by comparing
+		// something both ends see the same way. The ports were tried and do not
+		// qualify: every machine listens on the same port, so all that is left
+		// to compare are the ephemeral ports, and each end sees those two numbers
+		// in opposite order.
+		if bytes.Compare(n.ValidatorManager.Keys.EdPub, neighbor.Ed25519) >= 0 {
+			// The other end has the lower key, so it is the one that dials, and
+			// this node waits for it. Its neighbour loop repeats, so a peer that
+			// was down when this node started is still reached later.
+			continue
+		}
+
 		n.peersLock.RLock()
 		have := n.PeersSet.GetByEd25519Key(neighbor.Ed25519)
 		n.peersLock.RUnlock()
