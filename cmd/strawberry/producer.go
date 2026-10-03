@@ -1019,7 +1019,32 @@ func (bp *blockProducer) followCanonical() (bool, error) {
 	if tipHash == bp.parentHash {
 		return false, nil
 	}
-	if tip.TimeSlotIndex <= bp.lastSlot() {
+
+	// Only a tip that is behind where this node is gives it nothing to do. A tip
+	// at the same slot is not behind, it is a rival block for the same timeslot,
+	// and this is where the mesh used to come apart.
+	//
+	// Two nodes can both decide a timeslot is unwritten and both write it. Each
+	// one is behaving correctly and each has no way to know about the other: the
+	// block that settles the race is the one a peer happens to deliver first. That
+	// is not supposed to matter, because bestKnownTip breaks the tie between two
+	// blocks for one timeslot the same way on every node — lower hash wins — so
+	// every node in the mesh agrees on which of the two is the chain.
+	//
+	// Agreeing on which one is the chain is not the same as being on it. This
+	// refused to move unless the other tip was strictly further ahead, so a node
+	// whose own block lost the tie sat on the branch that had just lost, wrote the
+	// next timeslot on top of it, and lost the next tie as well, because its peers
+	// were now a slot ahead and no longer tied with it. Four nodes, four blocks for
+	// the timeslot, four chains, each one slot behind the last, and none of them
+	// willing to step onto a chain of the same height because the rule only spoke
+	// about chains that were further ahead.
+	//
+	// It does not need to know how many peers there are. Every node works out the
+	// same answer from the same blocks, so however many devices the mesh runs on,
+	// the ones holding the losing block step onto the winning one and the mesh is
+	// one chain again.
+	if tip.TimeSlotIndex < bp.lastSlot() {
 		return false, nil
 	}
 

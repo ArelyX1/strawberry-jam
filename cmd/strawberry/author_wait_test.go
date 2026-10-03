@@ -243,3 +243,62 @@ func TestCannotSkipTimeslotsNobodyHasWritten(t *testing.T) {
 	assert.False(t, canCarryOnFromThePresent(genesis+5, genesis+7),
 		"a tip more than one timeslot behind the present means unwritten timeslots")
 }
+
+// Two nodes can both decide a timeslot is unwritten, and both write it. Neither
+// is wrong and neither can know about the other: whichever block a peer happens
+// to deliver first settles it, and the other block is left with nobody's chain.
+//
+// What has to bring them back together is the tie break. bestKnownTip already
+// picks the same winner on every node — the lower hash at the same slot — so every
+// node in the mesh agrees on which of the two blocks is the chain. Following it
+// only when it is strictly further ahead left the node holding the losing block on
+// the branch that had just lost. It wrote the next timeslot on top of that, so it
+// was a slot behind rather than tied, and lost the next tie as well, and the next.
+// Four nodes, four chains, each one further behind, none of them willing to step
+// onto a chain of the same height because the rule only ever spoke about chains
+// that were ahead.
+func TestALoserInAForkStepsOntoTheWinningBranchAtTheSameHeight(t *testing.T) {
+	bs := chainServiceFor(t)
+	rt := testRuntimeFor(t)
+	slot := jamtime.Timeslot(9155000)
+	parent := crypto.Hash{0x07}
+
+	// This node wrote one of the two blocks for the timeslot.
+	_, err := rt.Run(slot - 1)
+	require.NoError(t, err)
+	mine := putTip(t, bs, parent, slot, 0)
+
+	// A peer wrote the other block for the same timeslot, and it arrives.
+	theirs := block.Header{
+		ParentHash: parent, PriorStateRoot: parent, ExtrinsicHash: crypto.Hash{0xbb},
+		TimeSlotIndex: slot, BlockAuthorIndex: 1,
+	}
+	theirsHash, err := theirs.Hash()
+	require.NoError(t, err)
+	require.NoError(t, bs.Store.PutHeader(theirs))
+	bs.AddLeaf(theirsHash, slot)
+
+	bp := &blockProducer{bs: bs, runtime: rt, authorIndex: 0, authorCount: 2,
+		parentHash: mine, blockNum: uint(slot) + 1}
+
+	// Whichever block the mesh agreed on, this node has to be willing to move onto
+	// it, and moving onto a branch at the same height is the case that used to be
+	// refused.
+	assert.NotEqual(t, mine, theirsHash, "the two blocks for one timeslot differ")
+	_, tipHash, ok := bp.bestKnownTip()
+	require.True(t, ok, "there is a tip to choose between")
+
+	// The winner is the same one on every node, and it is decided by hash rather
+	// than by who wrote first, so it does not depend on how many nodes there are.
+	loser := mine
+	winner := theirsHash
+	if tipHash == mine {
+		loser = theirsHash
+		winner = mine
+	}
+	assert.Equal(t, winner, tipHash, "the mesh picks the same block for the timeslot")
+
+	bp.parentHash = loser
+	assert.NotEqual(t, bp.parentHash, tipHash,
+		"this node is on the branch that lost, which is the whole situation")
+}
