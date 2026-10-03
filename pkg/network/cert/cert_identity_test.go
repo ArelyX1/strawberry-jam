@@ -99,3 +99,64 @@ func TestCertificateStillNamesTheHolder(t *testing.T) {
 // generateForTest is an alias kept so the tests above read the same way as the
 // ones already in this package.
 func generateForTest(t *testing.T) (*Generator, ed25519.PublicKey) { return newGenerator(t) }
+
+// Two nodes decide for themselves when their certificate starts being usable,
+// and each reads its own clock to make that decision about the other's. A node
+// whose clock is behind therefore judges a just-issued certificate as starting
+// in the future and refuses it, while the node ahead sees nothing wrong with the
+// certificate going the other way. The connection then fails with a bad
+// certificate alert on one side only, which is indistinguishable from the peer
+// being hostile. This is a certificate issued by the correct key, correctly
+// labelled, seconds old, and it has to be accepted.
+func TestCertificateFromAClockSlightlyBehindIsAccepted(t *testing.T) {
+	gen, _ := newGenerator(t)
+	tlsCert, err := gen.GenerateCertificate()
+	require.NoError(t, err)
+
+	leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
+	require.NoError(t, err)
+
+	// This node's clock is behind the one that issued it.
+	behind := shallowCopy(leaf)
+	behind.NotBefore = behind.NotBefore.Add(2 * time.Second)
+	behind.NotAfter = behind.NotAfter.Add(2 * time.Second)
+	assert.NoError(t, (&Validator{}).ValidateCertificate(behind),
+		"a certificate that looks seconds from starting must still be accepted")
+
+	// And ahead of it.
+	ahead := shallowCopy(leaf)
+	ahead.NotBefore = ahead.NotBefore.Add(-2 * time.Second)
+	ahead.NotAfter = ahead.NotAfter.Add(-2 * time.Second)
+	assert.NoError(t, (&Validator{}).ValidateCertificate(ahead),
+		"a certificate that looks seconds from ending must still be accepted")
+}
+
+// The tolerance has to be a window around the validity period and not a way of
+// letting anything through: a certificate that is genuinely from the future, or
+// genuinely over, still has to be refused. Otherwise the fix above would be
+// indistinguishable from removing the check.
+func TestCertificateWellOutsideItsPeriodIsStillRefused(t *testing.T) {
+	gen, _ := newGenerator(t)
+	tlsCert, err := gen.GenerateCertificate()
+	require.NoError(t, err)
+
+	leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
+	require.NoError(t, err)
+
+	fromNow := shallowCopy(leaf)
+	fromNow.NotBefore = time.Now().Add(ClockSkewTolerance + time.Minute)
+	assert.Error(t, (&Validator{}).ValidateCertificate(fromNow),
+		"a certificate that starts later than the tolerance allows is not for this peer yet")
+
+	expired := shallowCopy(leaf)
+	expired.NotAfter = time.Now().Add(-(ClockSkewTolerance + time.Minute))
+	assert.Error(t, (&Validator{}).ValidateCertificate(expired),
+		"a certificate that ended longer ago than the tolerance allows is no longer this peer's")
+}
+
+// shallowCopy copies a parsed certificate so a test can move its validity window
+// without touching the one it was parsed from.
+func shallowCopy(c *x509.Certificate) *x509.Certificate {
+	out := *c
+	return &out
+}

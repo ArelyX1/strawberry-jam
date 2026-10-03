@@ -16,6 +16,15 @@ import (
 // DNSNamePrefix is prepended to all encoded public keys in certificate DNS names
 const (
 	DNSNamePrefix = "e"
+
+	// ClockSkewTolerance is how far a peer's clock is allowed to disagree with
+	// this node's before a certificate is judged early or late.
+	//
+	// It has to cover the drift of any two machines expected to hold a connection
+	// open, including a virtual machine whose clock is synchronised only when its
+	// host says so, and it has to stay small next to the validity period so that a
+	// certificate still stops being accepted when it runs out.
+	ClockSkewTolerance = 5 * time.Minute
 )
 
 // base32Encoding defines the custom base32 alphabet used for encoding public keys
@@ -81,12 +90,28 @@ func (v *Validator) ValidateCertificate(cert *x509.Certificate) error {
 		return fmt.Errorf("DNS name does not match public key")
 	}
 
-	// Check expiration
+	// Check the validity period, allowing for the two clocks disagreeing.
+	//
+	// NotBefore is stamped with the clock of the node that made the certificate,
+	// and a node checking it is reading its own clock, which need not be the same
+	// one. Two nodes whose clocks differ by seconds will refuse to talk: the node
+	// behind judges the other's certificate as starting in the future and answers
+	// the handshake with a bad certificate alert, while the node ahead sees nothing
+	// wrong with it, because the far end of the period is a day away and being
+	// early does not expire anything. That asymmetry is what makes it look like
+	// one node is rejecting the other for no reason.
+	//
+	// Skew between machines is normal and no amount of care keeps two clocks
+	// equal, so the check is made against a window rather than against the instant
+	// the certificate claims to begin. The window is far wider than the skew of
+	// any two machines that are talking to each other at all, and far narrower
+	// than the validity period, so it loosens the instant a certificate becomes
+	// usable without loosening what it means.
 	now := time.Now()
-	if now.Before(cert.NotBefore) {
+	if now.Before(cert.NotBefore.Add(-ClockSkewTolerance)) {
 		return fmt.Errorf("certificate is not yet valid")
 	}
-	if now.After(cert.NotAfter) {
+	if now.After(cert.NotAfter.Add(ClockSkewTolerance)) {
 		return fmt.Errorf("certificate has expired")
 	}
 	return nil
