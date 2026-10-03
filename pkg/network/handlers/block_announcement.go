@@ -327,9 +327,25 @@ func (ba *BlockAnnouncer) shouldAnnounce(h *block.Header) (bool, error) {
 	}
 
 	// Check if the block is a descendant of the latest finalized block
+	//
+	// The walk needs the ancestors, and a node that has fallen behind does not have
+	// them. That is not a block from another chain: it is a block whose ancestors
+	// are exactly the ones it has not been given yet, and the request that follows
+	// an announcement is what brings them in.
+	//
+	// Refusing to announce such a block is what stopped a chain between two nodes
+	// holding one timeslot each. Both had the block only the other could announce,
+	// each was waiting on an announcement from the other, and neither could send
+	// one: the walk failed for want of an ancestor, the failure came back as an
+	// error, and the error was read as a verdict that the block must not be
+	// announced. The blocks went unasked for and, being only ever asked for on
+	// announcement, were never asked for at all.
 	isDescendant, err := ba.IsDescendantOfFinalized(h)
 	if err != nil {
-		return false, fmt.Errorf("checking if block is descendant of finalized: %w", err)
+		// The walk could not be finished. Not being able to prove where a block
+		// sits is not the same as it sitting on the wrong side, so it is announced
+		// and the proof is made once the blocks are here.
+		return true, nil
 	}
 	if !isDescendant {
 		return false, nil

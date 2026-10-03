@@ -351,6 +351,10 @@ func (bs *BlockService) IsDescendantOfFinalized(header *block.Header) (bool, err
 	for current.TimeSlotIndex > finalizedSlot {
 		parent, err := bs.Store.GetHeader(current.ParentHash)
 		if err != nil {
+			// The walk stops short of the answer, and the caller has to be able to
+			// tell that apart from an answer of no: a header whose ancestors are
+			// missing is kept as a handle and the blocks behind it are asked for,
+			// which is how a node that has fallen behind walks the chain again.
 			return false, fmt.Errorf("get parent block of slot %d (hash %x): %w", current.TimeSlotIndex, current.ParentHash, err)
 		}
 		current = &parent
