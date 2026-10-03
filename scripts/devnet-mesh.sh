@@ -38,6 +38,14 @@ cd "$ROOT" || exit 1
 BIN="./strawberry"
 [ -x "$BIN" ] || { echo "falta $BIN; compílalo con: go build -tags dev -o strawberry ./cmd/strawberry/" >&2; exit 1; }
 
+# appconfig.json tiene que estar en el directorio de trabajo de cada nodo. Sin el,
+# el proceso no llega a levantar la red: se cae nada mas empezar, con un panic, y lo
+# unico que se ve es que ningun nodo tiene pares y la cadena no arranca. No es un
+# fallo de la malla, es que no arranco. Se copia desde la raiz del repo, que es
+# donde vive, al directorio de corrida, que es donde se levantan los nodos.
+APPCONFIG_SRC="$ROOT/appconfig.json"
+[ -f "$APPCONFIG_SRC" ] || { echo "falta $APPCONFIG_SRC" >&2; exit 1; }
+
 BASE_PORT=30333
 BASE_RPC=19944
 RUN="/tmp/strawberry-mesh"
@@ -84,6 +92,7 @@ arranca() {
   local rpc=$((BASE_RPC + i))
   local dir="$RUN/n$i"
   rm -rf "$dir"; mkdir -p "$dir"
+  cp "$APPCONFIG_SRC" "$dir/appconfig.json"
   GOMAXPROCS=1 "$BIN" --name "mesh-$i" --validator-index "$i" \
     --validators-file "$VALFILE" --author-count "$N" --full-mesh \
     --genesis "$GENFILE" --rpc-port "$rpc" --port "$net" --data-dir "$dir" \

@@ -270,11 +270,19 @@ func main() {
 		log.Internal.Fatal().Err(err).Msg("net conf peer addresses failed")
 	}
 	if portOverride > 0 {
-		for i, addr := range listenAddrs {
-			listenAddrs[i], err = overridePort(addr, portOverride)
-			if err != nil {
-				log.Internal.Fatal().Str("address", addr).Err(err).Msg("peer address port override failed")
-			}
+		// Only this validator's own address. A listen port is the one thing about
+		// a machine that changes when it moves: the addresses the other validators
+		// are reached on are theirs, not ours, and rewriting them to our port sends
+		// every peer to a port where nobody is listening for them.
+		//
+		// Written over the whole list, a run where each node was given its own port
+		// made every validator answer at the port of whichever node was asking.
+		// Each node then dialled its own address, found itself, and settled for a
+		// conversation with itself: one peer per node, every node talking to itself,
+		// and no chain at all. That looked like a mesh that had formed and had not.
+		listenAddrs[index], err = overridePort(listenAddrs[index], portOverride)
+		if err != nil {
+			log.Internal.Fatal().Str("address", listenAddrs[index]).Err(err).Msg("own address port override failed")
 		}
 	}
 	udpAddress, err := net.ResolveUDPAddr("udp", listen)
