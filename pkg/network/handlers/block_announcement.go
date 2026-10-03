@@ -161,6 +161,40 @@ func (bh *BlockAnnouncementHandler) NewBlockAnnouncer(bs *chain.BlockService, ct
 	return ba
 }
 
+// LiveAnnouncer returns this peer's announcer if it is one that can still be used,
+// which means it has not finished and its stream belongs to the connection given
+// rather than to one that has since gone. It reports false when there is no such
+// announcer.
+//
+// The connection has to be part of the question. These announcers are keyed by the
+// peer's public key, and that key is the same before and after a reconnect, so an
+// entry under it can belong to a connection that has been replaced. Handing such an
+// entry back means announcing into a stream the other end has closed, which fails
+// with "Application error 0x0 (remote)" every time and never recovers, because the
+// entry is never replaced and so is found again on the next attempt.
+//
+// An entry that is finished, or that belongs to another connection, is taken out of
+// the map and cancelled here rather than merely ignored. Ignoring it leaves it in
+// place for the next caller to find, which is what made the failure permanent for
+// as long as the peer stayed connected.
+func (bh *BlockAnnouncementHandler) LiveAnnouncer(peerKey ed25519.PublicKey, connCtx context.Context) (*BlockAnnouncer, bool) {
+	bh.mu.Lock()
+	defer bh.mu.Unlock()
+
+	announcer, found := bh.Announcers[string(peerKey)]
+	if !found {
+		return nil, false
+	}
+	if !announcer.Done() && announcer.connCtx == connCtx {
+		return announcer, true
+	}
+	if bh.Announcers[string(peerKey)] == announcer {
+		delete(bh.Announcers, string(peerKey))
+	}
+	announcer.cancel()
+	return nil, false
+}
+
 // HandleStream processes a new UP 0 stream according to the JAMNP requirements.
 // Since UP streams should be unique per connection, it handles the case where a stream
 // already exists for the peer by keeping only the stream with the higher stream ID.
@@ -252,6 +286,23 @@ func (bh *BlockAnnouncementHandler) AddOnBlockReceiveHook(hook BlockReceiveHook)
 // means the stream under it is dead and the announcer has to be replaced rather
 // than reused. Reusing one of these is how a node that stayed up while its peer
 // restarted would keep announcing into a closed stream forever.
+// OnConnection reports the context of the connection this announcer's stream
+// belongs to, which is the connection's own context and is cancelled when that
+// connection closes.
+//
+// It exists because the handler that holds these announcers outlives every
+// connection: one handler is built for the process and handed to each connection
+// as it arrives, and it keys its announcers by the peer's public key, which is
+// the same key before and after a reconnect. So an entry found under a peer's key
+// may well belong to a connection that has since gone, and reusing its stream
+// means announcing into a stream the other end has closed. The context is what
+// tells the two apart.
+func (ba *BlockAnnouncer) OnConnection() context.Context {
+	return ba.connCtx
+}
+
+// Done reports whether this announcer has finished, and so has no stream left to
+// announce on.
 func (ba *BlockAnnouncer) Done() bool {
 	return ba.ctx.Err() != nil
 }

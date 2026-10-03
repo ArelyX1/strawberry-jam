@@ -714,16 +714,6 @@ func (n *Node) AnnounceBlockToAll(ctx context.Context, header *block.Header) err
 // It announces a new block to a peer by sending the block header. The announcement
 // also includes the latest finalized block information as required by the protocol.
 func (n *Node) AnnounceBlock(ctx context.Context, header *block.Header, peer *peer.Peer) error {
-	// If we already have an announcer for this peer, use it. Unless its connection
-	// is gone, in which case the stream under it is dead and announcing into it
-	// would fail forever without ever reopening anything.
-	if peer.BAnnouncer != nil {
-		if !peer.BAnnouncer.Done() {
-			return peer.BAnnouncer.SendAnnouncement(header)
-		}
-		peer.BAnnouncer = nil
-	}
-
 	handler, err := peer.ProtoConn.Registry.GetHandler(protocol.StreamKindBlockAnnouncement)
 	if err != nil {
 		return fmt.Errorf("failed to get announcement handler: %w", err)
@@ -734,9 +724,23 @@ func (n *Node) AnnounceBlock(ctx context.Context, header *block.Header, peer *pe
 	if !ok {
 		return fmt.Errorf("invalid handler type for block announcements")
 	}
-	// Check if we already have an announcer for this peer in BlockAnnouncementHandler. This should never happen.
-	announcer, found := bah.Announcers[string(peer.ProtoConn.TConn.PeerKey())]
-	if found && !announcer.Done() {
+	// A cached announcer belongs to one connection and is only worth reusing on
+	// that connection. The handler holding these announcers is built once for the
+	// process and handed to each connection as it arrives, and it keys them by the
+	// peer's public key, which is the same key before and after a reconnect. So an
+	// announcer found under this peer's key can belong to a connection that has
+	// since been replaced, and its stream is then one the other end has closed:
+	// announcing into it fails with "Application error 0x0 (remote)" for as long as
+	// the peer stays connected, because the entry never goes away and so is never
+	// rebuilt. A peer whose announcer was made before the reconnect is left unable
+	// to tell anyone anything, while the other end announces happily into a
+	// connection that is up.
+	//
+	// Comparing against the peer key alone is what let that happen, so the
+	// announcer's connection is compared against this peer's current one too, and
+	// an announcer on a connection that has gone is dropped rather than reused.
+	announcer, found := bah.LiveAnnouncer(peer.ProtoConn.TConn.PeerKey(), peer.ProtoConn.TConn.Context())
+	if found {
 		peer.BAnnouncer = announcer
 		return announcer.SendAnnouncement(header)
 	}
