@@ -474,6 +474,15 @@ func (r *Runtime) ForgetHandedOut() {
 	defer r.mu.Unlock()
 	r.issued = map[string]uint64{}
 	r.undecided = map[string]int{}
+	// The numbers this node handed out are not the only bookkeeping of its own
+	// that a replay has to start without. Which service gets which core is decided
+	// by a cursor in the scheduler that turns once per timeslot this node runs, so
+	// a node that has been running replays the chain over a cursor that is nowhere
+	// near where a node which had only replayed would be. The services all still
+	// run and still run in the same timeslots, but in a different order among
+	// themselves, and that is enough to settle to a different state: the node
+	// rebuilds the chain, gets a root no block names, and refuses to build on it.
+	r.scheduler.ForgetCoretime()
 }
 
 // nextNonceLocked hands out the next number of the chain's own sequence for an

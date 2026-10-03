@@ -1,6 +1,7 @@
 package devnet
 
 import (
+	"crypto/ed25519"
 	"testing"
 
 	"github.com/eigerco/strawberry/internal/crypto"
@@ -304,4 +305,141 @@ func TestTwoValidatorsWritingAndRebuildingEachOtherAgree(t *testing.T) {
 			"timeslot %d: the two validators had different states for the same chain", slot)
 	}
 	_ = workZero
+}
+
+// A node that has been running and then rebuilds the chain from the start has to
+// land on the state that wrote it, and it does not follow from the other tests
+// here that it does. Those start a node and replay it, so the node has no history
+// to forget. This one has been running first, which is the ordinary case: a node
+// follows the chain for a while, is asked to rebuild it, and has to arrive back
+// where it started.
+//
+// It could not, and it failed in the way a chain stops rather than in a way that
+// looks like a bug. Which service gets which core when two of them want one is
+// decided by a rotation in the scheduler that turns once per timeslot the node
+// runs. A node that has been running has turned it a number of times that has
+// nothing to do with where it is on the chain, so it replayed the chain over a
+// rotation a node that had only replayed would not have had. Every service still
+// ran, in the same timeslots, but in a different order among themselves, so the
+// state settled differently, so the rebuild reached a root no block names and the
+// node refused to build on it. That is the whole chain stopping, on every node,
+// over an ordering that is nobody's fault individually.
+func TestARunningNodeThatRebuildsAgreesWithTheChainItWasOn(t *testing.T) {
+	const slots = 10
+	start := jamtime.Timeslot(9184000)
+
+	// The chain, as the author ran it.
+	author := newTestRuntime(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	steps := make([]step, 0, slots)
+	for i := 0; i < slots; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err, "the author must be able to run timeslot %d", i)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	// The node that has been running: it followed the same chain, so it is on the
+	// same state, and its scheduler's rotation is wherever running it left it.
+	runner := newTestRuntime(t)
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		require.NoError(t, runner.Rebuild(s.work), "rebuild timeslot %d", slot)
+		require.NoError(t, runner.Step(slot), "step timeslot %d", slot)
+	}
+	runner.FinishRebuild()
+	require.Equal(t, author.Root(), runner.Root(),
+		"the node that followed the chain is on the chain's state to begin with")
+
+	// Now it is asked to adopt a chain, which is what a node does when a peer has
+	// written a stretch it has not: rewind to the start of the chain and execute the
+	// peer's blocks over that. Both halves matter. The rewind puts the state back;
+	// forgetting what this node was doing puts back the bookkeeping that is its own
+	// rather than the chain's, which includes the rotation of which service gets
+	// which core.
+	require.NoError(t, runner.Rewind(), "adopting a chain rewinds to the start of it")
+	runner.ForgetHandedOut()
+
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		require.NoError(t, runner.Rebuild(s.work), "rebuild timeslot %d", slot)
+		require.NoError(t, runner.Step(slot), "step timeslot %d", slot)
+		assert.Equal(t, s.root, runner.Root(),
+			"timeslot %d: a node that had been running rebuilt the chain to a state it was not on", slot)
+	}
+}
+
+// The same again, but with a payout in the chain, which is what put it there in
+// the first place.
+//
+// A payout is queued by a caller, on one node, and it settles in whichever
+// timeslot that node is authoring. Every other node learns about it from the
+// block, not from the caller: nobody asked them for it, so the only copy of it
+// anywhere is in the block. A node that queued one itself and is then handed a
+// chain that already settled it is holding that payout in its queue and in the
+// chain, and if the queue is not emptied on the way back to the start of the
+// chain it settles the same payout twice, or once before the timeslot that names
+// it, and the state it arrives at is not the state the blocks describe.
+//
+// It stops the chain the same way every time: the node rebuilds to a root no
+// block names, the check against the block fails, and the node refuses to adopt
+// a chain that was perfectly good. And every node that had queued anything does
+// it, so the mesh sits on the last block all of them agree on.
+func TestAdoptingAChainThatSettledAPayoutThisNodeHadQueued(t *testing.T) {
+	const slots = 8
+	start := jamtime.Timeslot(9175000)
+
+	author := newRuntimeWithBridge(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	steps := make([]step, 0, slots)
+
+	// The payout goes into the chain on the node that heard about it, and settles
+	// in the first timeslot that runs after it was queued.
+	if _, err := author.Faucet(addressOf(t, 5)); err != nil {
+		t.Fatalf("queue the payout: %v", err)
+	}
+	for i := 0; i < slots; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err, "the author must be able to run timeslot %d", i)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	// The other node was asked for the same payout. It queued it too, in its own
+	// queue, and it is about to be told about a chain that has already settled it.
+	adopter := newRuntimeWithBridge(t)
+	if _, err := adopter.Faucet(addressOf(t, 5)); err != nil {
+		t.Fatalf("queue the payout on the adopting node: %v", err)
+	}
+
+	// Adopting a chain rewinds to the start of it and executes the peer's blocks
+	// over that.
+	require.NoError(t, adopter.Rewind(), "rewind to the start of the chain")
+	adopter.ForgetHandedOut()
+
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		require.NoError(t, adopter.Rebuild(s.work), "rebuild timeslot %d", slot)
+		require.NoError(t, adopter.Step(slot), "step timeslot %d", slot)
+		assert.Equal(t, s.root, adopter.Root(),
+			"timeslot %d: the node that had queued the payout rebuilt the chain to a state it was not on", slot)
+	}
+}
+
+// newRuntimeWithBridge is [newTestRuntime] with a bridge key, so that the node
+// can be asked to pay a payout out of its own account the way it is in a chain
+// that has one.
+func newRuntimeWithBridge(t *testing.T) *Runtime {
+	t.Helper()
+	seed := make([]byte, ed25519.SeedSize)
+	for i := range seed {
+		seed[i] = byte(i)
+	}
+	rt, err := New(Options{Genesis: testGenesis(t), BridgeKey: ed25519.NewKeyFromSeed(seed)})
+	require.NoError(t, err)
+	return rt
 }

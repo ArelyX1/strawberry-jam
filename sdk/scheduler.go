@@ -108,6 +108,36 @@ func (s *Scheduler) Demand(id block.ServiceId) int {
 	return s.demandLocked(id)
 }
 
+// ForgetCoretime puts the rotation back to the start of the chain and empties the
+// queues and the inboxes.
+//
+// The cursor is what decides which service gets which core when two of them want
+// one, and it lives in this node's memory. A node that has been running has
+// turned it a number of times that has nothing to do with where it is on the
+// chain, so replaying that chain from the start over the top of them hands out
+// the cores in a different order than the node that wrote the blocks handed them
+// out in. The services still all run, still in the same timeslots, but they run
+// in a different sequence, and a service whose accumulate is not commutative
+// settles to a different state. So the node rebuilds the chain, arrives at a
+// root that no block ever named, and refuses to build on it.
+//
+// This is the same thing [github.com/eigerco/strawberry/pkg/devnet.Runtime]'s
+// ForgetHandedOut does for the numbers it handed out: the parts of a node that
+// are the node's own bookkeeping rather than the chain's have to go back to the
+// beginning of the chain before it is replayed, or the replay is of the chain
+// plus whatever the node was doing before.
+func (s *Scheduler) ForgetCoretime() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cursor = 0
+	for id := range s.queues {
+		s.queues[id] = &[]WorkItem{}
+	}
+	for id := range s.inbox {
+		s.inbox[id] = nil
+	}
+}
+
 func (s *Scheduler) demandLocked(id block.ServiceId) int {
 	n := 0
 	if queue := s.queues[id]; queue != nil {
