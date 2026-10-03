@@ -407,13 +407,24 @@ func (n *Node) ConnectToNeighbours() error {
 		// qualify: every machine listens on the same port, so all that is left
 		// to compare are the ephemeral ports, and each end sees those two numbers
 		// in opposite order.
-		if bytes.Compare(n.ValidatorManager.Keys.EdPub, neighbor.Ed25519) >= 0 {
-			// The other end has the lower key, so it is the one that dials, and
-			// this node waits for it. Its neighbour loop repeats, so a peer that
-			// was down when this node started is still reached later.
-			continue
-		}
-
+		//
+		// Both ends dialling is kept, because the connection each pair ends up
+		// holding is now decided by the two keys and comes out the same on both
+		// sides whatever order the connections arrive in. Deciding it by port was
+		// what used to break it.
+		//
+		// Dialing from one end only was tried instead, on the grounds that a pair
+		// then never has a duplicate to resolve at all. It does avoid that, and
+		// it costs more than it saves: the pair's only connection is then one
+		// node's outgoing one, so the pair is reachable only if packets from that
+		// one node get through. Two nodes on two machines are not symmetric that
+		// way. One of them was behind a NAT that dropped its inbound packets, so
+		// the node that was made to wait never got a connection at all, while the
+		// node that was made to dial believed it was connected: the peer list said
+		// one neighbour, announcing, and announcing to nothing, which is the state
+		// this is being fixed from. Letting both ends dial means either direction
+		// brings the pair up, and the rule above then settles which of the two
+		// connections survives.
 		n.peersLock.RLock()
 		have := n.PeersSet.GetByEd25519Key(neighbor.Ed25519)
 		n.peersLock.RUnlock()
