@@ -138,6 +138,51 @@ func (s *Scheduler) ForgetCoretime() {
 	}
 }
 
+// ForgetWork empties the queues and the inboxes, and leaves everything else —
+// including which services the protocol needs every timeslot — as it was.
+//
+// It is what a node does to its own pending work when it starts following a chain
+// that a peer wrote. What is queued belongs to the branch this node was on, and
+// running it against somebody else's blocks settles work that no block names.
+//
+// That is not a theoretical problem. A node with a payout queued that receives a
+// peer's block for a timeslot it is not authoring used to execute that timeslot
+// with both in the queue: the block's work, and its own, which settled there
+// instead of in a later timeslot. Its state was then the chain's state plus one
+// extra transfer, it wrote the next block on top of that, and the block named a
+// root no other node could rebuild — so every peer refused to adopt it and the
+// chain stopped with all of them healthy.
+func (s *Scheduler) ForgetWork() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.queues {
+		s.queues[id] = &[]WorkItem{}
+	}
+	for id := range s.inbox {
+		s.inbox[id] = nil
+	}
+}
+
+// Drain takes everything that is queued, leaving the queues empty, and says which
+// service each item was for.
+//
+// It is how work a node had queued of its own is picked up before the node starts
+// following a chain somebody else wrote, so that following a chain does not lose
+// it and does not run it either.
+func (s *Scheduler) Drain() map[block.ServiceId][]WorkItem {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[block.ServiceId][]WorkItem, len(s.queues))
+	for id, queue := range s.queues {
+		if queue == nil || len(*queue) == 0 {
+			continue
+		}
+		out[id] = append(out[id], (*queue)...)
+		*queue = (*queue)[:0]
+	}
+	return out
+}
+
 func (s *Scheduler) demandLocked(id block.ServiceId) int {
 	n := 0
 	if queue := s.queues[id]; queue != nil {

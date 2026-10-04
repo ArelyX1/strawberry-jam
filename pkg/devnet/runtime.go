@@ -122,8 +122,30 @@ type Runtime struct {
 	// produced earlier, and not from anything that asked the node to do it now.
 	// The faucet reserve is one thing that is not queued again while it is set.
 	replaying bool
+	// held is work this node was asked to do that has not been written into a block
+	// yet, kept aside while the node follows somebody else's chain.
+	//
+	// A block names the work its timeslot ran, so work of this node's own cannot
+	// be settled while it is executing timeslots it did not author: it would settle
+	// in a timeslot that does not name it, and the state would be the chain's
+	// state plus something extra. So it waits here instead, and goes back into the
+	// queue the next timeslot this node authors, which is the only place a block
+	// can come to and name it.
+	//
+	// Dropping it instead would be simpler and would leave the chain correct, but
+	// a caller that asked for a transfer would watch it disappear with nothing to
+	// say so, and the same request would have worked on a node that happened to be
+	// the author. Holding it is what makes the answer the same on every node.
+	held []heldWork
 
 	logf func(format string, args ...any)
+}
+
+// heldWork is one item this node was asked to do, set aside while it follows a
+// chain somebody else wrote.
+type heldWork struct {
+	serviceID block.ServiceId
+	item      svc.WorkItem
 }
 
 // New builds a runtime from a genesis definition: it registers PAPU, funds the
@@ -435,6 +457,29 @@ func (r *Runtime) Rebuild(work []BlockWork) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Whatever this node had queued of its own is set aside before the block's work
+	// goes in. This is the only place a node executes a timeslot it did not author,
+	// and a block says exactly what its timeslot ran. Work that was in the queue and
+	// is not in the block did not run in that timeslot, on any node, and settling it
+	// here makes this node's state the chain's state plus something extra — which
+	// is the one thing a state that every node rebuilds from the same blocks cannot
+	// be.
+	//
+	// It did settle it, and the chain stopped with every node healthy and every
+	// peer connected: a node with a payout queued received a peer's block for a
+	// timeslot it was not authoring, ran both, and wrote the next block on a root
+	// no peer could rebuild. Every peer then refused to adopt it.
+	//
+	// The work is held rather than dropped, because a caller that asked for a
+	// transfer should not lose it for asking on a node that was not about to author
+	// the timeslot that would have carried it.
+	for id, items := range r.scheduler.Drain() {
+		for _, item := range items {
+			r.held = append(r.held, heldWork{serviceID: id, item: item})
+		}
+	}
+	r.scheduler.ForgetWork()
+
 	r.replaying = true
 	for _, w := range work {
 		if _, err := r.scheduler.Submit(w.ServiceID, svc.WorkItem{Payload: w.Payload, Origin: "replay"}); err != nil {
@@ -545,6 +590,29 @@ func (r *Runtime) runLocked(timeslot jamtime.Timeslot) ([]BlockWork, error) {
 	// chain actually kept.
 	r.settleNoncesLocked()
 	r.fundBridgeLocked()
+
+	// Work this node was asked to do, and that was set aside while it was
+	// following somebody else's chain, goes back into the queue now — because now
+	// this node is the one writing the timeslot, and a block can only name work
+	// that the author of its timeslot ran.
+	//
+	// Not while it is replaying. A block that does not name this work did not run
+	// it, and running it anyway is what put this node's state off the chain and
+	// stopped the whole mesh.
+	if !r.replaying && len(r.held) > 0 {
+		waiting := r.held
+		r.held = nil
+		for i, h := range waiting {
+			if _, err := r.scheduler.Submit(h.serviceID, h.item); err != nil {
+				// The queue is full, which is a bound this node chose for itself.
+				// What did not fit stays held, in the order it arrived, and goes
+				// back in on a later timeslot rather than being lost.
+				r.held = append(waiting[i:], r.held...)
+				r.logf("work this node is holding did not fit in the queue and is still waiting: %v", err)
+				break
+			}
+		}
+	}
 
 	// The timeslot is part of the state, so the root of a chain that is running
 	// moves even in a timeslot that settles no work.
@@ -1078,6 +1146,8 @@ func (r *Runtime) Rewind() error {
 	r.scheduler = svc.NewScheduler(r.registry, int(constants.MaxNumberOfItems))
 	r.issued = map[string]uint64{}
 	r.undecided = map[string]int{}
+	// Held work is for the branch being abandoned, the same as the queue was.
+	r.held = nil
 	r.updateRoot()
 	return nil
 }

@@ -504,3 +504,123 @@ func TestExecutingOnTopWithoutARewindDropsNothingAndDoublesNothing(t *testing.T)
 		"timeslot %d: the node settled the payout from the block on top of the copy it had queued itself",
 		last)
 }
+
+// A node with work of its own queued, executing a block somebody else wrote.
+//
+// This is what a node does whenever it is not the author of a timeslot, which is
+// most of them. The block says what its timeslot ran. Anything else in the queue
+// belongs to this node's own memory, was queued for a state that is not the one
+// the block is about, and is not in any block.
+//
+// Executing the timeslot with both in the queue settled the node's own work there
+// too, in a timeslot that does not name it. Its state was then the chain's state
+// plus one transfer, so it wrote the next block on a root no peer could rebuild,
+// every peer refused to adopt it, and the chain stopped with all of them healthy
+// and all of them connected. The tell was a node reporting a balance its peers did
+// not have, on a chain where the block carrying the payout had never been executed
+// by anybody but the node that asked for it.
+//
+// The payout is queued by a caller and has not been in a block yet. Following a
+// chain that has none of it is normal — the author of that chain was somebody else
+// — and it has to leave the state at what the blocks say.
+func TestFollowingAPeerChainDropsWorkThisNodeHadQueued(t *testing.T) {
+	const slots = 6
+	start := jamtime.Timeslot(9144000)
+
+	// The chain, written by a node that was never asked to pay anything.
+	author := newRuntimeWithBridge(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	steps := make([]step, 0, slots)
+	for i := 0; i < slots; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err, "the author must be able to run timeslot %d", i)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	// This node was asked to pay somebody, and queued it. Nobody has written it
+	// into a block, because this node is not the one authoring these timeslots.
+	follower := newRuntimeWithBridge(t)
+	if _, err := follower.Faucet(addressOf(t, 5)); err != nil {
+		t.Fatalf("queue the payout: %v", err)
+	}
+	require.Positive(t, pendingOf(t, follower), "the payout is queued and not yet in a block")
+
+	// Now it follows the chain somebody else wrote.
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		require.NoError(t, follower.Rebuild(s.work), "rebuild timeslot %d", slot)
+		require.NoError(t, follower.Step(slot), "step timeslot %d", slot)
+		require.Equal(t, s.root, follower.Root(),
+			"timeslot %d: the node settled work of its own on somebody else's chain, so its state is not the chain's state",
+			slot)
+	}
+}
+
+// pendingOf reports how much work a node has queued, for saying out loud that
+// there was something to lose.
+func pendingOf(t *testing.T, rt *Runtime) int {
+	t.Helper()
+	queued, _ := rt.Pending()
+	return queued
+}
+
+// Work a node was asked to do is held while it follows a chain somebody else
+// wrote, and settled in the next timeslot it authors.
+//
+// Holding it and dropping it are both defensible for the chain — the state has to
+// be what the blocks say either way — and only one of them is defensible for the
+// caller. A node that dropped it would lose a transfer for no reason other than
+// which node the caller happened to ask, and the same request would have worked on
+// the node that was about to author. So the answer has to be the same everywhere.
+//
+// This node follows a chain it did not write, with a payout of its own queued, and
+// then it writes a timeslot itself. The payout settles there, in a block that names
+// it, and every node that rebuilds that block arrives at the same balance.
+func TestHeldWorkSettlesInTheNextTimeslotThisNodeAuthors(t *testing.T) {
+	start := jamtime.Timeslot(9133000)
+
+	// Somebody else's chain, with nothing in it.
+	author := newRuntimeWithBridge(t)
+	type step struct {
+		work []BlockWork
+		root crypto.Hash
+	}
+	var steps []step
+	for i := 0; i < 4; i++ {
+		work, err := author.Run(start + jamtime.Timeslot(i))
+		require.NoError(t, err)
+		steps = append(steps, step{work: work, root: author.Root()})
+	}
+
+	// This node is asked to pay somebody, and then told to follow that chain.
+	node := newRuntimeWithBridge(t)
+	if _, err := node.Faucet(addressOf(t, 5)); err != nil {
+		t.Fatalf("queue the payout: %v", err)
+	}
+	for i, s := range steps {
+		slot := start + jamtime.Timeslot(i)
+		require.NoError(t, node.Rebuild(s.work), "rebuild timeslot %d", slot)
+		require.NoError(t, node.Step(slot), "step timeslot %d", slot)
+		require.Equal(t, s.root, node.Root(), "timeslot %d: following the chain", slot)
+	}
+
+	// Following the chain is over, and the node is a running node again. The real
+	// caller of this path ends the rebuild the same way.
+	node.FinishRebuild()
+
+	// Now it writes a timeslot of its own. The payout has to go in that block,
+	// because a block can only name work its author ran.
+	own, err := node.Run(start + 4)
+	require.NoError(t, err)
+	require.Len(t, own, 1, "the timeslot this node authored carries the work that was waiting for it")
+
+	// And a node that rebuilds that block lands where this one is.
+	other := newRuntimeWithBridge(t)
+	require.NoError(t, other.Rebuild(own), "rebuild the timeslot this node authored")
+	require.NoError(t, other.Step(start+4), "step it")
+	assert.Equal(t, node.Root(), other.Root(),
+		"the timeslot this node authored is not the block the rest of the mesh rebuilds")
+}

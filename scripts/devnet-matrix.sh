@@ -155,8 +155,19 @@ while [ "$N" -le "$NODES" ]; do
     s=$((s + 1))
   done
 
+  # Que el primer nodo tenga el saldo no es que la transaccion haya llegado a
+  # todos. El trabajo viaja dentro de un bloque y cada peer lo recibe y lo ejecuta
+  # por su cuenta, asi que hay un rato en el que uno ya lo tiene y los demas
+  # todavia no. Preguntar en ese momento mide cuanto tarda un nodo en enterarse, no
+  # si la red se puso de acuerdo, y con mas nodos el rato es mas largo y la
+  # comprobacion falla sin que nada este mal.
+  #
+  # Asi que se espera a que la red se ponga de acuerdo y luego se comparan. Es lo
+  # que de verdad importa: al final de este rato todos tienen que ver lo mismo.
   if [ "$llego" = "1" ]; then
-    if mismoSaldoEnTodos; then
+    if ! esperaconsiste; then
+      falla "los $N no se ponen de acuerdo tras la transaccion"
+    elif mismoSaldoEnTodos; then
       ok "la transaccion llega a los $N con el mismo saldo ($(saldo $((BASE_RPC))))"
     else
       falla "la transaccion llega distinta a cada nodo"

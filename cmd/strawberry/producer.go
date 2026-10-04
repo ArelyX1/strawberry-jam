@@ -54,6 +54,9 @@ type blockProducer struct {
 	// neither node can tell the other anything, which is the opposite of what
 	// announcing is for.
 	announceBackoff map[string]time.Time
+	// aheadAskedAt is when this node may next ask its peers for the chain that is
+	// ahead of its own tip.
+	aheadAskedAt time.Time
 }
 
 // How long past the end of a timeslot a node keeps waiting for the block the
@@ -67,6 +70,16 @@ const (
 	// this runs. A batch of a few, one block each, and no second peer.
 	recoverBatch   = 4
 	recoverTimeout = 2 * time.Second
+
+	// aheadAskInterval is how often a node behind its peers says where its own
+	// chain is, which is the only way to be told about the blocks above its tip.
+	//
+	// It is not every pass, because saying where the chain is opens a stream per
+	// peer, and a node that is not behind would be doing that forever to nobody's
+	// benefit. It is short enough that a node which has fallen behind is back
+	// within a couple of timeslots rather than sitting on a stale tip, and long
+	// enough that the streams are not the reason the node falls further behind.
+	aheadAskInterval = 2 * time.Second
 	// authorRetryWait is how long an author waits before looking again for the
 	// block its timeslot has to build on. Long enough that holding a timeslot is
 	// not a busy loop.
@@ -258,6 +271,51 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 	aviso := true
 	for {
 		bp.waitFor(slot)
+
+		// Before anything else: if the chain has fallen behind the timeslot this
+		// loop is on, do not move. Wait for it to arrive.
+		//
+		// The timeslot on this loop only moves forward, and the chain it is
+		// following moves too, but not in step. A node that was slow, or that had
+		// its blocks late, ends up with the chain a few timeslots behind the
+		// timeslot the loop is on. It is then waiting for the block of a timeslot
+		// that its own chain has not reached, and the node whose turn that timeslot
+		// is — possibly this one — is waiting too, for a block nobody has written
+		// because the chain is not there to build on. Every author is waiting for a
+		// block that no one is going to write, and the mesh is stopped with all of
+		// them healthy and connected.
+		//
+		// Advancing made it worse, not better: moving past a timeslot the chain has
+		// not reached is not something a node can undo, and the timeslot it moves
+		// onto is one it will never be the author of. Standing still until the
+		// chain arrives is what lets this node write the timeslot that is actually
+		// its own, as soon as the chain gets there.
+		tip, _, haveTip := bp.bestKnownTip()
+		if haveTip {
+			tipSlot := tip.TimeSlotIndex
+			// Only when the chain has not arrived AND this node is not the author of
+			// the timeslot. If it is the author, waiting helps nobody: it is the one
+			// that has to move the chain forward, and standing still while the chain
+			// waits for it is a deadlock with everybody in it. When this node writes
+			// this timeslot, it writes it on whatever the chain has, which is how the
+			// chain catches up.
+			if tipSlot < slot && !authorFor(slot, bp.authorIndex, bp.authorCount) {
+				// The chain has not reached a timeslot that is not this node's. Ask
+				// its peers where they are, so that it arrives, and try the same
+				// timeslot again.
+				bp.recoverBlocksAhead()
+				bp.announceTipToNewPeers()
+				if aviso {
+					aviso = false
+					log.Internal.Debug().Uint64("slot", uint64(slot)).
+						Uint64("chainTip", uint64(tipSlot)).
+						Msg("the chain has not reached this timeslot yet; waiting rather than going past it")
+				}
+				time.Sleep(foreignSlotPoll)
+				continue
+			}
+		}
+		aviso = true
 		// Catching up comes before the turn and does not replace it. It used to be
 		// a case of the same switch, which meant that a node that had caught up
 		// skipped the rest of the timeslot: when the timeslot it was responsible
@@ -503,6 +561,25 @@ func (bp *blockProducer) catchUpBehind() bool {
 	// and the gap it already knew the hash of sat there until something else
 	// moved.
 	bp.recoverMissingBlocks()
+
+	// Asking what is missing only looks downwards, from the tips this node knows
+	// about, and that is the whole of what it asked for. A node whose chain has
+	// moved past it therefore had nothing to ask for, which is the wrong answer:
+	// what it is missing is above its tip, and walking down from its own tip can
+	// never reach it.
+	//
+	// It sat there saying it could not get to a timeslot whose block three of its
+	// peers already had. It had the right peers connected the whole time, and it
+	// had stopped asking twenty minutes earlier, and nothing in the log said so —
+	// the timeslot it was waiting for looked exactly like a timeslot nobody had
+	// written yet. Which is what it was, on the node: the block for it was in the
+	// store of everybody else.
+	//
+	// So a node that is behind asks its peers where their chain is, and asks for
+	// the stretch after its own tip by name. The peers answer with blocks this
+	// node did not have, and the gap closes the same way a gap below the tip does.
+	bp.recoverBlocksAhead()
+
 	if header.TimeSlotIndex <= bp.runtime.Timeslot() {
 		return false
 	}
@@ -534,6 +611,74 @@ func (bp *blockProducer) catchUpBehind() bool {
 // that has been away or has just started converge on the chain it is on.
 //
 // It reports how many blocks it managed to get, which is zero most of the time.
+// recoverBlocksAhead asks the peers where their chain is, so that the stretch above
+// this node's own tip arrives.
+//
+// Everything else this node asks for is by name: it walks down from the tips it
+// knows and asks for the hashes it finds missing on the way. That covers the whole
+// of what is behind it and none of what is in front. A node that has fallen behind
+// has blocks it cannot name, because a block nobody has told it about is not in
+// its store to be asked for by name, and the one way to learn about it is to say
+// where this node's chain stops.
+//
+// It is the same message a peer sends when it announces a block, and it is the
+// message that carries the stretch behind the announced head. So announcing this
+// node's own tip is the request: a peer that is further along answers with the
+// blocks in between.
+func (bp *blockProducer) recoverBlocksAhead() int {
+	header, hash, ok := bp.bestKnownTip()
+	if !ok {
+		return 0
+	}
+	if bp.net == nil || bp.ctx == nil {
+		return 0
+	}
+
+	// Saying where the chain is is not free and it is not the answer to a question
+	// the peer asked, so it is not done on every pass. A node that is waiting for a
+	// block to arrive asks for it now and then, and a node that is not behind does
+	// not ask at all.
+	bp.mu.Lock()
+	now := time.Now()
+	if now.Before(bp.aheadAskedAt) {
+		bp.mu.Unlock()
+		return 0
+	}
+	bp.aheadAskedAt = now.Add(aheadAskInterval)
+	bp.mu.Unlock()
+
+	gotten := 0
+	var wg sync.WaitGroup
+	for _, p := range bp.net.GetAllPeers() {
+		if p == nil || p.ProtoConn == nil || p.ProtoConn.TConn == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(p *peer.Peer) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(bp.ctx, recoverTimeout)
+			defer cancel()
+			// The blocks a peer sends back are handled by the same path any other
+			// block takes, so there is nothing to do with them here but count that
+			// something came back.
+			if err := bp.net.AnnounceBlock(ctx, &header, p); err != nil {
+				log.Internal.Debug().Err(err).
+					Str("tip", hashToHex(hash)).
+					Msg("could not ask a peer for the chain ahead of this node")
+				return
+			}
+			bp.mu.Lock()
+			defer bp.mu.Unlock()
+			gotten++
+			log.Internal.Debug().Str("tip", hashToHex(hash)).
+				Uint64("tipSlot", uint64(header.TimeSlotIndex)).
+				Msg("asked a peer for the chain ahead of this node")
+		}(p)
+	}
+	wg.Wait()
+	return gotten
+}
+
 func (bp *blockProducer) recoverMissingBlocks() int {
 	hashes := bp.bs.BackfillHashes(recoverBatch)
 	if len(hashes) == 0 {
@@ -801,6 +946,17 @@ func (bp *blockProducer) replay(from, through jamtime.Timeslot, blocks map[jamti
 	if through < from {
 		return 0, nil
 	}
+	// Whatever happens in here, this node stops being a replaying node on the way
+	// out, including when it gives up.
+	//
+	// It did not, and a node that had given up stayed in that state for good. Two
+	// things follow from being one. The faucet reserve is not queued again while it
+	// is set, so the node stopped funding itself; and work this node was asked to do
+	// is only put back into the queue when it is not replaying, so it stopped
+	// settling anything at all. A node that could not rebuild a chain once could
+	// then never produce again, however many times it tried, and it said nothing
+	// about why: it looked exactly like a node with nothing to do.
+	defer bp.runtime.FinishRebuild()
 	for slot := from; slot <= through; slot++ {
 		b, ok := blocks[slot]
 		if !ok {
@@ -821,7 +977,6 @@ func (bp *blockProducer) replay(from, through jamtime.Timeslot, blocks map[jamti
 			// here. Stopping is also what lets it be at the right state at all:
 			// inventing a timeslot is not a slower way of catching up, it is a
 			// different state.
-			bp.runtime.FinishRebuild()
 			return uint64(slot - from), nil
 		}
 
@@ -848,7 +1003,6 @@ func (bp *blockProducer) replay(from, through jamtime.Timeslot, blocks map[jamti
 			fmt.Printf("REPLAY %d %s\n", uint64(slot), hashToHex(bp.runtime.Root()))
 		}
 	}
-	bp.runtime.FinishRebuild()
 	return uint64(through - from + 1), nil
 }
 
