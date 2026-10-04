@@ -353,7 +353,7 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 					// while holding a block it already has. Those are different
 					// faults with different fixes, and reading the wrong one off
 					// this line costs the whole diagnosis.
-tip, _, hasTip := bp.bestKnownTip()
+					tip, _, hasTip := bp.bestKnownTip()
 					tipSlot := jamtime.Timeslot(0)
 					if hasTip {
 						tipSlot = tip.TimeSlotIndex
