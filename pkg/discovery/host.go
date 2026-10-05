@@ -30,9 +30,11 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/host/autonat"
 	ma "github.com/multiformats/go-multiaddr"
@@ -55,6 +57,23 @@ type Options struct {
 	// anyone who did not already have a connection to it.
 	Relay bool
 
+	// Identity overrides the key derived from the validator key.
+	//
+	// A node whose identity is derived rather than random can be worked out from
+	// the genesis by every other node, which is what lets two machines find each
+	// other without either having met a third. Leaving this nil keeps the stored
+	// random key, which still works between nodes that have already met.
+	Identity crypto.PrivKey
+
+	// Bootstrap seeds the distributed hash table with peers to ask.
+	//
+	// Any one of them is enough, and there does not have to be any: the address
+	// book from previous runs is used too. That is deliberate. A network whose
+	// first contact depends on one particular machine being up is a network with
+	// a single point of failure wearing a disguise, and it fails exactly when
+	// somebody is already trying to fix something else.
+	Bootstrap []peer.AddrInfo
+
 	// Logf receives what the host is doing.
 	Logf func(format string, args ...any)
 }
@@ -65,6 +84,12 @@ func (o *Options) logf(format string, args ...any) {
 	}
 }
 
+// peerAddrTTL is how long an address learned about a peer is trusted without
+// being confirmed. Long enough to cover a restart, short enough that a machine
+// that moved is eventually dialled at its new address and not only at the old
+// one.
+const peerAddrTTL = 24 * time.Hour
+
 // identityFile is the private key inside the data directory. The name says what
 // it is so that nobody deletes it thinking it is a cache.
 const identityFile = "p2p-identity.key"
@@ -72,8 +97,10 @@ const identityFile = "p2p-identity.key"
 // Host is a running peer-to-peer host. The zero value is not usable; build one
 // with Start.
 type Host struct {
-	host host.Host
-	dht  *dht.IpfsDHT
+	host      host.Host
+	dht       *dht.IpfsDHT
+	book      *addressBook
+	bootstrap []peer.AddrInfo
 
 	cancel context.CancelFunc
 	logf   func(format string, args ...any)
@@ -91,10 +118,17 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	keyPath := filepath.Join(opts.DataDir, identityFile)
-	priv, err := loadOrCreateIdentity(keyPath)
-	if err != nil {
-		cancel()
-		return nil, err
+	var (
+		priv crypto.PrivKey
+		err  error
+	)
+	priv = opts.Identity
+	if priv == nil {
+		priv, err = loadOrCreateIdentity(keyPath)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
 	}
 
 	listen, err := listenAddrs(opts.Port)
@@ -134,10 +168,18 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 	}
 
 	out := &Host{
-		host:   h,
-		logf:   opts.Logf,
-		cancel: cancel,
+		host:      h,
+		book:      loadAddressBook(opts.DataDir),
+		bootstrap: opts.Bootstrap,
+		logf:      opts.Logf,
+		cancel:    cancel,
 	}
+
+	// Everything the address book holds goes back into the peer store before the
+	// table is started, because the table can only be bootstrapped from peers and
+	// this is where the peers this node already met come from. It is what makes a
+	// restart find the network again with nothing else available.
+	out.recordKnownPeers()
 
 	if opts.Relay {
 		out.logf("offering to relay for nodes that cannot be reached directly")
@@ -169,24 +211,61 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 // to bootstrap from, and for them the net conf is still the way in; once there
 // are peers, the table takes over.
 func (h *Host) startDHT(ctx context.Context) error {
-	// The peers already in the peerstore are the only ones the table can be
-	// bootstrapped from, and at the very first start there are none. That is the
-	// normal beginning of a network rather than a fault: the net conf supplies
-	// the first contact, and from there the table and local discovery take over.
-	bootstrap := make([]peer.AddrInfo, 0, 8)
+	// Se junta lo que se sabe de cuatro maneras independientes, y no hace falta
+	// que ninguna funcione. Lo que está en el peerstore yaincludes lo que la
+	// tabla sabe; lo que da el bootstrap son las semillas; lo del libro son los
+	// pares de corridas anteriores.
+	//
+	// Reunirlas es lo que quita el punto unico de fallo. Con una sola fuente, un
+	// nodo apaga el DHT de su vecino hasta que ese vecino vuelve, y la red se
+	// parte sin que ninguna de las dos mitades parezca equivocada.
+	conjunto := make(map[peer.ID]peer.AddrInfo)
+
 	for _, id := range h.host.Peerstore().Peers() {
 		if id == h.host.ID() {
 			continue
 		}
-		bootstrap = append(bootstrap, peer.AddrInfo{
-			ID:    id,
-			Addrs: h.host.Peerstore().Addrs(id),
-		})
+		conjunto[id] = peer.AddrInfo{ID: id, Addrs: h.host.Peerstore().Addrs(id)}
 	}
+
+	for _, info := range h.bootstrap {
+		if info.ID == h.host.ID() {
+			continue
+		}
+		conjunto[info.ID] = info
+		h.host.Peerstore().AddAddrs(info.ID, info.Addrs, peerAddrTTL)
+	}
+
+	for _, info := range h.book.all() {
+		if info.ID == h.host.ID() {
+			continue
+		}
+		if previa, ok := conjunto[info.ID]; ok {
+			conjunto[info.ID] = peer.AddrInfo{
+				ID:    info.ID,
+				Addrs: append(append([]ma.Multiaddr{}, previa.Addrs...), info.Addrs...),
+			}
+			continue
+		}
+		conjunto[info.ID] = info
+		h.host.Peerstore().AddAddrs(info.ID, info.Addrs, peerAddrTTL)
+	}
+
+	bootstrap := make([]peer.AddrInfo, 0, len(conjunto))
+	for _, info := range conjunto {
+		if len(info.Addrs) == 0 {
+			continue
+		}
+		bootstrap = append(bootstrap, info)
+	}
+
 	if len(bootstrap) == 0 {
-		h.logf("no peers to bootstrap the distributed hash table from yet; " +
-			"discovery will use local broadcast and the addresses in the net conf " +
-			"until there is somebody to ask")
+		// Esto no es un fallo y no se va a decir como si lo fuera. Una red nueva
+		// empieza sin nadie, y el nodo tiene que arrancar igualmente para poder ser
+		// encontrado por los demas: si se negara a arrancar, nadie lo encontraria
+		// nunca y la red no empezaria.
+		h.logf("nobody to ask yet, so the table starts empty and this node waits to be " +
+			"found: it announces itself on the local network and answers whoever asks")
 	}
 
 	routing, err := dht.New(ctx, h.host, dht.BootstrapPeers(bootstrap...))
@@ -200,10 +279,143 @@ func (h *Host) startDHT(ctx context.Context) error {
 			h.logf("the distributed hash table did not start: %v", err)
 			return
 		}
-		h.logf("on the distributed hash table as %s", routing.PeerID())
+		h.logf("on the distributed hash table as %s, seeded with %d peers", routing.PeerID(), len(bootstrap))
 	}()
 
+	h.dialSeeds(ctx)
+	h.watchPeers(ctx)
+
 	return nil
+}
+
+// dialSeeds keeps trying to reach the peers it was told about, for as long as
+// the node runs.
+//
+// One attempt at startup is not enough, and the reason is not that dialing is
+// flaky. It is that the other machine is very likely not up yet: two people
+// start two machines at the same time, or one starts after the other has given
+// up, and a node that asked once and then forgot is a node that stays alone
+// until somebody happens to restart both. So a seed is retried until it answers,
+// with the wait growing each time so that a machine that is genuinely gone costs
+// progressively less.
+func (h *Host) dialSeeds(ctx context.Context) {
+	pendientes := h.book.all()
+	for _, info := range h.bootstrap {
+		pendientes = append(pendientes, info)
+	}
+	if len(pendientes) == 0 {
+		return
+	}
+
+	go func() {
+		vistos := make(map[peer.ID]bool, len(pendientes))
+		espera := 2 * time.Second
+
+		for {
+			quedan := 0
+			for _, info := range pendientes {
+				if info.ID == h.host.ID() || len(info.Addrs) == 0 {
+					continue
+				}
+				if h.host.Network().Connectedness(info.ID) == network.Connected {
+					vistos[info.ID] = true
+					continue
+				}
+				quedan++
+				if vistos[info.ID] {
+					// It was reached before and is not any more. Somebody
+					// went away, and the one thing worth doing is looking
+					// for it again rather than waiting to be asked.
+					h.logf("lost contact with %s, looking for it again", info.ID)
+					vistos[info.ID] = false
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				if err := h.host.Connect(ctx, info); err != nil {
+					h.logf("could not reach %s to ask it for the others: %v", info.ID, err)
+					continue
+				}
+				h.logf("reached %s to ask it for the others", info.ID)
+				vistos[info.ID] = true
+				quedan--
+			}
+
+			if quedan == 0 {
+				espera = 2 * time.Second
+			} else if espera < time.Minute {
+				espera *= 2
+			}
+			if espera > time.Minute {
+				espera = time.Minute
+			}
+
+			t := time.NewTimer(espera)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+		}
+	}()
+}
+
+// watchPeers keeps the address book up to date, which is the whole point of it:
+// a peer seen now is a peer that can be found after a restart.
+func (h *Host) watchPeers(ctx context.Context) {
+	guardar := func() {
+		for _, id := range h.host.Peerstore().Peers() {
+			if id == h.host.ID() {
+				continue
+			}
+			h.book.remember(id, h.host.Peerstore().Addrs(id))
+		}
+		if err := h.book.save(); err != nil {
+			h.logf("the address book could not be written: %v", err)
+		}
+	}
+
+	// La version de Notify que hay aqui no devuelve un tirador para cancelar, asi
+	// que la suscripcion se queda hasta que el contexto se cierra. Es lo bastante:
+	// el aviso de conexion solo sirve para escribir en el libro, y un libro al
+	// que se deje de escribir tras cancelar el host ya no sirve para nada.
+	h.host.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(_ network.Network, c network.Conn) {
+			h.book.remember(c.RemotePeer(), []ma.Multiaddr{c.RemoteMultiaddr()})
+		},
+		DisconnectedF: func(_ network.Network, c network.Conn) {
+			h.book.remember(c.RemotePeer(), []ma.Multiaddr{c.RemoteMultiaddr()})
+		},
+	})
+
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				guardar()
+				return
+			case <-t.C:
+				guardar()
+			}
+		}
+	}()
+}
+
+// recordKnownPeers puts the address book back into the peer store at startup.
+func (h *Host) recordKnownPeers() {
+	for _, info := range h.book.all() {
+		if info.ID == h.host.ID() {
+			continue
+		}
+		h.host.Peerstore().AddAddrs(info.ID, info.Addrs, peerAddrTTL)
+	}
 }
 
 // startMDNS announces this node on the local network, so that two machines on

@@ -10,6 +10,8 @@ package discovery
 // healthy and reaches nobody. TCP is the floor that always exists.
 
 import (
+	"strconv"
+
 	"fmt"
 
 	tcp "github.com/libp2p/go-libp2p/p2p/transport/tcp"
@@ -27,23 +29,31 @@ var tcpTransport = tcp.NewTCPTransport
 // and a node that only listened on one would be invisible to whoever only has
 // the other.
 func listenAddrs(port int) ([]ma.Multiaddr, error) {
-	if port == 0 {
-		// Any port, chosen by the system. This is what a node behind NAT wants:
-		// it has no use for a particular number, and taking whatever is free
-		// removes a whole class of "why will it not start".
-		return []ma.Multiaddr{
-			ma.StringCast("/ip6/::/tcp/0"),
-			ma.StringCast("/ip6/::/udp/0/quic-v1"),
-		}, nil
+	// The wildcard is written out for both families on purpose. Listening only on
+	// the IPv6 wildcard looks like it covers everything, and on most machines it
+	// does, because a v6 socket that is not v6-only also answers on v4. But that
+	// is a property of the machine, not of the code, and where the kernel or a
+	// tunnel has turned v4-mapped addressing off, a node listening only on the v6
+	// wildcard is a node nobody can reach at any of its IPv4 addresses. The
+	// symptom is a peer that announces fine, answers on localhost, and is
+	// invisible to the machine that was told exactly where to find it.
+	//
+	// So both families are asked for, and the system answers with whichever ones
+	// this machine actually has. Asking is cheap; guessing wrong is not.
+	patrones := []string{
+		"/ip4/0.0.0.0/tcp/" + strconv.Itoa(port),
+		"/ip6/::/tcp/" + strconv.Itoa(port),
+		"/ip4/0.0.0.0/udp/" + strconv.Itoa(port) + "/quic-v1",
+		"/ip6/::/udp/" + strconv.Itoa(port) + "/quic-v1",
 	}
 
-	tcpAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip6/::/tcp/%d", port))
-	if err != nil {
-		return nil, fmt.Errorf("cannot build the tcp listen address for port %d: %w", port, err)
+	out := make([]ma.Multiaddr, 0, len(patrones))
+	for _, patron := range patrones {
+		addr, err := ma.NewMultiaddr(patron)
+		if err != nil {
+			return nil, fmt.Errorf("cannot build the listen address %s: %w", patron, err)
+		}
+		out = append(out, addr)
 	}
-	quicAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip6/::/udp/%d/quic-v1", port))
-	if err != nil {
-		return nil, fmt.Errorf("cannot build the quic listen address for port %d: %w", port, err)
-	}
-	return []ma.Multiaddr{tcpAddr, quicAddr}, nil
+	return out, nil
 }

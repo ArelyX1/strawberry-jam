@@ -30,7 +30,7 @@ func writeKit(t *testing.T, count int) string {
 	t.Cleanup(func() { genesisPath = prev })
 
 	dir := filepath.Join(t.TempDir(), "kit")
-	if err := writeNetworkKit(dir, count); err != nil {
+	if err := writeNetworkKit(dir, count, nil); err != nil {
 		t.Fatalf("kit: %v", err)
 	}
 	return dir
@@ -326,7 +326,7 @@ func chdir(t *testing.T, dir string) {
 // the network was quietly one validator short.
 func TestEveryValidatorGetsItsOwnPort(t *testing.T) {
 	dir := t.TempDir()
-	if err := writeNetworkKit(dir, 4); err != nil {
+	if err := writeNetworkKit(dir, 4, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -366,7 +366,7 @@ func TestEveryValidatorGetsItsOwnPort(t *testing.T) {
 // override it passes will fight with the file the node reads.
 func TestTheLaunchCommandAgreesWithTheValidatorSet(t *testing.T) {
 	dir := t.TempDir()
-	if err := writeNetworkKit(dir, 3); err != nil {
+	if err := writeNetworkKit(dir, 3, nil); err != nil {
 		t.Fatal(err)
 	}
 	launch, err := os.ReadFile(filepath.Join(dir, "LEVANTAR.txt"))

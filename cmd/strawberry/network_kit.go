@@ -16,7 +16,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	ma "github.com/multiformats/go-multiaddr"
 	"time"
 
 	"github.com/eigerco/strawberry/internal/jamtime"
@@ -92,7 +95,42 @@ func mustGetwd() string {
 	return dir
 }
 
-func writeNetworkKit(dir string, count int) error {
+// meshEntry es una direccion de malla y el validador al que pertenece.
+type meshEntry struct {
+	Index int
+	Addr  string
+}
+
+// parseMeshEntries lee el valor de --mesh.
+//
+// Una entrada que no se entiende se rechaza aqui y no al arrancar el nodo, que es
+// donde se nota: un nodo que no encuentra a nadie parece una red rota, y en
+// realidad lo que esta mal es un signo de menos en un fichero.
+func parseMeshEntries(texto string) ([]meshEntry, error) {
+	var salida []meshEntry
+	for _, parte := range strings.Split(texto, ",") {
+		parte = strings.TrimSpace(parte)
+		if parte == "" {
+			continue
+		}
+		idx, addr, ok := strings.Cut(parte, "=")
+		if !ok {
+			return nil, fmt.Errorf("una entrada de --mesh deberia ser indice=direccion, y es %q", parte)
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(idx))
+		if err != nil {
+			return nil, fmt.Errorf("el indice de --mesh deberia ser un numero, y es %q", idx)
+		}
+		limpia := strings.TrimSpace(addr)
+		if _, err := ma.NewMultiaddr(limpia); err != nil {
+			return nil, fmt.Errorf("la direccion de --mesh para el validador %d no es una multiaddr: %w", n, err)
+		}
+		salida = append(salida, meshEntry{Index: n, Addr: limpia})
+	}
+	return salida, nil
+}
+
+func writeNetworkKit(dir string, count int, mesh []meshEntry) error {
 	if count <= 0 {
 		count = 3
 	}
@@ -127,7 +165,7 @@ func writeNetworkKit(dir string, count int) error {
 	// left for --net-conf or for the node to announce. Keys are the identity
 	// and do not depend on where the node ends up.
 	validatorsPath := filepath.Join(dir, "validators.json")
-	if err := writeValidators(validatorsPath, count); err != nil {
+	if err := writeValidators(validatorsPath, count, mesh); err != nil {
 		return err
 	}
 
@@ -180,21 +218,27 @@ func nowTimeslot(slotSecs int) int64 {
 	return int64(elapsed.Seconds()) / int64(slotSecs)
 }
 
-func writeValidators(path string, count int) error {
+func writeValidators(path string, count int, mesh []meshEntry) error {
 	// The field names and shapes here are the ones the loader actually reads.
 	// The public key is ed25519_pub and not ed25519_public, and the private half
 	// is written under both seed and ed25519_private so that either spelling
 	// works: getting either wrong does not fail to load, it fails later and
 	// cryptographically, which is a far worse way to find out.
 	type entry struct {
-		Name       string `json:"name"`
-		Index      int    `json:"index"`
-		Seed       string `json:"seed"`
-		Ed25519Prv string `json:"ed25519_private"`
-		Ed25519Pub string `json:"ed25519_pub"`
-		IP         string `json:"ip"`
-		Port       int    `json:"port"`
+		Name       string   `json:"name"`
+		Index      int      `json:"index"`
+		Seed       string   `json:"seed"`
+		Ed25519Prv string   `json:"ed25519_private"`
+		Ed25519Pub string   `json:"ed25519_pub"`
+		IP         string   `json:"ip"`
+		Port       int      `json:"port"`
+		Mesh       []string `json:"mesh,omitempty"`
 	}
+	porIndice := make(map[int][]string, len(mesh))
+	for _, m := range mesh {
+		porIndice[m.Index] = append(porIndice[m.Index], m.Addr)
+	}
+
 	out := make([]entry, 0, count)
 	for i := 0; i < count; i++ {
 		priv, pub, err := devnet.DevValidatorKey(i)
@@ -208,6 +252,7 @@ func writeValidators(path string, count int) error {
 			Seed:       seedHex,
 			Ed25519Prv: seedHex,
 			Ed25519Pub: "0x" + hex.EncodeToString(pub),
+			Mesh:       porIndice[i],
 			// The IPv6 wildcard, not a blank address. A blank one leaves the
 			// validator state without a usable declaration and the node dies at
 			// startup with "not an IPv6 address", which is a poor first thing to
@@ -283,9 +328,19 @@ func writeLaunch(path string, count int) error {
 
 	add("On a machine holding more than one node, give each its own index and its\n")
 	add("own data directory, and start them at the same time.\n\n")
-	add("The nodes find each other on the local network by themselves, and reach\n")
-	add("the ones on other networks through the relay. There are no addresses to\n")
-	add("write down anywhere.\n\n")
+	add("Nodes on the same network find each other by themselves, and once they have\n")
+	add("met, they remember each other, so a restart needs nothing written down.\n\n")
+	add("Two nodes on two different networks cannot find each other on their own,\n")
+	add("because before they have spoken neither one knows where the other is.\n")
+	add("Somebody has to introduce them once. Write the address of each machine\n")
+	add("into the \"mesh\" list of its validator in validators.json, or pass it with\n")
+	add("--mesh when you generate the kit, and from then on they keep each other\n")
+	add("without being told anything again:\n\n")
+	add("   ./strawberry -init-genesis ./red -validator-count 2 \\\n")
+	add("     -mesh '0=/ip4/DIRECCION_LOCAL/tcp/40334,1=/ip4/192.0.2.4/tcp/40335'\n\n")
+	add("One working address out of the two is enough, which is the whole point:\n")
+	add("there is no address in that list that has to stay up for the network to\n")
+	add("keep running.\n\n")
 	add("Check that they agree:\n\n")
 	add("   curl -s -X POST -H 'content-type: application/json' \\\n")
 	add("     -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"jam_getHeader\",\"params\":[null]}' \\\n")

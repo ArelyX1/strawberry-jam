@@ -24,6 +24,8 @@ import (
 	"github.com/eigerco/strawberry/pkg/discovery"
 	"github.com/eigerco/strawberry/pkg/log"
 	"github.com/eigerco/strawberry/pkg/network/node"
+	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 var version = "0.1.0-dev"
@@ -40,7 +42,17 @@ type FullValidatorInfo struct {
 	IP         string `json:"ip"`
 	Port       int    `json:"port"`
 	Ed25519Pub string `json:"ed25519_pub"`
-	Ed25519Prv string `json:"ed25519_private"`
+
+	// Mesh are the addresses where this validator's peer-to-peer host can be
+	// reached, written as libp2p multiaddrs.
+	//
+	// They are optional and the network works without them, because local
+	// discovery and the address book each cover part of it. They exist because
+	// two machines on two different networks have to be introduced once, and this
+	// is where that first introduction is written down. Any of them being enough
+	// is the point: there is no address here that has to keep working.
+	Mesh       []string `json:"mesh,omitempty"`
+	Ed25519Prv string   `json:"ed25519_private"`
 }
 
 type AppConfig struct {
@@ -153,6 +165,7 @@ func main() {
 		chainSpec          string
 		isValidator        bool
 		initGenesisDir     string
+		meshFlag           string
 		nodeName           string
 		telemetryURL       string
 		portOverride       int
@@ -191,12 +204,27 @@ func main() {
 		"write a ready-to-share network kit into this directory (genesis with the current "+
 			"genesisTimeslot, a validator set, an appconfig and a one-line launch command per "+
 			"node) and exit; copy the directory to every machine, then run the command it prints")
+	flag.StringVar(&meshFlag, "mesh", "",
+		"mesh addresses for the first contact between networks, as "+
+			"index=multiaddr pairs separated by commas; for example "+
+			"1=/ip4/203.0.113.4/tcp/40335. They are optional: the local network and "+
+			"what the node remembers from earlier runs cover the rest")
 	flag.BoolVar(&help, "help", false, "show help")
 	flag.Parse()
 
 	if initGenesisDir != "" {
-		if err := writeNetworkKit(initGenesisDir, flagValidatorCount); err != nil {
-			log.Internal.Fatal().Err(err).Msg("network kit write failed")
+		mesh, err := parseMeshEntries(meshFlag)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if err := writeNetworkKit(initGenesisDir, flagValidatorCount, mesh); err != nil {
+			// El logger todavia no esta puesto ahi, asi que un Fatal aqui
+			// terminaria con codigo 1 y sin decir por que, que es la peor
+			// forma de fallar: un kit que no se escribe parece un kit que no
+			// se pidio.
+			fmt.Fprintf(os.Stderr, "network kit write failed: %v\n", err)
+			os.Exit(1)
 		}
 		return
 	}
@@ -473,10 +501,25 @@ func main() {
 	// lo que permite que dos maquinas en redes distintas formen una sola red
 	// sin configuracion previa.
 	if len(devValidators) > 1 {
+		// La identidad de la malla sale de la clave de validador, no de una
+		// generada al azar. Asi cualquier nodo puede calcular el identificador de
+		// los demas a partir del genesis sin haber hablado con ellos, que es lo
+		// que hace posible que dos maquinas se encuentren sin un tercero que las
+		// presente.
+		identidad, err := discovery.IdentityFromValidatorKey(vkeys.EdPub)
+		if err != nil {
+			log.Internal.Warn().Err(err).
+				Msg("the mesh identity could not be derived from the validator key, so this " +
+					"node will use a generated one: other nodes will have to be told where " +
+					"it is, and it will still work on the local network")
+		}
+
 		discoveryHost, err := discovery.Start(ctx, discovery.Options{
-			DataDir: discoveryDataDir(dataDir, int(index)),
-			Port:    discoveryPortFor(portOverride),
-			Relay:   true,
+			DataDir:   discoveryDataDir(dataDir, int(index)),
+			Port:      discoveryPortFor(portOverride),
+			Relay:     true,
+			Identity:  identidad,
+			Bootstrap: bootstrapFromValidators(vs),
 			Logf: func(format string, args ...any) {
 				log.Internal.Info().Msgf(format, args...)
 			},
@@ -640,4 +683,59 @@ func connectToNeighbours(ctx context.Context, n *node.Node) {
 			}
 		}
 	}
+}
+
+// bootstrapFromValidators turns the optional mesh addresses in the validator set
+// into seeds for the discovery table.
+//
+// They are the answer to "how does a node on one network learn about a node on
+// another the very first time", and the only thing that can answer it: before two
+// machines have spoken, nobody knows where the other one is. After that the
+// address book takes over, and after a restart nothing has to be written down at
+// all.
+//
+// A malformed address is skipped rather than fatal. One bad line in a hand
+// edited file must not stop a node that could otherwise reach nine other
+// machines.
+func bootstrapFromValidators(vs []FullValidatorInfo) []peer.AddrInfo {
+	salida := make([]peer.AddrInfo, 0, len(vs))
+
+	for _, v := range vs {
+		if len(v.Mesh) == 0 {
+			continue
+		}
+		pub, err := decodeHex(v.Ed25519Pub)
+		if err != nil {
+			continue
+		}
+		id, err := discovery.PeerIDFromValidatorKey(pub)
+		if err != nil {
+			continue
+		}
+
+		addrs := make([]ma.Multiaddr, 0, len(v.Mesh))
+		for _, texto := range v.Mesh {
+			addr, err := ma.NewMultiaddr(strings.TrimSpace(texto))
+			if err != nil {
+				log.Internal.Warn().Err(err).
+					Str("address", texto).
+					Str("validator", v.Name).
+					Msg("a mesh address in the validator set does not parse and is being ignored")
+				continue
+			}
+			addrs = append(addrs, addr)
+		}
+		if len(addrs) == 0 {
+			continue
+		}
+		salida = append(salida, peer.AddrInfo{ID: id, Addrs: addrs})
+	}
+
+	if len(salida) > 0 {
+		log.Internal.Info().
+			Int("seeds", len(salida)).
+			Msg("the validator set carries mesh addresses, so this node does not have to be " +
+				"told where the others are")
+	}
+	return salida
 }
