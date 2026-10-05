@@ -27,6 +27,11 @@ import (
 
 var version = "0.1.0-dev"
 
+// genesisPath is the economy this run uses. It is a package variable rather than
+// a local because --init-genesis stamps the same economy into the kit it
+// writes, and the two have to be the same one.
+var genesisPath string
+
 type FullValidatorInfo struct {
 	Index      uint   `json:"index"`
 	Name       string `json:"name"`
@@ -146,13 +151,13 @@ func main() {
 		finalize           bool
 		chainSpec          string
 		isValidator        bool
+		initGenesisDir     string
 		nodeName           string
 		telemetryURL       string
 		portOverride       int
 		netConfPath        string
 		rpcPort            int
 		help               bool
-		genesisPath        string
 		dataDir            string
 		bridgeWallet       string
 	)
@@ -181,8 +186,19 @@ func main() {
 	flag.StringVar(&genesisPath, "genesis", "genesis/chain-dev.json", "path to the genesis of the PAPU economy")
 	flag.StringVar(&dataDir, "data-dir", "", "directory to keep blocks and state in; empty keeps them in memory")
 	flag.StringVar(&bridgeWallet, "bridge-wallet", "", "hex Ed25519 seed of the account the node pays faucets from")
+	flag.StringVar(&initGenesisDir, "init-genesis", "",
+		"write a ready-to-share network kit into this directory (genesis with the current "+
+			"genesisTimeslot, a validator set, an appconfig and a one-line launch command per "+
+			"node) and exit; copy the directory to every machine, then run the command it prints")
 	flag.BoolVar(&help, "help", false, "show help")
 	flag.Parse()
+
+	if initGenesisDir != "" {
+		if err := writeNetworkKit(initGenesisDir, flagValidatorCount); err != nil {
+			log.Internal.Fatal().Err(err).Msg("network kit write failed")
+		}
+		return
+	}
 
 	if help {
 		flag.Usage()
@@ -414,12 +430,20 @@ func main() {
 	}
 
 	// The chain is founded at the timeslot the genesis names, so that every node
-	// of the network founds it at the same moment. A node whose genesis does not
-	// say is on its own and dates its own chain when it starts.
-	var nodeOpts []node.NodeOption
-	if genesis.GenesisTimeslot != 0 {
-		nodeOpts = append(nodeOpts, node.WithGenesisTimeslot(genesis.GenesisTimeslot))
+	// of the network founds it at the same moment. A genesis that does not say is
+	// fatal rather than defaulted: a node that dates its own chain when it starts
+	// builds a different chain from every other node, and the two then reject each
+	// other's blocks. That failure is silent and looks like a network that never
+	// syncs, so it is worth refusing to start over.
+	if genesis.GenesisTimeslot == 0 {
+		log.Internal.Fatal().
+			Str("genesis", genesisPath).
+			Msg("the genesis has no genesisTimeslot, so this node would found its own chain " +
+				"at its own start time and never agree with the rest of the network; " +
+				"add genesisTimeslot to the genesis, shared by every node, or run " +
+				"scripts/devnet-prepare.sh which writes it into the genesis it generates")
 	}
+	nodeOpts := []node.NodeOption{node.WithGenesisTimeslot(genesis.GenesisTimeslot)}
 	n, err := node.NewNodeWithStore(ctx, udpAddress, vkeys, state, index, kvStore, nodeOpts...)
 	if err != nil {
 		log.Internal.Fatal().

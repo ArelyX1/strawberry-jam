@@ -20,6 +20,26 @@ type Validator struct {
 	Metadata crypto.MetadataKey
 }
 
+// DevValidatorKey returns the deterministic key pair of validator number index,
+// both halves, so that something writing a shared validator file has to derive
+// exactly the key the node will later run with. Exposing the private half is
+// what DevValidatorKeys, which only publishes public keys, cannot do.
+func DevValidatorKey(index int) (ed25519.PrivateKey, ed25519.PublicKey, error) {
+	seed := make([]byte, ed25519.SeedSize)
+	// Every byte is the index, which keeps the keys obviously synthetic and
+	// trivially reproducible. DevValidatorKeys derives them the same way, and
+	// the two have to agree or a written file would not match the node reading it.
+	for i := range seed {
+		seed[i] = byte(index)
+	}
+	key := ed25519.NewKeyFromSeed(seed)
+	publicKey, ok := key.Public().(ed25519.PublicKey)
+	if !ok {
+		return nil, nil, fmt.Errorf("devnet: ed25519 public key has an unexpected type")
+	}
+	return key, publicKey, nil
+}
+
 // ValidatorMetadata builds the declaration of a validator listening on addr.
 func ValidatorMetadata(addr *net.UDPAddr) crypto.MetadataKey {
 	var metadata crypto.MetadataKey
@@ -89,16 +109,9 @@ const defaultP2PPort = 30333
 func DevValidatorKeys(count int, listenAddrs []string) ([]Validator, error) {
 	validators := make([]Validator, count)
 	for index := range validators {
-		seed := make([]byte, ed25519.SeedSize)
-		// Every byte is the index, which keeps the keys obviously synthetic and
-		// trivially reproducible.
-		for i := range seed {
-			seed[i] = byte(index)
-		}
-		key := ed25519.NewKeyFromSeed(seed)
-		publicKey, ok := key.Public().(ed25519.PublicKey)
-		if !ok {
-			return nil, fmt.Errorf("devnet: ed25519 public key has an unexpected type")
+		_, publicKey, err := DevValidatorKey(index)
+		if err != nil {
+			return nil, err
 		}
 
 		metadata := crypto.MetadataKey{}

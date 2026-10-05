@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -564,7 +565,7 @@ func startNode(t *testing.T, binary, dir string, rpcPort int) *nodeProcess {
 		"-rpc-port", strconv.Itoa(rpcPort),
 		"-port", strconv.Itoa(rpcPort+1000),
 		"-data-dir", filepath.Join(dir, "chain"),
-		"-genesis", filepath.Join(moduleRoot(t), "genesis", "chain-dev.json"),
+		"-genesis", stampedGenesis(t),
 		"-bridge-wallet", hex.EncodeToString(seed),
 		// One node on its own, so it writes every timeslot. Left to rotate over
 		// the chain's validator count it would write one timeslot in a thousand
@@ -788,4 +789,24 @@ func quoteFee(t *testing.T, proc *nodeProcess, weiPerRaw *big.Int) *big.Int {
 	_, parsed := quotedWei.SetString(trim0x(evm(t, proc, "eth_gasPrice")), 16)
 	require.True(t, parsed, "a price has to be a number a client can read")
 	return new(big.Int).Quo(quotedWei, weiPerRaw)
+}
+
+// stampedGenesis writes the shipped dev economy with the founding timeslot
+// filled in, which is what the node now insists on.
+//
+// The shipped genesis deliberately carries no timeslot, because a fixed value
+// would date the chain to whenever the repository was written and every node
+// would have to replay the gap. So the node has to be handed one, and a test
+// that starts a process is exactly the case where that has to happen.
+func stampedGenesis(t *testing.T) string {
+	t.Helper()
+	genesis, err := devnet.LoadGenesis(filepath.Join(moduleRoot(t), "genesis", "chain-dev.json"))
+	require.NoError(t, err)
+	genesis.GenesisTimeslot = jamtime.Timeslot(nowTimeslot(genesis.TimeslotSecs))
+
+	path := filepath.Join(t.TempDir(), "genesis.json")
+	raw, err := json.MarshalIndent(genesis, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, raw, 0o644))
+	return path
 }
