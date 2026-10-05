@@ -28,8 +28,10 @@ SALIDA=${SALIDA:-$RAIZ/dist}
 # un nodo que arranca en una maquina de pruebas y no en la del usuario es un
 # nodo que no arranca.
 BANDERSNATCH_EXT=so
-ERASURECODING_EXT=so
-FLAGS_CARGO=()
+    ERASURECODING_EXT=so
+    FLAGS_CARGO=()
+    SIMBOLOS_BS="init_ring_size get_ring_size new_secret secret_public ietf_vrf_sign ietf_vrf_verify ietf_vrf_output_hash new_ring_vrf_verifier free_ring_vrf_verifier ring_vrf_verifier_commitment ring_vrf_verifier_verify ring_vrf_output_hash new_ring_vrf_prover free_ring_vrf_prover ring_vrf_prover_sign"
+    SIMBOLOS_EC="reed_solomon_encode reed_solomon_decode"
 
 log() { printf '\n== %s\n' "$*"; }
 
@@ -56,11 +58,15 @@ configurar_objetivo() {
             BANDERSNATCH_EXT=so
             ERASURECODING_EXT=so
             FLAGS_CARGO=()
+            SIMBOLOS_BS="init_ring_size get_ring_size new_secret secret_public ietf_vrf_sign ietf_vrf_verify ietf_vrf_output_hash new_ring_vrf_verifier free_ring_vrf_verifier ring_vrf_verifier_commitment ring_vrf_verifier_verify ring_vrf_output_hash new_ring_vrf_prover free_ring_vrf_prover ring_vrf_prover_sign"
+            SIMBOLOS_EC="reed_solomon_encode reed_solomon_decode"
             ;;
         windows/amd64)
             BANDERSNATCH_EXT=dll
             ERASURECODING_EXT=dll
             FLAGS_CARGO=(--no-default-features)
+            SIMBOLOS_BS="init_ring_size get_ring_size new_secret secret_public ietf_vrf_sign ietf_vrf_verify ietf_vrf_output_hash new_ring_vrf_verifier free_ring_vrf_verifier ring_vrf_verifier_commitment ring_vrf_verifier_verify ring_vrf_output_hash new_ring_vrf_prover free_ring_vrf_prover ring_vrf_prover_sign"
+            SIMBOLOS_EC="reed_solomon_encode reed_solomon_decode"
             ;;
         darwin/amd64|darwin/arm64)
             # En un Mac no se cruza nada: es el nativo, y cargo compila para el
@@ -70,11 +76,15 @@ configurar_objetivo() {
             BANDERSNATCH_EXT=dylib
             ERASURECODING_EXT=dylib
             FLAGS_CARGO=()
+            SIMBOLOS_BS="init_ring_size get_ring_size new_secret secret_public ietf_vrf_sign ietf_vrf_verify ietf_vrf_output_hash new_ring_vrf_verifier free_ring_vrf_verifier ring_vrf_verifier_commitment ring_vrf_verifier_verify ring_vrf_output_hash new_ring_vrf_prover free_ring_vrf_prover ring_vrf_prover_sign"
+            SIMBOLOS_EC="reed_solomon_encode reed_solomon_decode"
             ;;
         windows/arm64)
             BANDERSNATCH_EXT=dll
             ERASURECODING_EXT=dll
             FLAGS_CARGO=(--no-default-features)
+            SIMBOLOS_BS="init_ring_size get_ring_size new_secret secret_public ietf_vrf_sign ietf_vrf_verify ietf_vrf_output_hash new_ring_vrf_verifier free_ring_vrf_verifier ring_vrf_verifier_commitment ring_vrf_verifier_verify ring_vrf_output_hash new_ring_vrf_prover free_ring_vrf_prover ring_vrf_prover_sign"
+            SIMBOLOS_EC="reed_solomon_encode reed_solomon_decode"
             ;;
         *)
             return 1
@@ -116,22 +126,29 @@ construir_rust() {
         --target "$triple" )
 }
 
+# Fija RUTA_BS y RUTA_EC: donde va la libreria de cada crate dentro del arbol de
+# Go. Vive aparte porque los necesitan dos funciones distintas, incrustar() para
+# escribir y la comprobacion para leer, y duplicar el nombre en las dos seria
+# una forma de que se desincronicen sin que nada falle.
+destinos() {
+    RUTA_BS="internal/crypto/bandersnatch/lib/${BANDERSNATCH_LIB}.${BANDERSNATCH_EXT}"
+    RUTA_EC="internal/erasurecoding/reedsolomon/lib/${ERASURECODING_LIB}.${ERASURECODING_EXT}"
+}
+
 # Copia la libreria del objetivo donde la incrusta el binario. El nombre es el
 # que espera el fichero de ese sistema, no el que produce Rust, porque son
 # nombres distintos para la misma cosa.
 incrustar() {
     local triple=$1
 
+    destinos
     mkdir -p internal/crypto/bandersnatch/lib internal/erasurecoding/reedsolomon/lib
 
-    local destino_bs="internal/crypto/bandersnatch/lib/${BANDERSNATCH_LIB}.${BANDERSNATCH_EXT}"
-    local destino_ec="internal/erasurecoding/reedsolomon/lib/${ERASURECODING_LIB}.${ERASURECODING_EXT}"
+    cp "$(encontrar_lib bandersnatch "$BANDERSNATCH_LIB" "$BANDERSNATCH_EXT" "$triple")" "$RUTA_BS"
+    cp "$(encontrar_lib erasurecoding "$ERASURECODING_LIB" "$ERASURECODING_EXT" "$triple")" "$RUTA_EC"
 
-    cp "$(encontrar_lib bandersnatch "$BANDERSNATCH_LIB" "$BANDERSNATCH_EXT" "$triple")" "$destino_bs"
-    cp "$(encontrar_lib erasurecoding "$ERASURECODING_LIB" "$ERASURECODING_EXT" "$triple")" "$destino_ec"
-
-    printf '  incrustada %s\n' "$destino_bs"
-    printf '  incrustada %s\n' "$destino_ec"
+    printf '  incrustada %s\n' "$RUTA_BS"
+    printf '  incrustada %s\n' "$RUTA_EC"
 }
 
 # El nombre que produce Rust y el que espera el fichero de Go no son el mismo en
@@ -157,6 +174,56 @@ encontrar_lib() {
     fallar "no se encuentra $nombre.$ext para $triple en $dir:
     lo que hay es:
 $(ls -1 "$dir" 2>/dev/null | grep -E '\.(so|dylib|dll)$' || echo '  (ninguna libreria)')"
+}
+
+# Una DLL valida puede no exportar nada. dll de Windows empieza con la tabla de
+# exports vacia, y rustc no la rellena al compilar para windows-gnu, de modo que
+# se obtiene un fichero con el tamano y el aspecto correctos que no sirve para
+# nada. file lo declara PE32+ y el nodo muere en el arranque al buscar la
+# primera funcion. Esta comprobacion es la que lo detecta.
+exportar_falta() {
+    local dll=$1; shift
+    local visto
+    visto=$(python3 - "$dll" "$@" <<'PY'
+import struct, sys
+ruta = sys.argv[1]
+esperado = sys.argv[2:]
+d = open(ruta, 'rb').read()
+pe = struct.unpack_from('<I', d, 0x3c)[0]
+nsec = struct.unpack_from('<H', d, pe + 6)[0]
+optsz = struct.unpack_from('<H', d, pe + 20)[0]
+opt = pe + 24
+magic = struct.unpack_from('<H', d, opt)[0]
+edata_rva, _ = struct.unpack_from('<II', d, opt + (112 if magic == 0x20b else 96))
+secs = []
+so = opt + optsz
+for i in range(nsec):
+    b = so + 40 * i
+    secs.append((struct.unpack_from('<I', d, b + 12)[0],
+                 struct.unpack_from('<I', d, b + 8)[0],
+                 struct.unpack_from('<I', d, b + 20)[0]))
+def r2o(rva):
+    for va, vs, raw in secs:
+        if va <= rva < va + max(vs, 1) + 0x1000:
+            return raw + (rva - va)
+    return None
+faltan = list(esperado)
+if edata_rva:
+    n = r2o(edata_rva)
+    nNombres = struct.unpack_from('<I', d, n + 24)[0]
+    rNombres = r2o(struct.unpack_from('<I', d, n + 32)[0])
+    hay = set()
+    for i in range(nNombres):
+        o = r2o(struct.unpack_from('<I', d, rNombres + 4 * i)[0])
+        if o:
+            hay.add(d[o:d.index(b'\0', o)].decode())
+    faltan = [e for e in esperado if e not in hay]
+print(' '.join(faltan))
+PY
+)
+    if [ -n "$visto" ]; then
+        fallar "a $dll le faltan estas funciones: $visto"
+    fi
 }
 
 construir_un_objetivo() {
@@ -197,6 +264,29 @@ construir_un_objetivo() {
     # directorio con un binario dentro y no un binario.
     local etiqueta=${objetivo//\//-}
     local binario="$SALIDA/strawberry-$etiqueta$sufijo"
+
+    destinos
+    log "comprobando que las librerias exportan lo que el nodo busca"
+    # En Unix los simbolos se ven con nm, en Windows hay que leer la tabla de
+    # exports del PE, porque ahi una libreria puede no exportar nada sin que nada
+    # falle al compilar.
+    case "$objetivo" in
+        windows/*)
+            exportar_falta "$RUTA_BS" $SIMBOLOS_BS
+            exportar_falta "$RUTA_EC" $SIMBOLOS_EC
+            ;;
+        *)
+            for s in $SIMBOLOS_BS; do
+                nm -D --defined-only "$RUTA_BS" | grep -q " T $s\$" ||
+                    fallar "la libreria de bandersnatch no define $s"
+            done
+            for s in $SIMBOLOS_EC; do
+                nm -D --defined-only "$RUTA_EC" | grep -q " T $s\$" ||
+                    fallar "la libreria de erasure coding no define $s"
+            done
+            ;;
+    esac
+    printf '  las dos librerias exportan todo lo que el nodo busca\n'
 
     log "go para $objetivo"
     # CGO apagado a proposito: la unica cosa de C en este repositorio son las dos
