@@ -93,6 +93,12 @@ install-hooks:
 build: build-bandersnatch build-erasurecoding
 	GOOS=${GOOS} GOARCH=${GOARCH} go build -ldflags="$(LDFLAGS)" -o strawberry ./cmd/strawberry
 
+.PHONY: release
+## release: Cross builds the node for another target, native libraries included
+## release TARGET=windows/amd64
+release:
+	scripts/build-release.sh $(TARGET)
+
 .PHONY: build-conformance
 ## build-conformance: Builds the conformance tool with the tiny spec
 build-conformance: build-bandersnatch build-erasurecoding

@@ -1,64 +1,72 @@
 package bandersnatch
 
 import (
-	"C"
 	"errors"
 	"fmt"
 	"os"
 	"unsafe"
-
-	"github.com/ebitengine/purego"
 
 	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/crypto"
 	"github.com/eigerco/strawberry/internal/rustlib"
 )
 
+// Las firmas de la libreria de Rust se declaran con tipos de Go y no con cgo,
+// porque todas las llamadas pasan por purego y cgo solo aportaba aqui el ancho
+// de size_t. Sin el, el mismo fichero compila para cualquier destino con
+// CGO_ENABLED=0, que es lo que permite construir sin un compilador de C
+// cruzado.
+//
+// El coste de quitarlo es que el ancho de size_t queda fijado a 8 bytes. En un
+// destino de 32 bits el array siguiente tendria longitud negativa, que es un
+// error de compilacion aqui y no un fallo silencioso mas adelante.
+var _ [unsafe.Sizeof(uintptr(0)) - 8]struct{}
+
 var (
-	initRingSize func(ring_size C.size_t) (cerr int)
+	initRingSize func(ring_size uint64) (cerr int)
 	getRingSize  func() (ring_size uint)
-	newSecret    func(seed []byte, seedLength C.size_t, secretOut []byte) (cerr int)
+	newSecret    func(seed []byte, seedLength uint64, secretOut []byte) (cerr int)
 	secretPublic func(secret []byte, publicOut []byte) (cerr int)
 	ietfVrfSign  func(
 		secret []byte,
 		vrfInputData []byte,
-		vrfInputDataLen C.size_t,
+		vrfInputDataLen uint64,
 		auxData []byte,
-		auxDataLen C.size_t,
+		auxDataLen uint64,
 		signatureOut []byte,
 	) (cerr int)
 	ietfVrfVerify func(
 		public []byte,
 		vrfInputData []byte,
-		vrfInputDataLen C.size_t,
+		vrfInputDataLen uint64,
 		auxData []byte,
-		auxDataLen C.size_t,
+		auxDataLen uint64,
 		signature []byte,
 		outputHash []byte,
 	) (cerr int)
 	ietfVrfOutputHash         func(signature []byte, outputHashOut []byte) (cerr int)
-	newRingVrfVerifier        func(publicKeys []byte, publicKeysLength C.size_t) (ringVrfVerifier unsafe.Pointer)
+	newRingVrfVerifier        func(publicKeys []byte, publicKeysLength uint64) (ringVrfVerifier unsafe.Pointer)
 	freeRingVrfVerifier       func(ringVrfVerifier unsafe.Pointer)
 	ringVrfVerifierCommitment func(ringVrfVerifier unsafe.Pointer, commitmentOut []byte) (cerr int)
 	ringVrfVerifierVerify     func(
 		ringVrfVerifier unsafe.Pointer,
 		vrfInputData []byte,
-		vrfInputDataLen C.size_t,
+		vrfInputDataLen uint64,
 		auxData []byte,
-		auxDataLen C.size_t,
+		auxDataLen uint64,
 		commitment []byte,
 		signature []byte,
 		outputHashOut []byte,
 	) (cerr int)
 	ringVrfOutputHash func(signature []byte, outputHashOut []byte) (cerr int)
-	newRingVrfProver  func(secret []byte, publicKeys []byte, publicKeysLength C.size_t, proverIdx C.size_t) (ringVrfProver unsafe.Pointer)
+	newRingVrfProver  func(secret []byte, publicKeys []byte, publicKeysLength uint64, proverIdx uint64) (ringVrfProver unsafe.Pointer)
 	freeRingVrfProver func(ringVrfProver unsafe.Pointer)
 	ringVrfProverSign func(
 		ringVrfProver unsafe.Pointer,
 		vrfInputData []byte,
-		vrfInputDataLen C.size_t,
+		vrfInputDataLen uint64,
 		auxData []byte,
-		auxDataLen C.size_t,
+		auxDataLen uint64,
 		signatureOut []byte,
 	) (cerr int)
 )
@@ -72,29 +80,29 @@ func init() {
 	}
 
 	// Load the Rust shared library
-	lib, err := purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := rustlib.Open(libPath)
 	if err != nil {
 		fmt.Println("Failed to load bandersnatch library:", err)
 		os.Exit(1)
 	}
 
 	// Register the Rust FFI functions with Go using purego
-	purego.RegisterLibFunc(&initRingSize, lib, "init_ring_size")
-	purego.RegisterLibFunc(&getRingSize, lib, "get_ring_size")
-	purego.RegisterLibFunc(&newSecret, lib, "new_secret")
-	purego.RegisterLibFunc(&secretPublic, lib, "secret_public")
-	purego.RegisterLibFunc(&secretPublic, lib, "secret_public")
-	purego.RegisterLibFunc(&ietfVrfSign, lib, "ietf_vrf_sign")
-	purego.RegisterLibFunc(&ietfVrfVerify, lib, "ietf_vrf_verify")
-	purego.RegisterLibFunc(&ietfVrfOutputHash, lib, "ietf_vrf_output_hash")
-	purego.RegisterLibFunc(&newRingVrfVerifier, lib, "new_ring_vrf_verifier")
-	purego.RegisterLibFunc(&freeRingVrfVerifier, lib, "free_ring_vrf_verifier")
-	purego.RegisterLibFunc(&ringVrfVerifierCommitment, lib, "ring_vrf_verifier_commitment")
-	purego.RegisterLibFunc(&ringVrfVerifierVerify, lib, "ring_vrf_verifier_verify")
-	purego.RegisterLibFunc(&ringVrfOutputHash, lib, "ring_vrf_output_hash")
-	purego.RegisterLibFunc(&newRingVrfProver, lib, "new_ring_vrf_prover")
-	purego.RegisterLibFunc(&freeRingVrfProver, lib, "free_ring_vrf_prover")
-	purego.RegisterLibFunc(&ringVrfProverSign, lib, "ring_vrf_prover_sign")
+	lib.Bind(&initRingSize, "init_ring_size")
+	lib.Bind(&getRingSize, "get_ring_size")
+	lib.Bind(&newSecret, "new_secret")
+	lib.Bind(&secretPublic, "secret_public")
+	lib.Bind(&secretPublic, "secret_public")
+	lib.Bind(&ietfVrfSign, "ietf_vrf_sign")
+	lib.Bind(&ietfVrfVerify, "ietf_vrf_verify")
+	lib.Bind(&ietfVrfOutputHash, "ietf_vrf_output_hash")
+	lib.Bind(&newRingVrfVerifier, "new_ring_vrf_verifier")
+	lib.Bind(&freeRingVrfVerifier, "free_ring_vrf_verifier")
+	lib.Bind(&ringVrfVerifierCommitment, "ring_vrf_verifier_commitment")
+	lib.Bind(&ringVrfVerifierVerify, "ring_vrf_verifier_verify")
+	lib.Bind(&ringVrfOutputHash, "ring_vrf_output_hash")
+	lib.Bind(&newRingVrfProver, "new_ring_vrf_prover")
+	lib.Bind(&freeRingVrfProver, "free_ring_vrf_prover")
+	lib.Bind(&ringVrfProverSign, "ring_vrf_prover_sign")
 
 	// Initialize the ring size, it's important that this runs before calling
 	// any other functions, otherwise the ring size will initialize to a default
@@ -117,7 +125,7 @@ func getBandersnatchLibraryPath() (string, error) {
 // vectors use a ring size of 6. The ring size should match the number of
 // validators constant.
 func InitRingSize(size uint) error {
-	result := initRingSize(C.size_t(size))
+	result := initRingSize(uint64(size))
 	if result != 0 {
 		return errors.New("error initializing ring size")
 	}
@@ -131,7 +139,7 @@ func GetRingSize() uint {
 
 // Creates a new bandersnatch private key based on the provided seed.
 func NewPrivateKeyFromSeed(seed crypto.BandersnatchSeedKey) (privateKey crypto.BandersnatchPrivateKey, err error) {
-	result := newSecret(seed[:], C.size_t(len(seed)), privateKey[:])
+	result := newSecret(seed[:], uint64(len(seed)), privateKey[:])
 	if result != 0 {
 		return crypto.BandersnatchPrivateKey{}, errors.New("error generating private key")
 	}
@@ -158,9 +166,9 @@ func Sign(
 	result := ietfVrfSign(
 		secret[:],
 		vrfInputData,
-		C.size_t(len(vrfInputData)),
+		uint64(len(vrfInputData)),
 		auxData,
-		C.size_t(len(auxData)),
+		uint64(len(auxData)),
 		signature[:],
 	)
 	if result != 0 {
@@ -181,9 +189,9 @@ func Verify(
 	result := ietfVrfVerify(
 		public[:],
 		vrfInputData,
-		C.size_t(len(vrfInputData)),
+		uint64(len(vrfInputData)),
 		auxData,
-		C.size_t(len(auxData)),
+		uint64(len(auxData)),
 		signature[:],
 		outputHash[:],
 	)
@@ -217,7 +225,7 @@ func EmptyRingVerifier() (*RingVrfVerifier, error) {
 // will become padding points on the ring.
 func NewRingVerifier(publicKeys []crypto.BandersnatchPublicKey) (*RingVrfVerifier, error) {
 	flatKeys := flattenPublicKeys(publicKeys)
-	ptr := newRingVrfVerifier(flatKeys, C.size_t(len(flatKeys)))
+	ptr := newRingVrfVerifier(flatKeys, uint64(len(flatKeys)))
 	if ptr == nil {
 		return nil, errors.New("unable to create RingVrfVerifier")
 	}
@@ -281,9 +289,9 @@ func (r *RingVrfVerifier) Verify(
 	result := ringVrfVerifierVerify(
 		r.ptr,
 		vrfInputData,
-		C.size_t(len(vrfInputData)),
+		uint64(len(vrfInputData)),
 		auxData,
-		C.size_t(len(auxData)),
+		uint64(len(auxData)),
 		commitment[:],
 		signature[:],
 		outputHash[:],
@@ -303,7 +311,7 @@ type RingVrfProver struct{ ptr unsafe.Pointer }
 // bandersnatch public keys will become padding points on the ring.
 func NewRingProver(secret crypto.BandersnatchPrivateKey, publicKeys []crypto.BandersnatchPublicKey, proverIdx uint) (*RingVrfProver, error) {
 	flatKeys := flattenPublicKeys(publicKeys)
-	ptr := newRingVrfProver(secret[:], flatKeys, C.size_t(len(flatKeys)), C.size_t(proverIdx))
+	ptr := newRingVrfProver(secret[:], flatKeys, uint64(len(flatKeys)), uint64(proverIdx))
 	if ptr == nil {
 		return nil, errors.New("unable to create RingVrfProver")
 	}
@@ -332,9 +340,9 @@ func (r *RingVrfProver) Sign(vrfInputData []byte, auxData []byte) (signature cry
 	result := ringVrfProverSign(
 		r.ptr,
 		vrfInputData,
-		C.size_t(len(vrfInputData)),
+		uint64(len(vrfInputData)),
 		auxData,
-		C.size_t(len(auxData)),
+		uint64(len(auxData)),
 		signature[:],
 	)
 	if result != 0 {

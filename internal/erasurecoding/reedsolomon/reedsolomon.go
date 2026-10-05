@@ -1,7 +1,6 @@
 package reedsolomon
 
 import (
-	"C"
 	"errors"
 	"fmt"
 	"math"
@@ -9,10 +8,20 @@ import (
 	"runtime"
 	"unsafe"
 
-	"github.com/ebitengine/purego"
 	"github.com/eigerco/strawberry/internal/constants"
 	"github.com/eigerco/strawberry/internal/rustlib"
 )
+
+// Las firmas de la libreria de Rust se declaran con tipos de Go y no con cgo,
+// porque todas las llamadas pasan por purego y cgo solo aportaba aqui el ancho
+// de size_t. Sin el, el mismo fichero compila para cualquier destino con
+// CGO_ENABLED=0, que es lo que permite construir sin un compilador de C
+// cruzado.
+//
+// El coste de quitarlo es que el ancho de size_t queda fijado a 8 bytes. En un
+// destino de 32 bits el array siguiente tendria longitud negativa, que es un
+// error de compilacion aqui y no un fallo silencioso mas adelante.
+var _ [unsafe.Sizeof(uintptr(0)) - 8]struct{}
 
 const (
 	MaxShards    = 65535 // Original + Recovery shards should equal this, a limitation of the reed-solomon-simd library.
@@ -22,27 +31,27 @@ const (
 var (
 	// Note: All slice parameters use uintptr because purego on ARM64 doesn't support slices
 	reedSolomonEncode func(
-		originalShardsCount C.size_t,
-		recoveryShardsCount C.size_t,
-		shardSize C.size_t,
+		originalShardsCount uint64,
+		recoveryShardsCount uint64,
+		shardSize uint64,
 		originalShards uintptr,
-		originalShardsLen C.size_t,
+		originalShardsLen uint64,
 		recoveryShardsOut uintptr,
-		recoveryShardsLen C.size_t,
+		recoveryShardsLen uint64,
 	) (cerr int)
 
 	reedSolomonDecode func(
-		originalShardsCount C.size_t,
-		recoveryShardsCount C.size_t,
-		shardSize C.size_t,
+		originalShardsCount uint64,
+		recoveryShardsCount uint64,
+		shardSize uint64,
 		originalShards uintptr,
-		originalShardsLen C.size_t,
+		originalShardsLen uint64,
 		originalShardsIndexes uintptr,
 		recoveryShards uintptr,
-		recoveryShardsLen C.size_t,
+		recoveryShardsLen uint64,
 		recoveryShardsIndexes uintptr,
 		recoveredShards uintptr,
-		recoveredShardsLength C.size_t,
+		recoveredShardsLength uint64,
 		recoveredShardsIndexesOut uintptr,
 	) (cerr int)
 )
@@ -138,13 +147,13 @@ func (r *Encoder) Encode(
 	recoveryShardsOut := make([]byte, r.recoveryShardsCount*shardSize)
 
 	result := reedSolomonEncode(
-		C.size_t(r.originalShardsCount),
-		C.size_t(r.recoveryShardsCount),
-		C.size_t(shardSize),
+		uint64(r.originalShardsCount),
+		uint64(r.recoveryShardsCount),
+		uint64(shardSize),
 		slicePtr(flatOriginalShards),
-		C.size_t(len(flatOriginalShards)),
+		uint64(len(flatOriginalShards)),
 		slicePtr(recoveryShardsOut),
-		C.size_t(len(recoveryShardsOut)),
+		uint64(len(recoveryShardsOut)),
 	)
 
 	// Keep slices alive until after the FFI call completes
@@ -186,26 +195,26 @@ func (r *Encoder) Decode(shards [][]byte) error {
 	}
 
 	flatOriginalShards := []byte{}
-	flatOriginalShardsIndexes := []C.size_t{}
+	flatOriginalShardsIndexes := []uint64{}
 	for i, s := range shards[:r.originalShardsCount] {
 		if len(s) != 0 {
 			if len(s) != shardSize {
 				return errors.New("inconsistent shard size")
 			}
 			flatOriginalShards = append(flatOriginalShards, s...)
-			flatOriginalShardsIndexes = append(flatOriginalShardsIndexes, C.size_t(i))
+			flatOriginalShardsIndexes = append(flatOriginalShardsIndexes, uint64(i))
 		}
 	}
 
 	flatRecoveryShards := []byte{}
-	flatRecoveryShardsIndexes := []C.size_t{}
+	flatRecoveryShardsIndexes := []uint64{}
 	for i, s := range shards[r.originalShardsCount:] {
 		if len(s) != 0 {
 			if len(s) != shardSize {
 				return errors.New("inconsistent shard size")
 			}
 			flatRecoveryShards = append(flatRecoveryShards, s...)
-			flatRecoveryShardsIndexes = append(flatRecoveryShardsIndexes, C.size_t(i))
+			flatRecoveryShardsIndexes = append(flatRecoveryShardsIndexes, uint64(i))
 		}
 	}
 
@@ -213,20 +222,20 @@ func (r *Encoder) Decode(shards [][]byte) error {
 	// Shards we already have aren't restored.
 	restoredShardsCount := r.originalShardsCount - shardCountOriginal
 	restoredShards := make([]byte, restoredShardsCount*shardSize)
-	restoredShardsIndexes := make([]C.size_t, restoredShardsCount)
+	restoredShardsIndexes := make([]uint64, restoredShardsCount)
 
 	result := reedSolomonDecode(
-		C.size_t(r.originalShardsCount),
-		C.size_t(r.recoveryShardsCount),
-		C.size_t(shardSize),
+		uint64(r.originalShardsCount),
+		uint64(r.recoveryShardsCount),
+		uint64(shardSize),
 		slicePtr(flatOriginalShards),
-		C.size_t(len(flatOriginalShards)),
+		uint64(len(flatOriginalShards)),
 		slicePtrSizeT(flatOriginalShardsIndexes),
 		slicePtr(flatRecoveryShards),
-		C.size_t(len(flatRecoveryShards)),
+		uint64(len(flatRecoveryShards)),
 		slicePtrSizeT(flatRecoveryShardsIndexes),
 		slicePtr(restoredShards),
-		C.size_t(len(restoredShards)),
+		uint64(len(restoredShards)),
 		slicePtrSizeT(restoredShardsIndexes))
 
 	// Keep slices alive until after the FFI call completes
@@ -280,9 +289,9 @@ func slicePtr(s []byte) uintptr {
 	return uintptr(unsafe.Pointer(&s[0]))
 }
 
-// slicePtrSizeT returns a pointer to the first element of a C.size_t slice.
+// slicePtrSizeT returns a pointer to the first element of a uint64 slice.
 // For empty slices, returns a dummy non-null pointer (our rust implementation requires non-null).
-func slicePtrSizeT(s []C.size_t) uintptr {
+func slicePtrSizeT(s []uint64) uintptr {
 	if len(s) == 0 {
 		return uintptr(unsafe.Pointer(&struct{}{}))
 	}
@@ -298,15 +307,15 @@ func init() {
 	}
 
 	// Load the Rust shared library.
-	lib, err := purego.Dlopen(libPath, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+	lib, err := rustlib.Open(libPath)
 	if err != nil {
 		fmt.Println("Failed to load erasure coding library:", err)
 		os.Exit(1)
 	}
 
 	// Register the Rust FFI functions with Go using purego.
-	purego.RegisterLibFunc(&reedSolomonEncode, lib, "reed_solomon_encode")
-	purego.RegisterLibFunc(&reedSolomonDecode, lib, "reed_solomon_decode")
+	lib.Bind(&reedSolomonEncode, "reed_solomon_encode")
+	lib.Bind(&reedSolomonDecode, "reed_solomon_decode")
 }
 
 func getErasurecodingLibaryPath() (string, error) {

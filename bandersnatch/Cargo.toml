@@ -4,9 +4,22 @@ version = "0.1.2"
 edition = "2021"
 
 [dependencies]
-ark-vrf = { version = "0.1.1", features = ["bandersnatch", "ring", "parallel", "asm"] }
+# "asm" is not listed here because it cannot be. It arrives through the asm
+# feature below, which is on by default and has to be turned off for Windows:
+# the feature reaches sha2/asm, and sha2-asm refuses to compile for a Windows
+# target outright, with an error rather than a warning. So a Windows build asks
+# for --no-default-features and gets the portable code path instead.
+#
+# That is a change of implementation and not of result. A hash is defined by what
+# it computes, and the portable and assembly paths compute the same one, so keys
+# and proofs are the same bytes they always were. What is given up is speed.
+ark-vrf = { version = "0.1.1", features = ["bandersnatch", "ring", "parallel"] }
 hex = "0.4.3"
 libc = "0.2.161"
+
+[features]
+default = ["asm"]
+asm = ["ark-vrf/asm"]
 
 [lib]
 crate-type = ["cdylib"]

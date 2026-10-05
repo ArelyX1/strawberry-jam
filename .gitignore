@@ -5,6 +5,9 @@
 *.dylib
 *.test
 *.out
+
+# Binarios y librerias que genera scripts/build-release.sh
+dist/
 go.work
 go.work.sum
 .env
