@@ -9,6 +9,8 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -175,4 +177,66 @@ func TestKitInstructionsNameEveryFileItWrote(t *testing.T) {
 			t.Fatalf("the instructions have no launch line for validator %d", i)
 		}
 	}
+}
+
+// Every node needs a net conf, and each one has to name a different port. If two
+// nodes are told to listen on the same one, the second dies on bind; if a port
+// is not written at all, the node looks for everybody on the port in the
+// validator file, nobody is there, and the mesh is silently empty while every
+// node reports itself healthy.
+func TestKitWritesANetConfPerNodeWithDistinctPorts(t *testing.T) {
+	dir := writeKit(t, 4)
+
+	ports := map[int]string{}
+	for i := 0; i < 4; i++ {
+		path := filepath.Join(dir, netConfName(i))
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("node %d has no net conf: %v", i, err)
+		}
+		conf, err := devnet.ParseNetConf(string(raw))
+		if err != nil {
+			t.Fatalf("node %d: the net conf the kit wrote does not parse: %v", i, err)
+		}
+
+		// It has to be loadable, not merely present.
+		if conf.Listen == "" {
+			t.Fatalf("node %d: net conf has no listen address", i)
+		}
+		if len(conf.Peers) != 4 {
+			t.Fatalf("node %d: net conf knows %d peers, want 4", i, len(conf.Peers))
+		}
+		for j := 0; j < 4; j++ {
+			if _, ok := conf.Peers[uint16(j)]; !ok {
+				t.Fatalf("node %d: net conf has no address for validator %d", i, j)
+			}
+		}
+
+		// The port it listens on has to be the one its peers are told to reach.
+		listenPort := portOf(t, conf.Listen)
+		if addr, ok := conf.Peers[uint16(i)]; ok {
+			if got := portOf(t, addr); got != listenPort {
+				t.Fatalf("node %d listens on %d but its own peers entry says %d, so the "+
+					"others will not find it where it is", i, listenPort, got)
+			}
+		}
+		if other, clash := ports[listenPort]; clash {
+			t.Fatalf("nodes %s and %d are both told to listen on %d, and the second "+
+				"one to start will die on bind", other, i, listenPort)
+		}
+		ports[listenPort] = fmt.Sprintf("%d", i)
+	}
+}
+
+func portOf(t *testing.T, addr string) int {
+	t.Helper()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("address %q does not carry a port: %v", addr, err)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatalf("port %q is not a number: %v", port, err)
+	}
+	return n
 }

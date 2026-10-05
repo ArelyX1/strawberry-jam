@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/eigerco/strawberry/internal/jamtime"
@@ -27,6 +28,11 @@ import (
 // be stamped at the moment the network is created, not when the repository was
 // written.
 const defaultBaseGenesis = "genesis/chain-dev.json"
+
+// p2pPort is the port the first node listens on, and each node after it takes
+// the next one. These are the ports the net conf files name, so they have to
+// agree with the --port each node is launched with.
+const p2pPort = 30334
 
 // baseGenesisPath is where the economy to copy comes from: whatever --genesis
 // names, so that a test or a chain of one's own is the one stamped, and the
@@ -96,6 +102,21 @@ func writeNetworkKit(dir string, count int) error {
 		return err
 	}
 
+	// One net conf per node, because a net conf says where THIS node listens and
+	// where it should look for the others. Without them every node looks for
+	// everybody on the port in the validator file, nobody is listening there, and
+	// the mesh is silently empty while all the nodes look perfectly healthy.
+	//
+	// That failure is expensive: the nodes start, produce blocks, answer the RPC
+	// and say they are fine, and there is no message anywhere saying that they
+	// are all alone. Writing them here is what makes the kit work on the first
+	// try rather than the fourth.
+	for i := 0; i < count; i++ {
+		if err := writeNetConf(filepath.Join(dir, netConfName(i)), i, count); err != nil {
+			return err
+		}
+	}
+
 	launch := filepath.Join(dir, "LEVANTAR.txt")
 	if err := writeLaunch(launch, count); err != nil {
 		return err
@@ -160,6 +181,31 @@ func writeValidators(path string, count int) error {
 	return writeJSON(path, out)
 }
 
+// netConfName is the file a node's own view of the network lives in. The index
+// is in the name because a machine holding several nodes needs one per node and
+// they cannot share: each says which of them listens where.
+func netConfName(index int) string {
+	return fmt.Sprintf("net-conf-%d.conf", index)
+}
+
+// The addresses are the IPv6 wildcard and a port derived from the index. On one
+// machine that is exactly right. Across machines it is a starting point rather
+// than an answer, and that is honest: where a node is reachable depends on the
+// NAT in front of it, which is not knowable when the kit is written. Discovery
+// is what fills this in, and until it does, a machine behind NAT is set by hand.
+func writeNetConf(path string, index, count int) error {
+	port := p2pPort + index
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Where node %d listens, and where it looks for the others.\n", index)
+	fmt.Fprintf(&b, "# The port has to match the --port this node is given.\n")
+	fmt.Fprintf(&b, "listen = [::]:%d\n\n", port)
+	b.WriteString("[peers]\n")
+	for i := 0; i < count; i++ {
+		fmt.Fprintf(&b, "%d = [::]:%d\n", i, p2pPort+i)
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
 func writeLaunch(path string, count int) error {
 	var b []byte
 	add := func(format string, args ...any) {
@@ -182,6 +228,8 @@ func writeLaunch(path string, count int) error {
 		add("     --validators-file %s/validators.json \\\n", "/ruta/a/esta/carpeta")
 		add("     --genesis %s/genesis.json \\\n", "/ruta/a/esta/carpeta")
 		add("     --validator-index %d \\\n", i)
+		add("     --net-conf %s/%s \\\n", "/ruta/a/esta/carpeta", netConfName(i))
+		add("     --port %d \\\n", p2pPort+i)
 		add("     --rpc-port %d \\\n", 9944+i)
 		add("     --data-dir ./datos%d\n\n", i)
 	}
