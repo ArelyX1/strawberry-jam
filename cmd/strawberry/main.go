@@ -21,6 +21,7 @@ import (
 	"github.com/eigerco/strawberry/internal/validator"
 	"github.com/eigerco/strawberry/pkg/db/pebble"
 	"github.com/eigerco/strawberry/pkg/devnet"
+	"github.com/eigerco/strawberry/pkg/discovery"
 	"github.com/eigerco/strawberry/pkg/log"
 	"github.com/eigerco/strawberry/pkg/network/node"
 )
@@ -464,6 +465,42 @@ func main() {
 	// puede no estar arrancado todavia, y eso no puede impedir que este nodo
 	// sirva su propia cadena.
 	go connectToNeighbours(ctx, n)
+
+	// Descubrimiento. El nodo de cadena y el de descubrimiento son dos capas
+	// distintas: la cadena habla su propio transporte con los validadores que el
+	// genesis fija, y el descubrimiento averigua donde estan las maquinas sin
+	// que nadie escriba una direccion a mano. Este es el puente entre ambos, y es
+	// lo que permite que dos maquinas en redes distintas formen una sola red
+	// sin configuracion previa.
+	if len(devValidators) > 1 {
+		discoveryHost, err := discovery.Start(ctx, discovery.Options{
+			DataDir: discoveryDataDir(dataDir, int(index)),
+			Port:    discoveryPortFor(portOverride),
+			Relay:   true,
+			Logf: func(format string, args ...any) {
+				log.Internal.Info().Msgf(format, args...)
+			},
+		})
+		if err != nil {
+			// Sin descubrimiento el nodo todavia puede servir a los validadores que
+			// ya estan escritos en el net conf, asi que esto no es fatal. Decirlo
+			// alto importa mas que callarlo: si el nodo no encuentra a nadie y no
+			// se sabe por que, parece una red muerta.
+			log.Internal.Warn().Err(err).
+				Msg("peer discovery is not available, so this node will only reach the " +
+					"validators written in its net conf; it will not find any others")
+		} else {
+			defer discoveryHost.Close()
+			log.Internal.Info().
+				Str("peerID", discoveryHost.ID().String()).
+				Msg("peer discovery is running")
+			go dialDiscoveredPeers(ctx, n, discoveryHost, udpAddress.String(),
+				chainPortsFrom(listenAddrs), func(
+					format string, args ...any) {
+					log.Internal.Info().Msgf(format, args...)
+				})
+		}
+	}
 
 	// Rellenar los bloques que falten. Solo tiene sentido con pares, asi que
 	// espera a que ConnectToNeighbours haya hecho su trabajo: antes de eso el

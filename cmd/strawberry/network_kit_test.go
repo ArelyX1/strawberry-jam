@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eigerco/strawberry/pkg/devnet"
 )
@@ -239,4 +240,144 @@ func portOf(t *testing.T, addr string) int {
 		t.Fatalf("port %q is not a number: %v", port, err)
 	}
 	return n
+}
+
+// A missing genesis used to leave the search for it spinning forever, because
+// filepath.Dir(".") is "." and the walk up the tree never moved. The symptom was
+// a command that appeared to hang and wrote an empty kit, which reads as "the
+// kit does not work" rather than "the genesis is not here". This pins that it
+// answers instead.
+func TestAMissingGenesisIsReportedInsteadOfHungOn(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	old := genesisPath
+	genesisPath = ""
+	t.Cleanup(func() { genesisPath = old })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := baseGenesisPath()
+		if err == nil {
+			t.Error("a genesis that is not there was reported as found")
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("looking for a genesis that is not there did not finish; this is the " +
+			"loop that never left the working directory")
+	}
+}
+
+// The same walk has to actually find the genesis when it is in a parent of the
+// working directory, which is the case where the binary is run from a data
+// directory rather than from the repository.
+func TestAGenesisInAParentDirectoryIsFound(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "genesis"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, defaultBaseGenesis), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deep := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	chdir(t, deep)
+
+	old := genesisPath
+	genesisPath = ""
+	t.Cleanup(func() { genesisPath = old })
+
+	got, err := baseGenesisPath()
+	if err != nil {
+		t.Fatalf("the genesis two levels up was not found: %v", err)
+	}
+	want := filepath.Join(root, defaultBaseGenesis)
+	if filepath.Clean(got) != filepath.Clean(want) {
+		t.Fatalf("found %s, want %s", got, want)
+	}
+}
+
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(old) })
+}
+
+// Every validator has to have its own port, and that number has to be the same
+// one the net conf and the launch command use.
+//
+// This failed before with a fixed port in the validator set while the other two
+// files counted from p2pPort. Nothing caught it, because the launch command
+// passes --port explicitly and overwrote the wrong value on its way in. The
+// damage only appeared for a node started by hand, or by anything that does not
+// copy the launch command verbatim: it died with "address already in use" and
+// the network was quietly one validator short.
+func TestEveryValidatorGetsItsOwnPort(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeNetworkKit(dir, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "validators.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var validators []struct {
+		Index int    `json:"index"`
+		IP    string `json:"ip"`
+		Port  int    `json:"port"`
+	}
+	if err := json.Unmarshal(raw, &validators); err != nil {
+		t.Fatal(err)
+	}
+	if len(validators) != 4 {
+		t.Fatalf("the kit has %d validators, want 4", len(validators))
+	}
+
+	ports := make(map[int]int)
+	for _, v := range validators {
+		if want := p2pPort + v.Index; v.Port != want {
+			t.Errorf("validator %d has port %d, want %d", v.Index, v.Port, want)
+		}
+		if other, taken := ports[v.Port]; taken {
+			t.Errorf("validators %d and %d both have port %d, so one of them cannot start",
+				other, v.Index, v.Port)
+		}
+		ports[v.Port] = v.Index
+		if v.IP == "" {
+			t.Errorf("validator %d has no address, and a node with none dies at startup", v.Index)
+		}
+	}
+}
+
+// The launch command has to name the same port the validator set does, or the
+// override it passes will fight with the file the node reads.
+func TestTheLaunchCommandAgreesWithTheValidatorSet(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeNetworkKit(dir, 3); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := os.ReadFile(filepath.Join(dir, "LEVANTAR.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		want := fmt.Sprintf("--port %d", p2pPort+i)
+		if !strings.Contains(string(launch), want) {
+			t.Errorf("the launch command does not say %q, so this node would listen "+
+				"somewhere other than where the validator set says it does", want)
+		}
+	}
 }

@@ -39,22 +39,57 @@ const p2pPort = 30334
 // shipped dev genesis when the flag was left alone. Reaching for a path relative
 // to the working directory alone would mean the kit only ever works when it is
 // run from the repository root, which is nowhere a node actually runs.
-func baseGenesisPath() string {
+//
+// It returns an error when the genesis cannot be found, rather than a path that
+// does not exist. The difference matters: a missing genesis used to leave the
+// loop below spinning forever, because filepath.Dir(".") is ".", so the search
+// never climbed and never ended. The command appeared to hang and wrote an empty
+// kit, which reads as "the network kit does not work" instead of "you did not
+// copy the genesis".
+func baseGenesisPath() (string, error) {
 	if genesisPath != "" {
-		return genesisPath
+		if _, err := os.Stat(genesisPath); err != nil {
+			return "", fmt.Errorf("the genesis %s named by --genesis cannot be read: %w", genesisPath, err)
+		}
+		return genesisPath, nil
 	}
 	if _, err := os.Stat(defaultBaseGenesis); err == nil {
-		return defaultBaseGenesis
+		return defaultBaseGenesis, nil
 	}
 	// Walked up from the working directory: the binary sits in the repository
 	// root's parent at most, and the genesis is a few levels down from it.
-	for dir := "."; dir != "/" && dir != "."; dir = filepath.Dir(dir) {
+	//
+	// The walk starts from the absolute working directory rather than from "."
+	// on purpose. filepath.Dir(".") is ".", so a walk that started at "." would
+	// compare "." with itself, decide it had reached the top, and stop after
+	// checking one path. Going up from an absolute path is the only way the
+	// parent of a directory is ever a different string.
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("cannot work out the working directory to look for %s in: %w", defaultBaseGenesis, err)
+	}
+	for {
 		candidate := filepath.Join(dir, defaultBaseGenesis)
 		if _, err := os.Stat(candidate); err == nil {
-			return candidate
+			return candidate, nil
 		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
 	}
-	return defaultBaseGenesis
+	return "", fmt.Errorf("the dev genesis %s was not found from the working directory %s; "+
+		"run from the repository, or name the genesis to copy with --genesis",
+		defaultBaseGenesis, mustGetwd())
+}
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "unknown"
+	}
+	return dir
 }
 
 func writeNetworkKit(dir string, count int) error {
@@ -68,7 +103,12 @@ func writeNetworkKit(dir string, count int) error {
 		return fmt.Errorf("cannot create %s: %w", dir, err)
 	}
 
-	base, err := devnet.LoadGenesis(baseGenesisPath())
+	path, err := baseGenesisPath()
+	if err != nil {
+		return err
+	}
+
+	base, err := devnet.LoadGenesis(path)
 	if err != nil {
 		return fmt.Errorf("the base genesis is not usable: %w", err)
 	}
@@ -174,8 +214,15 @@ func writeValidators(path string, count int) error {
 			// hand someone setting up a network. Every machine can listen on
 			// ::, and a machine behind NAT gets its reachable address from what
 			// its peers announce rather than from a value baked in here.
-			IP:   "::",
-			Port: 30334,
+			IP: "::",
+			// The port is derived from the index, and it has to be. A single
+			// port written here looks right until two nodes are launched without
+			// --port, at which point the second one dies with "address already in
+			// use" and the network silently ends up one node short. The net conf
+			// and the launch command both counted from p2pPort already; this was
+			// the one place that did not, so the validator set disagreed with
+			// every other file about where anybody listens.
+			Port: p2pPort + i,
 		})
 	}
 	return writeJSON(path, out)
