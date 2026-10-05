@@ -11,7 +11,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/multiformats/go-multiaddr"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 func TestChainPortsComeFromTheValidatorSet(t *testing.T) {
@@ -51,7 +51,7 @@ func TestAnAddressWithoutAUsablePortIsDropped(t *testing.T) {
 // chain to a port on somebody else's node, which is where the connection opens
 // and carries nothing.
 func TestARelayedAddressIsNotTreatedAsAMachine(t *testing.T) {
-	relayed, err := multiaddr.NewMultiaddr(
+	relayed, err := ma.NewMultiaddr(
 		"/ip4/1.2.3.4/tcp/4001/p2p-circuit/p2p/12D3KooWFake")
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +60,7 @@ func TestARelayedAddressIsNotTreatedAsAMachine(t *testing.T) {
 		t.Fatalf("a relayed path was taken for a machine at %s", ip)
 	}
 
-	direct, err := multiaddr.NewMultiaddr("/ip4/192.168.1.20/udp/30340/quic-v1")
+	direct, err := ma.NewMultiaddr("/ip4/192.168.1.20/udp/30340/quic-v1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestARelayedAddressIsNotTreatedAsAMachine(t *testing.T) {
 // An address with an IP but no transport tells us a machine exists and nothing
 // about how to reach it.
 func TestAnAddressWithNoTransportIsNotAMachine(t *testing.T) {
-	addr, err := multiaddr.NewMultiaddr("/ip4/10.0.0.5")
+	addr, err := ma.NewMultiaddr("/ip4/10.0.0.5")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,4 +135,58 @@ func TestChainPortsSurviveWildcardAddresses(t *testing.T) {
 	if _, _, err := net.SplitHostPort("[::]:30340"); err != nil {
 		t.Fatalf("the address form the kit writes does not parse: %v", err)
 	}
+}
+
+// A machine answers on every address it has, and the chain counts a validator
+// once per session. Handing it all of a machine's addresses therefore turns one
+// validator into several peers, and the count moves about on its own as
+// addresses come and go, which reads as a validator joining or leaving.
+func TestOneAddressIsChosenPerMachine(t *testing.T) {
+	addrs := []ma.Multiaddr{
+		mustAddr(t, "/ip6/::1/udp/4001/quic-v1"),
+		mustAddr(t, "/ip4/127.0.0.1/udp/4001/quic-v1"),
+		mustAddr(t, "/ip4/192.168.1.20/udp/4001/quic-v1"),
+	}
+
+	got, ok := bestHostFor(addrs)
+	if !ok {
+		t.Fatal("a machine with usable addresses produced none")
+	}
+	if got != "192.168.1.20" {
+		t.Fatalf("chose %s; a loopback address is only right for the machine that owns it", got)
+	}
+}
+
+// When every address is a loopback, as on a machine that has nothing else, the
+// loopback is still the right answer: it reaches that machine and nothing else
+// does.
+func TestALoopbackIsUsedWhenThereIsNothingElse(t *testing.T) {
+	addrs := []ma.Multiaddr{
+		mustAddr(t, "/ip6/::1/udp/4001/quic-v1"),
+		mustAddr(t, "/ip4/127.0.0.1/udp/4001/quic-v1"),
+	}
+	got, ok := bestHostFor(addrs)
+	if !ok || !isLoopback(got) {
+		t.Fatalf("chose %q, %v; want a loopback address", got, ok)
+	}
+}
+
+// Relayed paths are not machines, so a peer known only by relay gives nothing to
+// dial.
+func TestAPeerKnownOnlyByRelayGivesNoAddress(t *testing.T) {
+	addrs := []ma.Multiaddr{
+		mustAddr(t, "/ip4/1.2.3.4/tcp/4001/p2p-circuit/p2p/12D3KooWFake"),
+	}
+	if got, ok := bestHostFor(addrs); ok {
+		t.Fatalf("a peer reachable only by relay gave %s to dial", got)
+	}
+}
+
+func mustAddr(t *testing.T, text string) ma.Multiaddr {
+	t.Helper()
+	addr, err := ma.NewMultiaddr(text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return addr
 }

@@ -29,7 +29,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/multiformats/go-multiaddr"
+	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/eigerco/strawberry/pkg/discovery"
 	"github.com/eigerco/strawberry/pkg/network/node"
@@ -125,14 +125,19 @@ func dialDiscoveredPeers(
 	}
 }
 
-// discoveredHosts is the set of machines discovery knows about, as bare IP
-// addresses and without ports.
+// discoveredHosts is one address per machine discovery knows about.
 //
-// The port is dropped on purpose. It is the discovery port, and the chain needs
-// a different one, so keeping it here would only invite the mistake of dialling
-// it. Relayed addresses are dropped for the same reason and a harder one: a path
-// through somebody else's node is not a machine on this network, and there is
-// nothing to connect to.
+// One, not all of them. A machine answers on every address it has, so taking
+// them all means opening a session to the same validator once per address: the
+// node then counts one validator as several peers, and the count moves about as
+// addresses come and go. Nothing catches it, because every one of those sessions
+// is a real connection to a real validator, and the network still agrees on its
+// chain. The cost is paid later, when a peer count that changes on its own is
+// read as a validator joining or leaving.
+//
+// The address chosen is the one most likely to be the right one to hand to
+// somebody else: an address outside the loopback, because a loopback address is
+// only ever right for the machine that owns it.
 func discoveredHosts(h *discovery.Host) []string {
 	var out []string
 	seen := make(map[string]bool)
@@ -141,16 +146,43 @@ func discoveredHosts(h *discovery.Host) []string {
 		if id == h.ID() {
 			continue
 		}
-		for _, addr := range h.Libp2p().Peerstore().Addrs(id) {
-			ip, ok := directIP(addr)
-			if !ok || seen[ip] {
-				continue
-			}
-			seen[ip] = true
-			out = append(out, ip)
+		best, ok := bestHostFor(h.Libp2p().Peerstore().Addrs(id))
+		if !ok || seen[best] {
+			continue
 		}
+		seen[best] = true
+		out = append(out, best)
 	}
 	return out
+}
+
+// bestHostFor picks the address of one peer worth giving to the chain.
+func bestHostFor(addrs []ma.Multiaddr) (string, bool) {
+	fallback, haveFallback := "", false
+
+	for _, addr := range addrs {
+		ip, ok := directIP(addr)
+		if !ok {
+			continue
+		}
+		if !isLoopback(ip) {
+			return ip, true
+		}
+		if !haveFallback {
+			fallback, haveFallback = ip, true
+		}
+	}
+	return fallback, haveFallback
+}
+
+// isLoopback reports whether an address only means something on the machine that
+// owns it.
+func isLoopback(ip string) bool {
+	if ip == "::1" || ip == "127.0.0.1" || ip == "localhost" {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.IsLoopback()
 }
 
 // directIP reads the IP out of an address that is on this machine's own network,
@@ -160,13 +192,13 @@ func discoveredHosts(h *discovery.Host) []string {
 // machine exists and nothing about how to reach it, and treating it as a machine
 // to knock on spends a connection attempt on every poll for a host that discovery
 // has merely heard a rumour about.
-func directIP(addr multiaddr.Multiaddr) (string, bool) {
-	if _, err := addr.ValueForProtocol(multiaddr.P_CIRCUIT); err == nil {
+func directIP(addr ma.Multiaddr) (string, bool) {
+	if _, err := addr.ValueForProtocol(ma.P_CIRCUIT); err == nil {
 		return "", false
 	}
 
 	transported := false
-	for _, code := range []int{multiaddr.P_UDP, multiaddr.P_QUIC_V1, multiaddr.P_TCP} {
+	for _, code := range []int{ma.P_UDP, ma.P_QUIC_V1, ma.P_TCP} {
 		if _, err := addr.ValueForProtocol(code); err == nil {
 			transported = true
 			break
@@ -176,10 +208,10 @@ func directIP(addr multiaddr.Multiaddr) (string, bool) {
 		return "", false
 	}
 
-	if value, err := addr.ValueForProtocol(multiaddr.P_IP4); err == nil {
+	if value, err := addr.ValueForProtocol(ma.P_IP4); err == nil {
 		return value, true
 	}
-	if value, err := addr.ValueForProtocol(multiaddr.P_IP6); err == nil {
+	if value, err := addr.ValueForProtocol(ma.P_IP6); err == nil {
 		return value, true
 	}
 	return "", false
