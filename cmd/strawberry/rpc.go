@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +40,19 @@ type rpcServer struct {
 	// listenAddr is the address this node is reachable on. It is passed in
 	// because the transport keeps no accessor for its own address.
 	listenAddr string
+	// rpcAddr is the address the RPC server itself listens on (e.g. ":9944").
+	// It is stored so network_map can tell callers what port to reach this
+	// node's RPC on, without guessing.
+	rpcAddr string
+	// validatorIndex is this node's position in the validator set. It is set
+	// after construction because startRPCServer runs before the producer knows
+	// which index this node got.
+	validatorIndex uint16
+	// validators is the validator set this node was given (--validators-file).
+	// network_map lists the whole set with its configured P2P addresses, so a
+	// web panel can show who is supposed to be in the network and mark who is
+	// actually connected, even for validators that are currently down.
+	validators []FullValidatorInfo
 	// startedAt is when this process came up, which is what uptime has to be
 	// measured from. It is not the chain's age: a node replays from genesis, so
 	// the chain is much older than the process serving it.
@@ -398,6 +413,7 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 				"papucoin_chainParams", "papucoin_balance", "papucoin_supply",
 				"papucoin_submit", "papucoin_faucet",
 				"jam_getTelemetry", "jam_getWorks", "jam_getBlockLog", "jam_joinAccumulate",
+				"network_map",
 			},
 		}}
 	case "system_chain":
@@ -450,6 +466,8 @@ func (s *rpcServer) handleRequest(req rpcReq, subCh chan<- subscribeEvent, subID
 			out = append(out, s.listenAddr)
 		}
 		return &rpcResp{JSONRPC: "2.0", ID: id, Result: out}
+	case "network_map":
+		return &rpcResp{JSONRPC: "2.0", ID: id, Result: s.networkMap()}
 	case "chain_getBlockHash":
 		s.mu.RLock()
 		hash := s.latestHash
@@ -629,4 +647,129 @@ func (s *rpcServer) papucoinCall(req rpcReq) *rpcResp {
 		return &rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32000, Message: err.Error()}}
 	}
 	return &rpcResp{JSONRPC: "2.0", ID: req.ID, Result: result}
+}
+
+// rpcPort parses the listening port out of the RPC address. The address is
+// ":9944" or "0.0.0.0:9944"; the port is what a caller outside this process
+// needs to reach this node's RPC.
+func (s *rpcServer) rpcPort() int {
+	for i := len(s.rpcAddr) - 1; i >= 0; i-- {
+		if s.rpcAddr[i] == ':' {
+			var port int
+			if _, err := fmt.Sscanf(s.rpcAddr[i+1:], "%d", &port); err == nil {
+				return port
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
+// networkMap is what a web panel calls to see the network without being told
+// where it is. It reports this node and the validator set it was given, with
+// each validator's configured P2P address and whether this node is connected
+// to it. The RPC port of peers has to be found by trying ports: a node never
+// hears its peer's RPC port, only its P2P one, so the panel derives candidates
+// from the RPC port of this node and the standard devnet offset.
+func (s *rpcServer) networkMap() map[string]interface{} {
+	self := map[string]interface{}{
+		"name":            s.nodeName,
+		"version":         s.nodeVersion,
+		"chain":           s.chainName,
+		"listenAddresses": []string{},
+		"rpcPort":         s.rpcPort(),
+		"validatorIndex":  s.validatorIndex,
+		"connected":       true,
+	}
+	if s.listenAddr != "" {
+		self["listenAddresses"] = []string{s.listenAddr}
+	}
+
+	live := make(map[uint16]peerState)
+	if s.node != nil {
+		for _, p := range s.node.GetAllPeers() {
+			st := peerState{connected: true}
+			if p.BAnnouncer != nil {
+				st.announcing = true
+			}
+			// Prefer the peer's known validator index; fall back to matching
+			// the key, because not every connection carries its index.
+			if p.ValidatorIndex != nil {
+				st.validatorIndex = *p.ValidatorIndex
+			} else {
+				pub := strings.ToLower(hexKey(p.Ed25519Key))
+				for _, v := range s.validators {
+					// validators.json spells the keys with a 0x prefix.
+					configured := strings.TrimPrefix(strings.ToLower(v.Ed25519Pub), "0x")
+					if pub == configured {
+						st.validatorIndex = uint16(v.Index)
+						break
+					}
+				}
+			}
+			// The observed source of the connection is the peer's real address,
+			// which is what a panel on another network needs to reach it. The
+			// configured address in the validator set is often "::" ("any local
+			// interface"), which tells no one where the node actually is.
+			if p.Address != nil {
+				st.observedHost = p.Address.IP.String()
+			}
+			live[st.validatorIndex] = st
+		}
+	}
+
+	peers := make([]interface{}, 0, len(s.validators))
+	for _, v := range s.validators {
+		vIdx := uint16(v.Index)
+		host := addrHost(v.IP, v.Port)
+		if lv, ok := live[vIdx]; ok && lv.observedHost != "" && lv.observedHost != "<nil>" {
+			host = lv.observedHost
+		}
+		entry := map[string]interface{}{
+			"validatorIndex": v.Index,
+			"name":           v.Name,
+			// The configured P2P port with the address this node actually sees
+			// the peer on when it is connected: stable, and in the right place.
+			"p2pAddress": fmt.Sprintf("%s:%d", host, v.Port),
+			"connected":  live[vIdx].connected,
+		}
+		if live[vIdx].announcing {
+			entry["announcing"] = true
+		}
+		if vIdx == s.validatorIndex {
+			entry["self"] = true
+		}
+		peers = append(peers, entry)
+	}
+
+	return map[string]interface{}{
+		"self":           self,
+		"peers":          peers,
+		"validatorCount": len(s.validators),
+	}
+}
+
+type peerState struct {
+	connected      bool
+	announcing     bool
+	validatorIndex uint16
+	observedHost   string
+}
+
+// addrHost turns an IPv6 placeholder or address into something usable in a URL
+// host. "::" becomes the empty host, because that means "any local address". A
+// bare "::1" is wrapped in brackets the way URLs require.
+func addrHost(ip string, port int) string {
+	if ip == "" || ip == "::" {
+		return "127.0.0.1"
+	}
+	if strings.Contains(ip, ":") {
+		return "[" + ip + "]"
+	}
+	return ip
+}
+
+// hexKey renders an ed25519 public key the way validators.json spells it.
+func hexKey(key []byte) string {
+	return hex.EncodeToString(key)
 }

@@ -593,6 +593,12 @@ func main() {
 	rpcSrv := startRPCServer(rpcAddr, nodeName, chainName, version,
 		n.BlockService.Store, n.BlockService, n, udpAddress.String())
 	rpcSrv.papucoin = newPapucoinHandlers(runtime, rpcSrv)
+	// The RPC server is built before the producer knows which validator this
+	// node is, so the two values network_map reports are filled in here. The
+	// validator set it lists comes from the same file the node was given.
+	rpcSrv.rpcAddr = rpcAddr
+	rpcSrv.validatorIndex = index
+	rpcSrv.validators = vs
 
 	// Start block producer
 	startBlockProducer(n.BlockService, runtime, index, uint16(authorCount),
