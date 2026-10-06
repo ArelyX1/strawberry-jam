@@ -154,6 +154,23 @@ messages are sent.
 | macOS | amd64, arm64 | Pendiente de compilar |
 | Windows | amd64, arm64 | Pendiente de compilar |
 
+### Dónde están los binarios compilados
+
+Tras `./scripts/build-release.sh linux/amd64` o `./scripts/build-release.sh windows/amd64`:
+
+```
+node-go/dist/strawberry-linux-amd64      (51 MB, Linux amd64)
+node-go/dist/strawberry-windows-amd64.exe (54 MB, Windows amd64)
+```
+
+Son archivos autocontenidos: no necesitan Go, ni cargo, ni nada más. Se copian
+tal cual a la otra máquina y se ejecutan. En Linux puede que haya que darles
+permiso de ejecución (`chmod +x`). En Windows no hace falta nada.
+
+Para llevar la red a otra PC se copia **el binario más la carpeta del kit**
+(`--init-genesis`): `genesis.json`, `validators.json`, `appconfig.json` y los
+`net-conf-N.conf`. Sin el kit el nodo no sabe qué red es y se niega a arrancar.
+
 El de Linux/amd64 no depende de nada externo salvo la libc: las dos librerías
 nativas (bandersnatch y Reed-Solomon) van incrustadas en el binario y se
 desembeben en tiempo de ejecución.
