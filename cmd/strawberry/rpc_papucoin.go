@@ -114,6 +114,22 @@ func (s *papucoinHandlers) balance(params []json.RawMessage) (map[string]interfa
 	if err != nil {
 		return nil, err
 	}
+
+	// The nonce reported here has to be the one a signature can actually use.
+	//
+	// The state stores a nonce per account and a brand new account has none, so
+	// the raw read answers 0. But the chain refuses anything below the first
+	// nonce the genesis names, which is 1, so a wallet that did the obvious thing
+	// with this answer, read the nonce and signed the next item with it, would be
+	// rejected by papucoin_submit with "item nonce is 0, but the first nonce is
+	// 1". Nothing about that error points back here, where the mistake is.
+	//
+	// So the number reported is floored at the first nonce. It is the nonce to
+	// sign with, which is the only thing a client can do with it.
+	if first := s.runtime.Params().FirstNonce; nonce < first {
+		nonce = first
+	}
+
 	decimals := s.runtime.Genesis().Service.Decimals
 	return map[string]interface{}{
 		"address":  address,

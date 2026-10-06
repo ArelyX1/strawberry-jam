@@ -25,6 +25,7 @@ func main() {
 	seedHex := flag.String("seed", "", "hex Ed25519 seed of the sending account")
 	method := flag.String("method", "transfer", "transfer, faucet, welcome, mint or burn")
 	to := flag.String("to", "", "recipient address")
+	imprimir := flag.Bool("address", false, "print the chain address of this seed and exit")
 	amount := flag.String("amount", "", "amount, as a decimal string")
 	nonce := flag.Uint64("nonce", 0, "nonce of this item for this sender")
 	flag.Parse()
@@ -39,6 +40,19 @@ func main() {
 	}
 	if len(seed) != ed25519.SeedSize {
 		fail(fmt.Errorf("seed is %d bytes, want %d", len(seed), ed25519.SeedSize))
+	}
+
+	// Una cartera necesita saber cual es su propia direccion antes de poder
+	// cobrar o gastar, y derivarla a mano es donde se cometen los errores de
+	// formato. Aqui sale de la misma funcion que usa la cadena.
+	if *imprimir {
+		public := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+		direccion, err := papucoin.AddressFromPublicKey(public)
+		if err != nil {
+			fail(err)
+		}
+		fmt.Println(direccion)
+		return
 	}
 
 	item := papucoin.Item{

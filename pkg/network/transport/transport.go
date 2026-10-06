@@ -14,8 +14,34 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// MaxIdleTimeout defines the maximum duration a connection can be idle before timing out
-const MaxIdleTimeout = 30 * time.Minute
+// MaxIdleTimeout defines the maximum duration a connection can be idle before timing out.
+//
+// A node that is killed without closing its sockets leaves nothing behind for the
+// others to notice, so the only way to find out that a peer is gone is to fail to
+// hear from it. Left at half an hour, that is half an hour of a peer counted as
+// connected while every stream opened on it fails.
+//
+// The other end reconnects long before that. OnConnection has to choose between
+// the connection it already holds and the one that just arrived, and it can only
+// recognise the old one as gone once its context is cancelled, which happens when
+// the idle timeout expires. So for half an hour both ends can keep the dead
+// connection and close the live one, and the node that came back stays behind
+// forever with no path to catch up.
+//
+// The keep-alive below is what makes a short timeout safe. It sends traffic on a
+// connection that is otherwise quiet, so this is how long a connection may go
+// unheard before it counts as dead, not how long it may go unused. It cannot be
+// made much shorter than this: a node that is importing or working through a slot
+// can go this long without saying anything, and a timeout that expires then tears
+// down a perfectly healthy connection, which leaves the nodes reconnecting over
+// each other and refusing each other's streams.
+const MaxIdleTimeout = 60 * time.Second
+
+// KeepAlivePeriod is how often a connection sends a packet purely to be heard
+// from, which is what lets the idle timeout above mean "this peer has gone" rather
+// than "nobody has spoken in a while". Two missed periods are what mark a
+// connection dead, so this sits well under MaxIdleTimeout.
+const KeepAlivePeriod = 20 * time.Second
 
 // InitialPacketSize is the largest packet a connection sends before it has measured
 // the path.
@@ -132,6 +158,7 @@ func (t *Transport) Start() error {
 	listener, err := quic.ListenAddr(t.config.ListenAddr.AddrPort().String(), tlsConfig, &quic.Config{
 		EnableDatagrams:   true,
 		MaxIdleTimeout:    MaxIdleTimeout,
+		KeepAlivePeriod:   KeepAlivePeriod,
 		InitialPacketSize: InitialPacketSize,
 	})
 	if err != nil {
@@ -172,6 +199,7 @@ func (t *Transport) Connect(addr *net.UDPAddr) error {
 	quicConn, err := quic.DialAddr(t.ctx, addr.AddrPort().String(), tlsConf, &quic.Config{
 		EnableDatagrams:   true,
 		MaxIdleTimeout:    MaxIdleTimeout,
+		KeepAlivePeriod:   KeepAlivePeriod,
 		InitialPacketSize: InitialPacketSize,
 	})
 	if err != nil {

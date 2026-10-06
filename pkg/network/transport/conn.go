@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/eigerco/strawberry/internal/crypto/ed25519"
@@ -96,6 +97,21 @@ func (c *Conn) SetPeerKey(key ed25519.PublicKey) {
 
 func (c *Conn) QConn() *quic.Conn {
 	return c.quicConn
+}
+
+// OriginPort is the ephemeral port of the process that opened this connection.
+//
+// Los dos extremos ven el mismo numero. El que abre la conexion lo usa como
+// puerto local, y el que la acepta lo ve como puerto remoto, asi que ninguno de
+// los dos tiene que preguntarle nada al otro para saberlo. Es lo que permite
+// desempatar dos conexiones a un mismo vecino de una forma que ambos calculan
+// igual, cosa que el orden de llegada no da: las dos conexiones de un marcado
+// mutuo llegan en orden opuesto en cada nodo.
+func (c *Conn) OriginPort() int {
+	if c.dialed {
+		return c.quicConn.LocalAddr().(*net.UDPAddr).Port
+	}
+	return c.quicConn.RemoteAddr().(*net.UDPAddr).Port
 }
 
 // Close closes the connection and cancels all associated streams.

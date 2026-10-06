@@ -1,7 +1,6 @@
 package node
 
 import (
-	"bytes"
 	"context"
 	"strings"
 
@@ -283,11 +282,11 @@ func (n *Node) OnConnection(conn *transport.Conn) {
 	// other is holding. They end up crossed, and every announcement fails with the
 	// connection closed by the remote.
 	//
-	// What both nodes can compute the same way is the pair of ports a connection
-	// has, because each side knows its own and the peer's. The smaller pair wins,
-	// which both sides agree on without having to agree about anything else. The
-	// two connections are then dropped together, one on each node, and each is
-	// left holding a live connection the other is not closing.
+	// What both nodes can compute the same way is the ephemeral port of whoever
+	// opened each connection, which each of them holds as the same number. The
+	// smaller one wins, which both sides agree on without having to agree about
+	// anything else. The two connections are then dropped together, one on each
+	// node, and each is left holding a live connection the other is not closing.
 	if existingPeer := n.PeersSet.GetByEd25519Key(conn.PeerKey()); existingPeer != nil {
 		existing := existingPeer.ProtoConn.TConn
 		switch {
@@ -298,7 +297,7 @@ func (n *Node) OnConnection(conn *transport.Conn) {
 				log.Printf("Failed to close existing peer connection: %v", err)
 			}
 			n.PeersSet.RemovePeer(existingPeer)
-		case n.preferConnection(conn):
+		case n.preferConnection(existing, conn):
 			if err := existing.Close(); err != nil {
 				log.Printf("Failed to close existing peer connection: %v", err)
 			}
@@ -324,6 +323,36 @@ func (n *Node) OnConnection(conn *transport.Conn) {
 
 	// Add to peer set
 	n.PeersSet.AddPeer(peer)
+
+	// Y en cuanto esta conexion muera, el peer se va del conjunto.
+	//
+	// Sin esto un vecino que se apaga a lo bruto se queda contado para siempre.
+	// El conjunto es lo que se consulta para saber con quien se esta conectado,
+	// y el bucle que marca a los vecinos usa esa consulta para no marcar a uno
+	// con quien ya esta conectado. Un peer cuya conexion esta muerta sigue
+	// estando en el conjunto, asi que el nodo cree que ya lo tiene y no lo vuelve
+	// a marcar nunca. Y el nodo que vuelve no se reencuentra con nadie: cuando se
+	// ofrece de nuevo, OnConnection compara la conexion nueva con la vieja, que
+	// sigue sin estar cerrada porque el aviso de que se fue no llego, y puede
+	// acabar cerrando la nueva. El resultado es que los dos se quedan sin poder
+	// hablar y la cadena no vuelve a arrancar, sin nada que lo incite a reintentar.
+	go n.retiraAlMorir(peer)
+}
+
+// retiraAlMorir saca al peer del conjunto en cuanto su conexion se cierra.
+//
+// Solo lo saca si sigue siendo el mismo peer que hay dentro. Si mientras tanto
+// se conecto otro por el mismo nodo, ese es el que vale y este ya no: borrarlo a
+// la fuerza sin mirar dejaria al nodo sin vecino, que es justo lo contrario de lo
+// que se busca aqui.
+func (n *Node) retiraAlMorir(p *peer.Peer) {
+	<-p.ProtoConn.TConn.Context().Done()
+
+	n.peersLock.Lock()
+	defer n.peersLock.Unlock()
+	if n.PeersSet.GetByEd25519Key(p.Ed25519Key) == p {
+		n.PeersSet.RemovePeer(p)
+	}
 }
 
 // ConnectToPeer initiates a connection to a peer at the specified address.
@@ -793,14 +822,23 @@ func (n *Node) AnnounceBlock(ctx context.Context, header *block.Header, peer *pe
 // NAT, for one) makes the two numbers differ in ways neither end can correct.
 // Comparing IP addresses has the same problem one step further out.
 //
-// What both nodes hold identically is the pair of public keys, so the choice is
-// made on those. The node whose own key sorts first keeps the connection it
-// dialled and the other keeps the one it accepted, and since each end knows both
-// keys and which connection it opened itself, both arrive at the same answer and
-// are left holding the same live connection.
-func (n *Node) preferConnection(incoming *transport.Conn) bool {
-	keepDialed := bytes.Compare(n.ValidatorManager.Keys.EdPub, incoming.PeerKey()) < 0
-	return incoming.Dialed() == keepDialed
+// What decides it is the ephemeral port of whoever opened each connection, which
+// both ends hold as the same number: whoever opens it has it as its local port,
+// and whoever accepts it has it as the peer's. The smaller one wins, so the two
+// connections are dropped together, one on each node, and each is left holding a
+// live connection the other is not closing.
+//
+// That also covers the case the rule above could not. When a neighbour is killed
+// and comes back, only one new connection is ever made, because the old one is
+// dead and nobody is going to dial it again. A rule phrased in terms of "the one
+// I dialled" then has nothing to compare, both ends can land on the dead one, and
+// neither can open a stream to the other: "Application error 0x0 (remote)", the
+// node that came back stays behind, and because the dead connection was never
+// closed from this side nothing ever says so. The port of whoever opened the
+// connection needs no counterpart to be compared against, so the one connection
+// that arrived wins over the one that is on its way out.
+func (n *Node) preferConnection(existing *transport.Conn, incoming *transport.Conn) bool {
+	return incoming.OriginPort() < existing.OriginPort()
 }
 
 // RequestState implements the client side of the CE 129 State Request protocol from the JAMNP.
