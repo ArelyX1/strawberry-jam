@@ -161,6 +161,7 @@ func main() {
 		flagValidatorCount int
 		validatorsFile     string
 		fullMesh           bool
+		skipMissingAuthors bool
 		finalize           bool
 		chainSpec          string
 		isValidator        bool
@@ -187,6 +188,10 @@ func main() {
 		"the validator file: who exists and where to reach them")
 	flag.BoolVar(&fullMesh, "full-mesh", false,
 		"connect to every configured validator, not only the grid neighbours")
+	flag.BoolVar(&skipMissingAuthors, "skip-missing-authors", false,
+		"when the designated author of a timeslot does not produce within the grace period, "+
+			"the next validator in rotation writes it instead; off by default because a "+
+			"production chain should stall honestly rather than attribute a block to the wrong author")
 	flag.BoolVar(&finalize, "finalize", false,
 		"record blocks as finalized after a fixed depth; off by default because a devnet has nobody to agree with")
 	flag.StringVar(&chainSpec, "chain", "dev", "chain specification")
@@ -485,6 +490,10 @@ func main() {
 			Err(err).
 			Msg("node start failed")
 	}
+	// Grid-diffusion: when a block is received, re-announce it to this node's
+	// grid neighbours so the block reaches the grid hop by hop instead of
+	// flooding to every peer.
+	n.SetupGridDiffusion()
 
 	// Conectar con los validadores vecinos. Hasta ahora no se llamaba nunca, de
 	// modo que el nodo escuchaba y nunca ": conectaba con nadie, y por eso dos
@@ -587,6 +596,7 @@ func main() {
 
 	// Start block producer
 	startBlockProducer(n.BlockService, runtime, index, uint16(authorCount),
+		skipMissingAuthors,
 		func(hash crypto.Hash, num uint, h block.Header) {
 			rpcSrv.updateBlock(hash, num, h)
 		}, rpcSrv.markRebuilt, n, ctx)

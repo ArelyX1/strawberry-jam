@@ -57,6 +57,18 @@ type blockProducer struct {
 	// aheadAskedAt is when this node may next ask its peers for the chain that is
 	// ahead of its own tip.
 	aheadAskedAt time.Time
+	// skipMissingAuthors enables writing a timeslot whose designated author has
+	// not produced within the grace period. The suplente is the next validator
+	// in rotation: (slot + 1) % authorCount. Only that one node writes, so
+	// there is no fork from several nodes all claiming the skipped slot.
+	skipMissingAuthors bool
+	// slotWaitStart records when this node first noticed a foreign timeslot had
+	// no block, so the grace period can be measured.
+	slotWaitStart map[jamtime.Timeslot]time.Time
+	// consecutiveSkips counts how many times each author has been skipped in a
+	// row. A cap keeps a permanently dead author from producing an endless run
+	// of skipped slots; the chain stalls honestly instead.
+	consecutiveSkips map[uint16]int
 }
 
 // How long past the end of a timeslot a node keeps waiting for the block the
@@ -84,6 +96,12 @@ const (
 	// block its timeslot has to build on. Long enough that holding a timeslot is
 	// not a busy loop.
 	authorRetryWait = 2 * time.Second
+
+	// skipGracePeriod is how long a foreign timeslot is given to its designated
+	// author before the suplente steps in. One timeslot's worth of patience: long
+	// enough that a slow author is not replaced, short enough that a dead one
+	// does not stall the chain visibly.
+	skipGracePeriod = foreignSlotGrace + 2*authorRetryWait
 )
 
 // announceRetryWait is how long a peer is left alone after an announcement to it
@@ -101,16 +119,19 @@ const announceRetryWait = 10 * time.Second
 // before it starts producing. A node that cannot rebuild its own state is not a
 // node that is a little late: it is a node that would write a second chain over the
 // first, so it stops instead.
-func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorIndex uint16, authorCount uint16, onBlock func(crypto.Hash, uint, block.Header), onReady func(), net *p2pnode.Node, ctx context.Context) *blockProducer {
+func startBlockProducer(bs *chain.BlockService, runtime *devnet.Runtime, authorIndex uint16, authorCount uint16, skipMissingAuthors bool, onBlock func(crypto.Hash, uint, block.Header), onReady func(), net *p2pnode.Node, ctx context.Context) *blockProducer {
 	bp := &blockProducer{
-		net:             net,
-		ctx:             ctx,
-		announceBackoff: map[string]time.Time{},
-		bs:              bs,
-		runtime:         runtime,
-		authorIndex:     authorIndex,
-		authorCount:     authorCount,
-		onBlock:         onBlock,
+		net:               net,
+		ctx:               ctx,
+		announceBackoff:   map[string]time.Time{},
+		bs:                bs,
+		runtime:           runtime,
+		authorIndex:       authorIndex,
+		authorCount:       authorCount,
+		skipMissingAuthors: skipMissingAuthors,
+		slotWaitStart:     map[jamtime.Timeslot]time.Time{},
+		consecutiveSkips:  map[uint16]int{},
+		onBlock:           onBlock,
 	}
 	time.Sleep(500 * time.Millisecond)
 
@@ -272,6 +293,29 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 	for {
 		bp.waitFor(slot)
 
+		// Skip a timeslot whose designated author has not produced within the
+		// grace period. The suplente is (slot+1)%authorCount: one deterministic
+		// node, so several candidates cannot all write the same slot and fork
+		// the chain. The block carries the suplente's own BlockAuthorIndex, so
+		// the seal verifies against its key and no escrow is needed.
+		//
+		// This check sits before the chain-behind wait on purpose. The wait
+		// `continue`s when the chain has not reached this timeslot and this node
+		// is not the author — which is exactly the suplente's situation. Moving
+		// the check after the wait left the suplente stuck: it waited for a
+		// chain that was one slot behind, and the slot it was waiting on was
+		// one the dead author was supposed to write, so nobody moved the chain
+		// and the wait never ended. shouldSkipSlot still requires atTipFor, so
+		// the suplente cannot write on a parent it does not have; when the
+		// chain is more than one slot behind, atTipFor is false and the wait
+		// above runs as before.
+		if bp.skipMissingAuthors && !bp.timeslotHasABlock(slot) && bp.shouldSkipSlot(slot) {
+			bp.noteSkip(slot)
+			bp.produceBlock(slot)
+			slot++
+			continue
+		}
+
 		// Before anything else: if the chain has fallen behind the timeslot this
 		// loop is on, do not move. Wait for it to arrive.
 		//
@@ -323,6 +367,7 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 		// being done, and never wrote the block. Nobody else writes it either,
 		// because there is one author per timeslot, so the chain stopped there.
 		bp.catchUpBehind()
+
 		switch {
 		case authorFor(slot, bp.authorIndex, bp.authorCount) && !bp.timeslotHasABlock(slot):
 			// Not writing and moving on is what stopped the chain. The next
@@ -393,6 +438,7 @@ func (bp *blockProducer) run(slot jamtime.Timeslot) {
 				continue
 			}
 			aviso = true
+			bp.consecutiveSkips[designatedAuthorFor(slot, bp.authorCount)] = 0
 			bp.produceBlock(slot)
 		default:
 			// Not this node's timeslot, so it has to wait for the block the author
@@ -775,6 +821,89 @@ func authorFor(slot jamtime.Timeslot, validatorIndex, authorCount uint16) bool {
 		authorCount = constants.NumberOfValidators
 	}
 	return uint64(slot)%uint64(authorCount) == uint64(validatorIndex)
+}
+
+// designatedAuthorFor returns the index of the validator whose turn it is to
+// write the given timeslot.
+func designatedAuthorFor(slot jamtime.Timeslot, authorCount uint16) uint16 {
+	if authorCount == 0 {
+		authorCount = constants.NumberOfValidators
+	}
+	return uint16(uint64(slot) % uint64(authorCount))
+}
+
+// suplenteFor returns the index of the validator that takes over a timeslot
+// whose designated author has not produced. It is the next validator in
+// rotation, so exactly one node qualifies and there is no fork.
+func suplenteFor(slot jamtime.Timeslot, authorCount uint16) uint16 {
+	if authorCount == 0 {
+		authorCount = constants.NumberOfValidators
+	}
+	return uint16(uint64(slot+1) % uint64(authorCount))
+}
+
+// shouldSkipSlot reports whether this node should write a timeslot whose
+// designated author has not produced within the grace period.
+//
+// The conditions, in order of cost:
+//   - the flag is on and there is more than one author;
+//   - the timeslot has no block (checked by the caller);
+//   - this node is the suplente and not the designated author;
+//   - the grace period has passed since this node first noticed the slot was
+//     empty;
+//   - the state has caught up to the parent timeslot, so the block can build on
+//     what everyone else is building on;
+//   - the designated author has not been skipped more than authorCount times in
+//     a row, which keeps a permanently dead author from producing an endless run
+//     of skipped slots.
+func (bp *blockProducer) shouldSkipSlot(slot jamtime.Timeslot) bool {
+	if bp.authorCount <= 1 {
+		return false
+	}
+	designated := designatedAuthorFor(slot, bp.authorCount)
+	if bp.authorIndex == designated {
+		return false
+	}
+	if bp.authorIndex != suplenteFor(slot, bp.authorCount) {
+		return false
+	}
+	if bp.consecutiveSkips[designated] > int(bp.authorCount) {
+		log.Internal.Error().
+			Uint64("slot", uint64(slot)).
+			Uint16("deadAuthor", designated).
+			Msg("dead author exceeded skip cap; chain will stall on this timeslot")
+		return false
+	}
+	// The node must be at the tip for this timeslot's parent before the grace
+	// period even starts. A node that is still catching up walks through old
+	// timeslots quickly; starting the timer then would let it decide an author
+	// is dead while the block is still in flight from a healthy peer.
+	if !bp.atTipFor(slot) {
+		return false
+	}
+	now := time.Now()
+	start, ok := bp.slotWaitStart[slot]
+	if !ok {
+		bp.slotWaitStart[slot] = now
+		return false
+	}
+	if now.Sub(start) < skipGracePeriod {
+		return false
+	}
+	return true
+}
+
+// noteSkip records that a timeslot was skipped, so the consecutive-skip counter
+// and the wait-start map stay accurate.
+func (bp *blockProducer) noteSkip(slot jamtime.Timeslot) {
+	designated := designatedAuthorFor(slot, bp.authorCount)
+	bp.consecutiveSkips[designated]++
+	delete(bp.slotWaitStart, slot)
+	log.Internal.Info().
+		Uint64("slot", uint64(slot)).
+		Uint16("deadAuthor", designated).
+		Uint16("suplente", bp.authorIndex).
+		Msg("skipping dead author; suplente is writing the timeslot")
 }
 
 // runForeignSlot executes the block another validator wrote for this timeslot.
@@ -1314,14 +1443,37 @@ func (bp *blockProducer) announceTipToNewPeers() {
 	go wg.Wait()
 }
 
-// announceWithBackoff tells the peers about a block, but only those that are not
-// still inside the wait that follows a failed attempt.
+// announceWithBackoff tells the peers about a block. Grid-diffusion routing is
+// tried first: the block goes only to this node's grid neighbours, and each of
+// them re-announces it to their own neighbours, so the block reaches the whole
+// grid in O(N·√N) announcements instead of the O(N²) a flood produces. When
+// too many grid neighbours are unreachable the grid is fragmented, and the
+// flood to every peer is used instead so the chain keeps moving.
 func (bp *blockProducer) announceWithBackoff(header *block.Header) {
 	peers := bp.net.GetAllPeers()
 	if len(peers) == 0 {
 		return
 	}
 
+	// Grid-diffusion first. A grid with no connected neighbours, or one where
+	// most neighbours are unreachable, is not worth walking: fall through to
+	// the flood so the block still arrives somewhere.
+	told, failed := bp.net.AnnounceBlockToGrid(bp.ctx, header)
+	if told > 0 && failed <= told {
+		log.Internal.Info().
+			Int("gridTold", told).
+			Int("gridFailed", failed).
+			Msg("announced block to grid neighbours")
+		return
+	}
+	if told > 0 {
+		log.Internal.Debug().
+			Int("gridTold", told).
+			Int("gridFailed", failed).
+			Msg("grid diffusion mostly failed; falling back to flood")
+	}
+
+	// Flood fallback: tell every peer that is not inside a backoff wait.
 	now := time.Now()
 	var due []*peer.Peer
 	for _, p := range peers {

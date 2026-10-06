@@ -82,6 +82,11 @@ type BlockAnnouncementHandler struct {
 	Announcers          map[string]*BlockAnnouncer // Maps peer keys to their respective announcers
 	requestor           BlockRequestor             // Used to request blocks after announcements
 	onBlockReceiveHooks []BlockReceiveHook         // hooks that trigger on receiving a new block, needed to start processes like assurance and auditing
+	// reannounce, when set, is called after a new block is received and stored,
+	// so the node can re-announce it to its grid neighbours. This is the
+	// diffusion half of grid-diffusion routing: the block reaches the grid
+	// hop by hop instead of flooding to every peer.
+	reannounce func(ctx context.Context, header *block.Header)
 }
 
 // NewBlockAnnouncementHandler creates a new handler with the provided block service
@@ -93,6 +98,14 @@ func NewBlockAnnouncementHandler(bs *chain.BlockService, requestor BlockRequesto
 		Announcers:   make(map[string]*BlockAnnouncer),
 		requestor:    requestor,
 	}
+}
+
+// SetReannounce installs the callback used to re-announce a received block to
+// the node's grid neighbours. It must be called before connections arrive.
+func (bh *BlockAnnouncementHandler) SetReannounce(fn func(ctx context.Context, header *block.Header)) {
+	bh.mu.Lock()
+	defer bh.mu.Unlock()
+	bh.reannounce = fn
 }
 
 type BlockReceiveHook func(ctx context.Context, block block.Block)
@@ -130,6 +143,9 @@ type BlockAnnouncer struct {
 	requestor           BlockRequestor                   // Used to request blocks after announcements
 	peerKey             ed25519.PublicKey                // Ed25519 key of the connected peer
 	onBlockReceiveHooks []BlockReceiveHook               // hooks that trigger on receiving a new block, needed to start processes like assurance and auditing
+	// reannounce, when set, is called after a new block is received and stored,
+	// so the node can re-announce it to its grid neighbours.
+	reannounce func(ctx context.Context, header *block.Header)
 }
 
 // NewBlockAnnouncer creates a new announcer for a given stream and peer.
@@ -156,6 +172,7 @@ func (bh *BlockAnnouncementHandler) NewBlockAnnouncer(bs *chain.BlockService, ct
 		announced:           make(map[crypto.Hash]*block.Header),
 		peerLeaves:          make(map[crypto.Hash]jamtime.Timeslot),
 		onBlockReceiveHooks: bh.onBlockReceiveHooks,
+		reannounce:          bh.reannounce,
 	}
 	bh.Announcers[string(peerKey)] = ba
 	return ba
@@ -627,6 +644,13 @@ func (ba *BlockAnnouncer) processAnnouncement(content []byte) error {
 			// the hooks are being executed in separate go routines to not slow down the main block receiver
 			for _, onBlockReceiveHook := range ba.onBlockReceiveHooks {
 				go onBlockReceiveHook(ba.ctx, b)
+			}
+			// Re-announce the received block to this node's grid neighbours, so
+			// the block diffuses across the grid instead of flooding to every
+			// peer. The callback is read under the announcer's own lifetime; a
+			// nil callback simply means diffusion is not configured.
+			if ba.reannounce != nil {
+				go ba.reannounce(ba.ctx, &b.Header)
 			}
 		}
 	}

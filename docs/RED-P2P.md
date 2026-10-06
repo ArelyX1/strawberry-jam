@@ -107,20 +107,43 @@ Dos cosas que costaron tiempo y conviene no volver a descubrir:
   dentro** del item, no al lado en un sobre. Un sobre aparte se rechaza con
   `item is not a PAPU item`.
 
-## Qué pasa cuando un nodo se cae
+## What happens when a node falls
 
-La malla se sostiene con la mitad caída: los supervivientes siguen de acuerdo y
-siguen escribiendo. Cuando el que falta vuelve, se pone al día.
+The mesh holds with half of it down: the survivors stay in agreement and keep
+writing. When the missing one comes back, it catches up.
 
-Lo que **no** hay es redundancia de autoría. El turno de autoría rota por
-`timeslot % authorCount == índice`, así que si el nodo que le toca escribir está
-apagado, la cadena **espera** a que vuelva. No hay otro que escriba en su lugar.
+Authorship redundancy exists now, behind a flag. Without `--skip-missing-authors`
+the chain still waits for the dead author — that was the old behaviour and it is
+still the default. With the flag on, a designated author that has not written a
+timeslot within the grace period is skipped: the suplente `(slot+1)%authorCount`
+writes that slot itself, carrying its own `BlockAuthorIndex` in the block, so the
+seal verifies against its own key and no escrow is needed.
 
-Esto es una limitación real y hay que decirla con todas las letras: la red
-tolera que un nodo se caiga, pero **no continúa avanzando si el que cae es el
-autor de ese timeslot**. Un diseño tolerante de verdad necesita o redundancia
-de autores o rotación del conjunto de validadores (Safrole), y aquí Safrole está
-desactivado: el conjunto de validadores es fijo y está escrito en el archivo.
+The suplente is deterministic — one node per slot, so several candidates cannot
+all write the same slot and fork the chain. A cap of `authorCount` consecutive
+skips stops a fully dead mesh from producing nonsense: if that cap is exceeded,
+the node logs an error and does not skip; the chain stops honestly rather than
+writing blocks nobody can verify.
+
+When the skipped author comes back, `catchUpBehind()` pulls it to the tip and it
+resumes writing its own slots. The skip check runs before the chain-behind wait
+in the producer loop: the suplente must not wait for a chain that is one slot
+behind, because the slot it is waiting on is the one the dead author was
+supposed to write. `shouldSkipSlot` still requires `atTipFor`, so the suplente
+cannot write on a parent it does not have.
+
+## Block propagation: grid-diffusion first, flood as fallback
+
+Block announcements are sent to the grid neighbours first — the same
+deterministic ring the connection grid already builds, so propagation follows
+the topology instead of shouting at everyone. If the grid announcement tells
+failed peers, the announcer falls back to a full flood for that block. Stored
+blocks are re-announced to newly connected peers so a late joiner does not have
+to wait for the next slot to hear about what it missed.
+
+Grid-diffusion is installed at startup via `SetupGridDiffusion()`; it does not
+change the wire protocol, only the order in which the existing announcement
+messages are sent.
 
 ## Estado de los binarios
 
@@ -144,9 +167,9 @@ herramienta de construcción y el script que recorra los targets.
 
 ## Lo que no está hecho
 
-- **libp2p**: el descubrimiento entre redes distintas (DHT, *hole punching*,
-  relay) no está implementado. Hoy la red se monta con direcciones escritas a
-  mano. Es el trabajo más grande que queda.
+- **libp2p completo**: el descubrimiento entre redes distintas funciona ya
+  (`5f5f985e`), pero DHT, *hole punching* y relay no están implementados. La red
+  se monta con direcciones o con el kit `--init-genesis`.
 - **Arranque automático**: no hay unidad de systemd, ni *launchd*, ni tarea
   programada de Windows.
 - **Prueba en dos máquinas**: verificado en local, no entre dos equipos

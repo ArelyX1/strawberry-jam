@@ -62,6 +62,7 @@ type Node struct {
 	workReportRequester           *handlers.WorkReportRequester
 	WorkPackageSharingHandler     *handlers.WorkPackageSharingHandler
 	safroleTicketSubmiter         *handlers.SafroleTicketSubmiter
+	announcementHandler           *handlers.BlockAnnouncementHandler
 	currentCoreIndex              uint16
 	currentGuarantorPeers         []*peer.Peer
 	ValidatorService              validator.ValidatorService
@@ -167,6 +168,7 @@ func NewNodeWithStore(nodeCtx context.Context, listenAddr *net.UDPAddr, keys val
 	// Register what type of streams the Node will support.
 	protoManager.Registry.RegisterHandler(protocol.StreamKindBlockRequest, handlers.NewBlockRequestHandler(bs))
 	announcementHandler := handlers.NewBlockAnnouncementHandler(bs, node)
+	node.announcementHandler = announcementHandler
 
 	// Assurance hook, triggers the assurance process for the newly added guarantees from the block extrinsic (EG)
 	// iterates over each guarantee and requests the shards with self validator index
@@ -737,6 +739,75 @@ func (n *Node) AnnounceBlockToAll(ctx context.Context, header *block.Header) err
 			len(peers)-len(failures), len(peers), strings.Join(failures, "; "))
 	}
 	return nil
+}
+
+// AnnounceBlockToGrid announces a block only to this node's grid neighbours
+// rather than to every connected peer. Each neighbour that receives the block
+// re-announces it to its own grid neighbours, so the block diffuses across the
+// grid in O(N·√N) announcements instead of the O(N²) that a flood produces.
+//
+// It reports how many grid neighbours were told and how many failed. The caller
+// falls back to AnnounceBlockToAll when too many grid neighbours are unreachable,
+// which is what keeps the chain moving when the grid is fragmented.
+func (n *Node) AnnounceBlockToGrid(ctx context.Context, header *block.Header) (told int, failed int) {
+	if n.ValidatorManager == nil {
+		return 0, 0
+	}
+	neighbors, err := n.ValidatorManager.GetNeighbors()
+	if err != nil || len(neighbors) == 0 {
+		return 0, 0
+	}
+
+	n.peersLock.RLock()
+	var targets []*peer.Peer
+	for _, nb := range neighbors {
+		if p := n.PeersSet.GetByEd25519Key(nb.Ed25519); p != nil {
+			targets = append(targets, p)
+		}
+	}
+	n.peersLock.RUnlock()
+
+	for _, p := range targets {
+		if err := n.AnnounceBlock(ctx, header, p); err != nil {
+			failed++
+		} else {
+			told++
+		}
+	}
+	return told, failed
+}
+
+// GridNeighbors returns the validator keys of this node's grid neighbours.
+// It is used by the diffusion path to decide where a received block is
+// re-announced.
+func (n *Node) GridNeighbors() []crypto.ValidatorKey {
+	if n.ValidatorManager == nil {
+		return nil
+	}
+	neighbors, err := n.ValidatorManager.GetNeighbors()
+	if err != nil {
+		return nil
+	}
+	return neighbors
+}
+
+// SetupGridDiffusion installs the reannounce callback that makes a received
+// block diffuse across the grid: when the announcement handler stores a new
+// block, the callback announces it to this node's grid neighbours, and each of
+// them does the same. The result is O(N·√N) announcements per block instead of
+// the O(N²) a flood produces.
+//
+// It is safe to call more than once; the last callback wins.
+func (n *Node) SetupGridDiffusion() {
+	if n.announcementHandler == nil {
+		return
+	}
+	n.announcementHandler.SetReannounce(func(ctx context.Context, header *block.Header) {
+		told, failed := n.AnnounceBlockToGrid(ctx, header)
+		if told > 0 {
+			log.Printf("diffused received block to %d grid neighbours (%d failed)", told, failed)
+		}
+	})
 }
 
 // AnnounceBlock implements the UP 0 block announcement protocol from the JAM spec.
