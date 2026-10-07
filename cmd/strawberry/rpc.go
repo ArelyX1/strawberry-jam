@@ -53,6 +53,10 @@ type rpcServer struct {
 	// web panel can show who is supposed to be in the network and mark who is
 	// actually connected, even for validators that are currently down.
 	validators []FullValidatorInfo
+	// wwwRoot is where the web panel lives on disk (--www-dir). When set, the
+	// RPC port serves the panel too: the web is hosted by the network itself,
+	// so any node answers the page at http://<nodo>/. Empty means no web.
+	wwwRoot string
 	// startedAt is when this process came up, which is what uptime has to be
 	// measured from. It is not the chain's age: a node replays from genesis, so
 	// the chain is much older than the process serving it.
@@ -71,7 +75,7 @@ type subscribeEvent struct {
 	params interface{}
 }
 
-func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainStore *store.Chain, bs *chain.BlockService, node *p2pnode.Node, listenAddr string) *rpcServer {
+func startRPCServer(addr string, nodeName, chainName, nodeVersion, wwwDir string, chainStore *store.Chain, bs *chain.BlockService, node *p2pnode.Node, listenAddr string) *rpcServer {
 	srv := &rpcServer{
 		node:        node,
 		listenAddr:  listenAddr,
@@ -81,6 +85,7 @@ func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainS
 		nodeVersion: nodeVersion,
 		chainStore:  chainStore,
 		bs:          bs,
+		wwwRoot:     wwwDir,
 		subs:        make(map[uint]chan<- subscribeEvent),
 		rebuilt:     make(chan struct{}),
 	}
@@ -94,6 +99,12 @@ func startRPCServer(addr string, nodeName, chainName, nodeVersion string, chainS
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") == "websocket" {
 			wsServer.ServeHTTP(w, r)
+			return
+		}
+		// Con la web montada el puerto RPC también sirve la página y hace de
+		// proxy para los demás nodos, todo mismo origen.
+		if srv.wwwRoot != "" {
+			srv.handleWeb(w, r)
 			return
 		}
 		srv.handleHTTP(w, r)

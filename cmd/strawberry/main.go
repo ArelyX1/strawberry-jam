@@ -172,6 +172,7 @@ func main() {
 		portOverride       int
 		netConfPath        string
 		rpcPort            int
+		wwwDir             string
 		help               bool
 		dataDir            string
 		bridgeWallet       string
@@ -202,6 +203,9 @@ func main() {
 	flag.StringVar(&netConfPath, "net-conf", "",
 		"where the machines are: this node's own listen address and, under [peers], the address of each validator by index")
 	flag.IntVar(&rpcPort, "rpc-port", 9944, "RPC WebSocket and HTTP port")
+	flag.StringVar(&wwwDir, "www-dir", "",
+		"directory with the web panel to serve on the RPC port; empty serves no web. "+
+			"The page lives in the network: open any node and the panel is there")
 	flag.StringVar(&genesisPath, "genesis", "genesis/chain-dev.json", "path to the genesis of the PAPU economy")
 	flag.StringVar(&dataDir, "data-dir", "", "directory to keep blocks and state in; empty keeps them in memory")
 	flag.StringVar(&bridgeWallet, "bridge-wallet", "", "hex Ed25519 seed of the account the node pays faucets from")
@@ -590,7 +594,7 @@ func main() {
 
 	// Start RPC server (before block producer so it's ready for subscriptions)
 	rpcAddr := fmt.Sprintf(":%d", rpcPort)
-	rpcSrv := startRPCServer(rpcAddr, nodeName, chainName, version,
+	rpcSrv := startRPCServer(rpcAddr, nodeName, chainName, version, wwwDir,
 		n.BlockService.Store, n.BlockService, n, udpAddress.String())
 	rpcSrv.papucoin = newPapucoinHandlers(runtime, rpcSrv)
 	// The RPC server is built before the producer knows which validator this
