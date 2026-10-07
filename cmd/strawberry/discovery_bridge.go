@@ -156,8 +156,12 @@ func discoveredHosts(h *discovery.Host) []string {
 	return out
 }
 
-// bestHostFor picks the address of one peer worth giving to the chain.
+// bestHostFor picks the address of one peer worth giving to the chain: a
+// globally routable one, because that is the only kind that reaches across a
+// router; and when the peer is on the same network, the first non-loopback
+// one, because a global address is not needed where everything is on one desk.
 func bestHostFor(addrs []ma.Multiaddr) (string, bool) {
+	loopback, haveLoopback := "", false
 	fallback, haveFallback := "", false
 
 	for _, addr := range addrs {
@@ -165,14 +169,50 @@ func bestHostFor(addrs []ma.Multiaddr) (string, bool) {
 		if !ok {
 			continue
 		}
-		if !isLoopback(ip) {
+		if isLoopback(ip) {
+			if !haveLoopback {
+				loopback, haveLoopback = ip, true
+			}
+			continue
+		}
+		if isGlobalRoutable(ip) {
 			return ip, true
 		}
 		if !haveFallback {
 			fallback, haveFallback = ip, true
 		}
 	}
-	return fallback, haveFallback
+	if haveFallback {
+		return fallback, true
+	}
+	return loopback, haveLoopback
+}
+
+// isGlobalRoutable reports whether an address can be reached from another
+// network, which is what a chain port has to be knocked on when the machine is
+// not on the same local network. Private, link-local and carrier-grade
+// addresses are on this side of some router, and a knock sent to them from
+// elsewhere lands on nobody.
+func isGlobalRoutable(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	if parsed.IsLoopback() || parsed.IsPrivate() || parsed.IsLinkLocalUnicast() ||
+		parsed.IsUnspecified() {
+		return false
+	}
+	// 100.64.0.0/10 is carrier-grade NAT, which is a router the other side of
+	// which this machine cannot be reached from the internet either.
+	if v4 := parsed.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return false
+	}
+	// fc00::/7 is the IPv6 relative of private addressing, which IsPrivate
+	// does not report.
+	if parsed.To4() == nil && len(parsed) == net.IPv6len && parsed[0]&0xfe == 0xfc {
+		return false
+	}
+	return true
 }
 
 // isLoopback reports whether an address only means something on the machine that

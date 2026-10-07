@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -116,6 +117,17 @@ func (o *Options) logf(format string, args ...any) {
 // one.
 const peerAddrTTL = 24 * time.Hour
 
+// publishedAddrs are the addresses this node wants to be found at beyond the
+// ones the interfaces give it, usually a router's public address behind a UPnP
+// mapping. The host reads them on every Addrs call, and the port mapper writes
+// them once it has a forward to back them up, so an announce never claims a
+// door that is closed. The lock is because the reader and the writer are
+// different goroutines.
+type publishedAddrs struct {
+	mu    sync.RWMutex
+	addrs []ma.Multiaddr
+}
+
 // identityFile is the private key inside the data directory. The name says what
 // it is so that nobody deletes it thinking it is a cache.
 const identityFile = "p2p-identity.key"
@@ -139,6 +151,12 @@ type Host struct {
 
 	cancel context.CancelFunc
 	logf   func(format string, args ...any)
+
+	// published holds the addresses UPnP made reachable; the AddrsFactory reads
+	// it on every call. discoverPort is the libp2p port, which is what those
+	// addresses and their forwards are drawn on.
+	published    *publishedAddrs
+	discoverPort int
 }
 
 // Start brings up a host and, unless told otherwise, everything that makes it
@@ -172,6 +190,13 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 		return nil, err
 	}
 
+	// The addresses this node announces are the interface ones plus whatever
+	// the port mapper manages to open: a provider record with only private
+	// addresses is a node the shared table lists and nobody can reach. The
+	// cell is empty until UPnP answers, so nothing is claimed until there is a
+	// forward to back the claim.
+	published := &publishedAddrs{}
+
 	cfg := []libp2p.Option{
 		libp2p.Identity(priv),
 		libp2p.ListenAddrs(listen...),
@@ -184,6 +209,17 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 		libp2p.EnableNATService(),
 		libp2p.NATPortMap(),
 		libp2p.Ping(false),
+		libp2p.AddrsFactory(func(base []ma.Multiaddr) []ma.Multiaddr {
+			published.mu.RLock()
+			extra := published.addrs
+			published.mu.RUnlock()
+			if len(extra) == 0 {
+				return base
+			}
+			out := make([]ma.Multiaddr, 0, len(base)+len(extra))
+			out = append(out, base...)
+			return append(out, extra...)
+		}),
 	}
 
 	if opts.Relay {
@@ -215,6 +251,8 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 		publicRendezvous: opts.PublicRendezvous,
 		logf:             opts.Logf,
 		cancel:           cancel,
+		published:        published,
+		discoverPort:     opts.Port,
 	}
 
 	// Everything the address book holds goes back into the peer store before the
@@ -236,8 +274,8 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 	out.startMDNS(ctx)
 	go out.serveAutoNAT(ctx)
 
-	if opts.ChainPort > 0 {
-		go out.mapChainPort(ctx, opts.ChainPort)
+	if opts.ChainPort > 0 || opts.Port > 0 {
+		go out.mapPublicPorts(ctx, opts.ChainPort, opts.Port)
 	}
 	if opts.NetworkID != "" {
 		go out.rendezvousLoop(ctx)
@@ -649,6 +687,16 @@ func (h *Host) Libp2p() host.Host { return h.host }
 // Addrs are the addresses other nodes can reach this one at right now. They
 // change when the network does, which is the whole reason this package exists.
 func (h *Host) Addrs() []ma.Multiaddr { return h.host.Addrs() }
+
+// publishExternal announces that this node can be reached at the given
+// addresses, which none of its interfaces claimed. Passing nil withdraws the
+// announcement. It is what the port mapper calls once it has a forward to back
+// the addresses with, and never with one for a door that is closed.
+func (h *Host) publishExternal(addrs []ma.Multiaddr) {
+	h.published.mu.Lock()
+	h.published.addrs = addrs
+	h.published.mu.Unlock()
+}
 
 // Connect dials a peer directly. Used for the addresses that are known rather
 // than discovered, which is still how the first nodes of a network meet.

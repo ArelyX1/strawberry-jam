@@ -171,6 +171,49 @@ func TestALoopbackIsUsedWhenThereIsNothingElse(t *testing.T) {
 	}
 }
 
+// A machine behind a router advertises its local addresses and, once UPnP has
+// opened a door, the address the router gives out. The chain has to knock on
+// the second one, not the first: a local address is where the machine is not
+// reachable from another network, no matter where on the list it sits.
+func TestAGloballyRoutableAddressIsChosenForTheChain(t *testing.T) {
+	upnped := []ma.Multiaddr{
+		mustAddr(t, "/ip4/192.168.1.20/udp/40336/quic-v1"),
+		mustAddr(t, "/ip4/81.4.122.10/udp/40336/quic-v1"),
+		mustAddr(t, "/ip4/81.4.122.10/tcp/40336"),
+	}
+	got, ok := bestHostFor(upnped)
+	if !ok {
+		t.Fatal("a maschine with usable addresses produced none")
+	}
+	if got != "81.4.122.10" {
+		t.Fatalf("chose %s; the chain must be knocked on the address other networks can reach", got)
+	}
+
+	onlyPrivate := []ma.Multiaddr{
+		mustAddr(t, "/ip4/192.168.1.20/udp/40336/quic-v1"),
+		mustAddr(t, "/ip4/10.0.0.7/tcp/40336"),
+	}
+	got, ok = bestHostFor(onlyPrivate)
+	if !ok || got != "192.168.1.20" {
+		t.Fatalf("peers on the same network should use a local address, chose %q, %v", got, ok)
+	}
+}
+
+// Carrier-grade and site-local addresses cross one NAT but live behind another,
+// so they are as useless for a chain knock from elsewhere as private ones.
+func TestCarrierGradeAndSiteLocalAddressesAreNotChoosable(t *testing.T) {
+	for _, ip := range []string{"100.64.0.1", "100.127.255.254", "fc00::1", "fd12:3456::7"} {
+		if isGlobalRoutable(ip) {
+			t.Fatalf("%s was taken for globally routable", ip)
+		}
+	}
+	for _, ip := range []string{"8.8.8.8", "172.217.12.4", "2606:4700:4700::1111"} {
+		if !isGlobalRoutable(ip) {
+			t.Fatalf("%s was not taken for globally routable", ip)
+		}
+	}
+}
+
 // Relayed paths are not machines, so a peer known only by relay gives nothing to
 // dial.
 func TestAPeerKnownOnlyByRelayGivesNoAddress(t *testing.T) {

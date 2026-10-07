@@ -29,7 +29,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-var version = "0.1.2-dev"
+var version = "0.1.3-dev"
 
 // genesisPath is the economy this run uses. It is a package variable rather than
 // a local because --init-genesis stamps the same economy into the kit it
