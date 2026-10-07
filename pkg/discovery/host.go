@@ -83,14 +83,16 @@ type Options struct {
 	// written down.
 	PublicRendezvous bool
 
-	// RendezvousPeers are the peers this node expects to exist, found by
-	// identifier rather than by address.
+	// NetworkID is what identifies the chain this node belongs to, the same
+	// bytes for every machine that runs the same genesis.
 	//
-	// The chain fixes the validator set, and the peer id of every validator can
-	// be worked out from its key, so a node can be told who its partners are
-	// without being told where they are. Once the node knows who to look for, it
-	// asks the table where each of them is instead of waiting to be found.
-	RendezvousPeers []peer.ID
+	// Every node computes the same key from it, and under that key every node
+	// announces itself and reads who else is announced. That is the whole of
+	// the automatic joining: nothing lists who to look for, because the node
+	// does not join by finding known validators, it joins by telling the mesh
+	// it is here and listening for the mesh's answer. A node that computes a
+	// different key is a different chain and is never even seen.
+	NetworkID string
 
 	// ChainPort is the port the chain transport listens on. When the node sits
 	// behind a router that answers UPnP, this attempts to map that exact port to
@@ -128,9 +130,10 @@ type Host struct {
 	// publicBootstrap is the slice of published bootstrap peers the public
 	// table was seeded with, kept for the dialer that keeps reaching out.
 	publicBootstrap []peer.AddrInfo
-	// rendezvous is who this node keeps asking the table after. The ids come
-	// from the validator set, so they are known before any of them is met.
-	rendezvous []peer.ID
+	// network is the identity this node announces itself under, computed the
+	// same way on every machine of the same chain; empty means the node is on
+	// no public mesh.
+	network string
 	// publicRendezvous remembers that the shared table is a subject too.
 	publicRendezvous bool
 
@@ -208,7 +211,7 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 		host:             h,
 		book:             loadAddressBook(opts.DataDir),
 		bootstrap:        opts.Bootstrap,
-		rendezvous:       opts.RendezvousPeers,
+		network:          opts.NetworkID,
 		publicRendezvous: opts.PublicRendezvous,
 		logf:             opts.Logf,
 		cancel:           cancel,
@@ -236,7 +239,7 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 	if opts.ChainPort > 0 {
 		go out.mapChainPort(ctx, opts.ChainPort)
 	}
-	if len(opts.RendezvousPeers) > 0 {
+	if opts.NetworkID != "" {
 		go out.rendezvousLoop(ctx)
 	}
 
@@ -335,7 +338,15 @@ func (h *Host) startDHT(ctx context.Context) error {
 			"found: it announces itself on the local network and answers whoever asks")
 	}
 
-	routing, err := dht.New(ctx, h.host, dht.BootstrapPeers(bootstrap...))
+	routing, err := dht.New(ctx, h.host,
+		dht.BootstrapPeers(bootstrap...),
+		// The node answers the table as well as asking it. A membership mesh is
+		// only useful if a lookup can end on another member: a node that never
+		// holds or answers records is a node that two members could never route
+		// through, and this mesh is small, so every member answering is part of
+		// how the mesh finds itself.
+		dht.Mode(dht.ModeServer),
+	)
 	if err != nil {
 		return fmt.Errorf("cannot join the distributed hash table: %w", err)
 	}
@@ -348,11 +359,44 @@ func (h *Host) startDHT(ctx context.Context) error {
 		}
 		h.logf("on the distributed hash table as %s, seeded with %d peers", routing.PeerID(), len(bootstrap))
 	}()
+	h.warmRoutingTable(ctx)
 
 	h.dialSeeds(ctx)
 	h.watchPeers(ctx)
 
 	return nil
+}
+
+// warmRoutingTable keeps the table's address book fuller than the table would
+// keep it by itself.
+//
+// A freshly started node knows little more than its seeds, and a routing table
+// that stays that thin for the first ten minutes (which is how long the table
+// takes to refresh itself) means that between two nodes starting at the same
+// time nothing can be found: the puts reach few servers and the lookups end at
+// different ones. Staying actively involved from the first minute is what gives
+// two new machines a working table to rendezvous over while it is still new.
+func (h *Host) warmRoutingTable(ctx context.Context) {
+	go func() {
+		t := time.NewTicker(2 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				select {
+				case err := <-h.dht.RefreshRoutingTable():
+					if err != nil {
+						h.logf("the table could not be refreshed: %v", err)
+					}
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Minute):
+				}
+			}
+		}
+	}()
 }
 
 // dialSeeds keeps trying to reach the peers it was told about, for as long as
@@ -368,9 +412,6 @@ func (h *Host) startDHT(ctx context.Context) error {
 func (h *Host) dialSeeds(ctx context.Context) {
 	pendientes := h.book.all()
 	for _, info := range h.bootstrap {
-		pendientes = append(pendientes, info)
-	}
-	for _, info := range h.publicBootstrap {
 		pendientes = append(pendientes, info)
 	}
 	if len(pendientes) == 0 {

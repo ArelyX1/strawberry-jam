@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -28,7 +29,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-var version = "0.1.1-dev"
+var version = "0.1.2-dev"
 
 // genesisPath is the economy this run uses. It is a package variable rather than
 // a local because --init-genesis stamps the same economy into the kit it
@@ -426,6 +427,18 @@ func main() {
 		log.Internal.Fatal().Str("genesis", genesisPath).Err(err).Msg("genesis load failed")
 	}
 
+	// La identidad de la malla es el hash del genesis. Todos los nodos de una
+	// misma cadena lo calculan igual, y es lo unico que tiene que coincidir para
+	// que dos maquinas en redes distintas se encuentren: bajo esa clave cada nodo
+	// se anuncia y lee quien mas esta anunciado. Nada de direcciones, nada de
+	// listas de candidatos: el nodo se une a la red, no busca a nadie.
+	genesisRaw, err := os.ReadFile(genesisPath)
+	if err != nil {
+		log.Internal.Fatal().Str("genesis", genesisPath).Err(err).Msg("genesis read failed")
+	}
+	genesisSum := sha256.Sum256(genesisRaw)
+	networkID := hex.EncodeToString(genesisSum[:])
+
 	// How many validators this network has comes from the validator file, not
 	// from a constant compiled into the binary. The constant is the real chain's
 	// size, which is nothing like the handful of nodes a devnet actually runs, and
@@ -540,14 +553,14 @@ func main() {
 			Relay:     true,
 			Identity:  identidad,
 			Bootstrap: bootstrapFromValidators(vs),
-			// La tabla publica y el bucle de presentacion son lo que hace que dos
-			// maquinas en redes distintas se encuentren sin que nadie escriba una
-			// direccion: cada nodo sabe con quien tiene que estar (los validadores
-			// del genesis) y le pregunta a la tabla por cada uno de ellos. El puerto
-			// de la cadena se mapea por UPnP para que el que encuentra a la otra
-			// maquina pueda llamar al transporte de la cadena, no solo a libp2p.
+			// La tabla publica y el paso de lista son lo que hace que dos maquinas
+			// en redes distintas se encuentren sin que nadie escriba una direccion:
+			// cada nodo de la misma cadena calcula la misma clave (del genesis) y
+			// bajo ella se anuncia y lee quien mas esta. El puerto de la cadena se
+			// mapea por UPnP para que el que encuentra a la otra maquina pueda
+			// llamar al transporte de la cadena, no solo a libp2p.
 			PublicRendezvous: true,
-			RendezvousPeers:  rendezvousFromValidators(vs, int(index)),
+			NetworkID:        networkID,
 			ChainPort:        udpAddress.Port,
 			Logf: func(format string, args ...any) {
 				log.Internal.Info().Msgf(format, args...)
@@ -776,39 +789,8 @@ func bootstrapFromValidators(vs []FullValidatorInfo) []peer.AddrInfo {
 	return salida
 }
 
-// rendezvousFromValidators is who this node will keep asking the shared table
-// after: every other validator in the set.
-//
-// No address is involved in that list. The id of a validator is worked out from
-// its key, which the genesis fixes, so the node knows who to look for without
-// ever being told where they are. Validators without a public key are left out,
-// because there is nothing to work an id from.
-func rendezvousFromValidators(vs []FullValidatorInfo, me int) []peer.ID {
-	salida := make([]peer.ID, 0, len(vs)-1)
-
-	for i, v := range vs {
-		if i == me {
-			continue
-		}
-		if v.Ed25519Pub == "" {
-			continue
-		}
-		pub, err := decodeHex(v.Ed25519Pub)
-		if err != nil {
-			continue
-		}
-		id, err := discovery.PeerIDFromValidatorKey(pub)
-		if err != nil {
-			continue
-		}
-		salida = append(salida, id)
-	}
-
-	if len(salida) > 0 {
-		log.Internal.Info().
-			Int("peers", len(salida)).
-			Msg("the shared table will be asked where every other validator is, so two " +
-				"machines on different networks can find each other with nothing written down")
-	}
-	return salida
-}
+// rendezvousFromValidators se fue con la idea de que el nodo busca a quien debe
+// estar con el. El nodo no busca: se anuncia bajo la clave de su genesis y lee
+// quien mas esta anunciado, asi que no hace falta derivar identificadores de
+// nadie. La identidad de transporte sigue derivandose de la clave del validador
+// (identityFromValidatorKey), que es lo que hace estable el identificador.

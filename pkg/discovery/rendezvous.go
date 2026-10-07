@@ -1,43 +1,63 @@
 package discovery
 
-// This is where a node meets the validators it is supposed to be running with,
-// when neither of them is on the same network as the other.
+// This is how a node joins the mesh without being told who or where any other
+// member is. It does not look for validators by name, and it does not wait to
+// be introduced: it signs in under the key of its own chain and answers the
+// mesh's roll call.
 //
-// The chain fixes the validator set, and the peer id of every validator comes
-// from its key, so everybody knows who to look for from the genesis alone. The
-// only thing missing is where they are, and that is what the shared table is
-// asked. The handshake that proves a machine is the validator it claims to be
-// still happens in the chain layer; all this does is find the machine to hand
-// the connection to.
+// The key comes from an identity every machine of the same chain computes the
+// same way, so a node that joined once and left comes back to the same place,
+// a second node that has never spoken to the first finds it there, and a node
+// of some other chain never even sees it. Under that key every node keeps a
+// provider record that says "here is where I am", and asks who else has
+// provided the same key. Provider records are served by the shared table for
+// as long as they are renewed, which is what makes two machines that nothing
+// knows about find each other: a plain lookup by peer id only works when
+// somebody happens to be holding that id in its own address book.
+//
+// The handshake that proves a machine belongs where it says it does still
+// happens in the chain layer. This only finds the machine.
 
 import (
 	"context"
 	"time"
 
+	"github.com/ipfs/go-cid"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	mh "github.com/multiformats/go-multihash"
 )
 
-// rendezvousInterval is how often the table is asked for every expected peer.
-// Thirty seconds is long enough for a machine to have found one route and short
-// enough that a machine that appears keeps being noticed in reasonable time.
+// rendezvousInterval is how often this node renews its membership and reads the
+// roll call. Thirty seconds keeps a provider record alive and notices a machine
+// that appeared or left in the same window.
 const rendezvousInterval = 30 * time.Second
 
-// rendezvousLoop keeps asking the shared table where every expected validator
-// is, and reaches each one that the table can place.
-//
-// It does not wait for a node to announce itself, and that is what makes a
-// network of machines behind their own routers come together: each one of them
-// asks for the others instead of all waiting to be asked.
+// rendezvousNamespace separates these records from anything else that could
+// share the table by coincidence, and lets the provider and the asker of a key
+// meet even though neither computes the other's peer id.
+const rendezvousNamespace = "sdlg-jam/network/v1/"
+
+// networkCID is the key every node of a chain provides and reads. It depends
+// only on the chain's identity, never on any address or peer id, so a node
+// that has just started can work it out from the genesis alone.
+func networkCID(network string) cid.Cid {
+	h1, _ := mh.Sum([]byte(rendezvousNamespace+network), mh.SHA2_256, -1)
+	return cid.NewCidV1(cid.Raw, h1)
+}
+
+// rendezvousLoop keeps this node on the roll call of its chain and the other
+// members in reach, for as long as the node runs.
 func (h *Host) rendezvousLoop(ctx context.Context) {
-	// The first ask comes after a short pause so the table has had a chance to
-	// be bootstrapped before anything is asked of it.
+	// The first round comes after a short pause so the table has had a chance
+	// to be bootstrapped before anything is asked of it.
 	primera := time.NewTimer(5 * time.Second)
 	defer primera.Stop()
 
 	tick := time.NewTicker(rendezvousInterval)
 	defer tick.Stop()
 
+	anunciado := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -46,54 +66,67 @@ func (h *Host) rendezvousLoop(ctx context.Context) {
 		case <-tick.C:
 		}
 
-		for _, id := range h.rendezvous {
-			if id == h.host.ID() {
-				continue
-			}
-			if !h.needsFinding(ctx, id) {
-				continue
-			}
-			h.lookFor(ctx, id)
-		}
+		h.announce(ctx, &anunciado)
+		h.rollCall(ctx)
 	}
 }
 
-// needsFinding reports whether the peer still has to be looked for: nothing to
-// do for a peer this host is already connected to, and nothing worth doing for
-// one it never had or just gave up on.
-func (h *Host) needsFinding(ctx context.Context, id peer.ID) bool {
-	if h.host.Network().Connectedness(id) == network.Connected {
-		return false
+// announce registers this node on the mesh: it becomes one of the answers a
+// member of the same chain gets when it asks who is there. The record has to
+// be renewed or the table forgets it, which is why it happens every round.
+func (h *Host) announce(ctx context.Context, ya *bool) {
+	qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	if err := h.dht.Provide(qctx, networkCID(h.network), true); err != nil {
+		h.logf("this node could not sign in on the shared table: %v", err)
+		return
 	}
-	return true
+	if !*ya {
+		h.logf("signed in on the shared table, so a node of the same chain can find it")
+		*ya = true
+	}
 }
 
-// lookFor asks the table where a peer is and reaches it if the table knows.
-func (h *Host) lookFor(ctx context.Context, id peer.ID) {
+// rollCall reads who else of the same chain is here and reaches them. Whoever
+// is listed has signed in under the same key, which is all the introduction the
+// node needs: the rest — is the machine really one of the validators? — is
+// answered later, by the chain handshake, not here.
+func (h *Host) rollCall(ctx context.Context) {
 	qctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	info, err := h.dht.FindPeer(qctx, id)
+	provedores, err := h.dht.FindProviders(qctx, networkCID(h.network))
 	if err != nil {
-		h.logf("asked the shared table where %s is and it does not know yet: %v",
-			id.ShortString(), err)
+		h.logf("asked the shared table who is here and it does not answer: %v", err)
 		return
 	}
-	if len(info.Addrs) == 0 {
-		h.logf("the shared table knows %s but has no address for it yet", id.ShortString())
+	if len(provedores) == 0 {
+		h.logf("asked the shared table who is here and it has no answers yet")
 		return
 	}
 
-	// What the table reported goes into the peer store and the book, because it
-	// is usually a public address and it is exactly the address the chain layer
-	// will want to knock the chain port on.
+	for _, info := range provedores {
+		if info.ID == h.host.ID() {
+			continue
+		}
+		if h.host.Network().Connectedness(info.ID) == network.Connected {
+			continue
+		}
+		h.meet(qctx, info)
+	}
+}
+
+// meet reaches a machine the roll call listed, and writes its addresses down
+// where the chain layer can knock the chain port on them.
+func (h *Host) meet(ctx context.Context, info peer.AddrInfo) {
 	h.host.Peerstore().AddAddrs(info.ID, info.Addrs, peerAddrTTL)
 	h.book.remember(info.ID, info.Addrs)
 
-	if err := h.host.Connect(qctx, info); err != nil {
-		h.logf("the shared table knows %s but reaching it failed: %v", id.ShortString(), err)
+	if err := h.host.Connect(ctx, info); err != nil {
+		h.logf("the shared table lists %s but reaching it failed: %v", info.ID.ShortString(), err)
 		return
 	}
 
-	h.logf("found %s on the shared table and reached it", id.ShortString())
+	h.logf("found %s on the shared table and reached it", info.ID.ShortString())
 }
