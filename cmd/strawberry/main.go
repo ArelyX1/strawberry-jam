@@ -243,11 +243,18 @@ func main() {
 		return
 	}
 
+	autoconfigure(&configFile, &validatorsFile, &genesisPath, &netConfPath, &validatorIndex, &wwwDir, &dataDir, &rpcPort)
+
 	ctx := context.Background()
 
 	appConfig, err := loadConfig(configFile)
 	if err != nil {
-		panic("application config load failed:" + err.Error())
+		fmt.Fprintln(os.Stderr, "the node could not find its configuration ("+err.Error()+")")
+		fmt.Fprintln(os.Stderr, "double-clicking only works when the network kit is beside the binary,")
+		fmt.Fprintln(os.Stderr, "so unzip the whole kit-windows.zip into this folder untouched (appconfig.json,")
+		fmt.Fprintln(os.Stderr, "validators.json and genesis.json right next to the .exe), or launch it with the")
+		fmt.Fprintln(os.Stderr, "start.bat command line.")
+		os.Exit(1)
 	}
 
 	loglevel, err := log.ParseLogLevel(appConfig.LogLevel)
