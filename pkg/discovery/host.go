@@ -74,6 +74,30 @@ type Options struct {
 	// somebody is already trying to fix something else.
 	Bootstrap []peer.AddrInfo
 
+	// PublicRendezvous joins the public distributed hash table as well as the
+	// local one. Two nodes on different networks have no way to meet on the
+	// local table, because there is no local anything in common: the shared
+	// table is what they have, and a node that stays on its own table can only
+	// ever be found by a machine on the same network as it. This is what makes
+	// a node behind its own router findable from a phone tether with nothing
+	// written down.
+	PublicRendezvous bool
+
+	// RendezvousPeers are the peers this node expects to exist, found by
+	// identifier rather than by address.
+	//
+	// The chain fixes the validator set, and the peer id of every validator can
+	// be worked out from its key, so a node can be told who its partners are
+	// without being told where they are. Once the node knows who to look for, it
+	// asks the table where each of them is instead of waiting to be found.
+	RendezvousPeers []peer.ID
+
+	// ChainPort is the port the chain transport listens on. When the node sits
+	// behind a router that answers UPnP, this attempts to map that exact port to
+	// this machine, so a node on another network can reach the chain at the
+	// port the genesis says, with no forwarding set up by hand. Zero skips it.
+	ChainPort int
+
 	// Logf receives what the host is doing.
 	Logf func(format string, args ...any)
 }
@@ -101,6 +125,14 @@ type Host struct {
 	dht       *dht.IpfsDHT
 	book      *addressBook
 	bootstrap []peer.AddrInfo
+	// publicBootstrap is the slice of published bootstrap peers the public
+	// table was seeded with, kept for the dialer that keeps reaching out.
+	publicBootstrap []peer.AddrInfo
+	// rendezvous is who this node keeps asking the table after. The ids come
+	// from the validator set, so they are known before any of them is met.
+	rendezvous []peer.ID
+	// publicRendezvous remembers that the shared table is a subject too.
+	publicRendezvous bool
 
 	cancel context.CancelFunc
 	logf   func(format string, args ...any)
@@ -156,7 +188,12 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 		// reachable at all, and it costs a node that has a public address very
 		// little: the relay is only used by peers that cannot be dialled
 		// directly.
-		cfg = append(cfg, libp2p.EnableRelay(), libp2p.EnableRelayService())
+		cfg = append(cfg, libp2p.EnableRelay(), libp2p.EnableRelayService(),
+			// Hole punching is what lets two nodes behind their own routers
+			// reach each other once each knows a public address of the other.
+			// Without it, a relay stays necessary forever and joins every
+			// conversation the two nodes have.
+			libp2p.EnableHolePunching())
 	} else {
 		cfg = append(cfg, libp2p.DisableRelay())
 	}
@@ -168,11 +205,13 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 	}
 
 	out := &Host{
-		host:      h,
-		book:      loadAddressBook(opts.DataDir),
-		bootstrap: opts.Bootstrap,
-		logf:      opts.Logf,
-		cancel:    cancel,
+		host:             h,
+		book:             loadAddressBook(opts.DataDir),
+		bootstrap:        opts.Bootstrap,
+		rendezvous:       opts.RendezvousPeers,
+		publicRendezvous: opts.PublicRendezvous,
+		logf:             opts.Logf,
+		cancel:           cancel,
 	}
 
 	// Everything the address book holds goes back into the peer store before the
@@ -193,6 +232,13 @@ func Start(ctx context.Context, opts Options) (*Host, error) {
 
 	out.startMDNS(ctx)
 	go out.serveAutoNAT(ctx)
+
+	if opts.ChainPort > 0 {
+		go out.mapChainPort(ctx, opts.ChainPort)
+	}
+	if len(opts.RendezvousPeers) > 0 {
+		go out.rendezvousLoop(ctx)
+	}
 
 	out.logf("peer-to-peer host ready: id=%s", h.ID().String())
 	for _, addr := range h.Addrs() {
@@ -259,6 +305,27 @@ func (h *Host) startDHT(ctx context.Context) error {
 		bootstrap = append(bootstrap, info)
 	}
 
+	// Joining the public table too is what lets two nodes on two different
+	// networks find each other. The local seeds are reachable only from this
+	// network; the published ones are the addresses of the shared table that
+	// nodes from everywhere ask, and they are reachable from anywhere. Both are
+	// kept: the local seeds keep a private network private, and the public ones
+	// do not exist to be asked for the chain, only to find the machines.
+	if h.publicRendezvous {
+		h.publicBootstrap = dht.GetDefaultBootstrapPeerAddrInfos()
+		vistos := make(map[peer.ID]bool, len(bootstrap))
+		for _, info := range bootstrap {
+			vistos[info.ID] = true
+		}
+		for _, info := range h.publicBootstrap {
+			if visto, ok := vistos[info.ID]; ok && visto {
+				continue
+			}
+			vistos[info.ID] = true
+			bootstrap = append(bootstrap, info)
+		}
+	}
+
 	if len(bootstrap) == 0 {
 		// Esto no es un fallo y no se va a decir como si lo fuera. Una red nueva
 		// empieza sin nadie, y el nodo tiene que arrancar igualmente para poder ser
@@ -303,18 +370,29 @@ func (h *Host) dialSeeds(ctx context.Context) {
 	for _, info := range h.bootstrap {
 		pendientes = append(pendientes, info)
 	}
+	for _, info := range h.publicBootstrap {
+		pendientes = append(pendientes, info)
+	}
 	if len(pendientes) == 0 {
 		return
 	}
 
 	go func() {
 		vistos := make(map[peer.ID]bool, len(pendientes))
+		// muertos son los pares cuyas direcciones del libro acaban de fallar. Se
+		// dejan de marcar una vez que el par vuelve a responder: o por la tabla,
+		// o porque un marcado de la red lo trajo de nuevo, y entonces volver a
+		// pedirle por las demas direcciones tiene sentido.
+		muertos := make(map[peer.ID]bool)
 		espera := 2 * time.Second
 
 		for {
 			quedan := 0
 			for _, info := range pendientes {
 				if info.ID == h.host.ID() || len(info.Addrs) == 0 {
+					continue
+				}
+				if muertos[info.ID] {
 					continue
 				}
 				if h.host.Network().Connectedness(info.ID) == network.Connected {
@@ -337,11 +415,29 @@ func (h *Host) dialSeeds(ctx context.Context) {
 				}
 
 				if err := h.host.Connect(ctx, info); err != nil {
+					// Una direccion muerta no se olvida porque el par este muerto: se
+					// olvida porque es la direccion la que no responde, y guardarla
+					// solo hace que el nodo siga gritando "unreachable" durante dias
+					// despues de que la maquina se haya movido. Si la maquina vuelve
+					// a esa direccion, mDNS, la tabla y el cuaderno la aprenden de
+					// nuevo; el libro no es la unica memoria que queda.
+					delLibro := false
+					for _, r := range h.book.all() {
+						if r.ID == info.ID {
+							delLibro = true
+							break
+						}
+					}
+					if delLibro {
+						h.book.forget(info.ID)
+						muertos[info.ID] = true
+					}
 					h.logf("could not reach %s to ask it for the others: %v", info.ID, err)
 					continue
 				}
 				h.logf("reached %s to ask it for the others", info.ID)
 				vistos[info.ID] = true
+				muertos[info.ID] = false
 				quedan--
 			}
 

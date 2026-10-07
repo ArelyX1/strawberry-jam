@@ -28,7 +28,7 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-var version = "0.1.0-dev"
+var version = "0.1.1-dev"
 
 // genesisPath is the economy this run uses. It is a package variable rather than
 // a local because --init-genesis stamps the same economy into the kit it
@@ -540,6 +540,15 @@ func main() {
 			Relay:     true,
 			Identity:  identidad,
 			Bootstrap: bootstrapFromValidators(vs),
+			// La tabla publica y el bucle de presentacion son lo que hace que dos
+			// maquinas en redes distintas se encuentren sin que nadie escriba una
+			// direccion: cada nodo sabe con quien tiene que estar (los validadores
+			// del genesis) y le pregunta a la tabla por cada uno de ellos. El puerto
+			// de la cadena se mapea por UPnP para que el que encuentra a la otra
+			// maquina pueda llamar al transporte de la cadena, no solo a libp2p.
+			PublicRendezvous: true,
+			RendezvousPeers:  rendezvousFromValidators(vs, int(index)),
+			ChainPort:        udpAddress.Port,
 			Logf: func(format string, args ...any) {
 				log.Internal.Info().Msgf(format, args...)
 			},
@@ -763,6 +772,43 @@ func bootstrapFromValidators(vs []FullValidatorInfo) []peer.AddrInfo {
 			Int("seeds", len(salida)).
 			Msg("the validator set carries mesh addresses, so this node does not have to be " +
 				"told where the others are")
+	}
+	return salida
+}
+
+// rendezvousFromValidators is who this node will keep asking the shared table
+// after: every other validator in the set.
+//
+// No address is involved in that list. The id of a validator is worked out from
+// its key, which the genesis fixes, so the node knows who to look for without
+// ever being told where they are. Validators without a public key are left out,
+// because there is nothing to work an id from.
+func rendezvousFromValidators(vs []FullValidatorInfo, me int) []peer.ID {
+	salida := make([]peer.ID, 0, len(vs)-1)
+
+	for i, v := range vs {
+		if i == me {
+			continue
+		}
+		if v.Ed25519Pub == "" {
+			continue
+		}
+		pub, err := decodeHex(v.Ed25519Pub)
+		if err != nil {
+			continue
+		}
+		id, err := discovery.PeerIDFromValidatorKey(pub)
+		if err != nil {
+			continue
+		}
+		salida = append(salida, id)
+	}
+
+	if len(salida) > 0 {
+		log.Internal.Info().
+			Int("peers", len(salida)).
+			Msg("the shared table will be asked where every other validator is, so two " +
+				"machines on different networks can find each other with nothing written down")
 	}
 	return salida
 }

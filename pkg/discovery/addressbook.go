@@ -202,6 +202,17 @@ func (b *addressBook) all() []peer.AddrInfo {
 	return salida
 }
 
+// forget drops a peer from the book entirely. Used when a dial makes clear the
+// addresses written down for a peer no longer answer: keeping them would make
+// every following run repeat the same failing dial for days, and nothing is
+// lost, because a peer that comes back is learned again through mDNS, the table
+// or the book of whoever talks to it.
+func (b *addressBook) forget(id peer.ID) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.peers, id)
+}
+
 // save writes the book out, oldest entries first dropped.
 func (b *addressBook) save() error {
 	b.mu.Lock()
